@@ -30,6 +30,10 @@ packages = ["src/olympus"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "live_api: live LLM evaluation tests requiring --run-live-api",
+    "slow: longer benchmark sweeps",
+]
 
 [tool.ruff]
 target-version = "py313"

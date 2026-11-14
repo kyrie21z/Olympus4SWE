@@ -1,6 +1,9 @@
 # Local reference materials (kept local, not tracked in git)
 docs/references/
 
+# Local eval run outputs
+tests/evals/results/
+
 # Python / uv / local artifacts
 .venv/
 __pycache__/

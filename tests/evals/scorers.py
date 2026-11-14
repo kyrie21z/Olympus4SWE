@@ -25,6 +25,7 @@ from olympus.core.contracts import GoalSpec, StrictModel, TaskPlan
 from olympus.core.dag import validate_plan
 from olympus.providers.types import ChatMessage, LLMProvider
 from olympus.stages.common import extract_json_payload
+from tests.evals.benchmarks.clarifycodebench import calculate_ora, calculate_tkqr
 from tests.evals.oracle import match_slot
 from tests.evals.schemas import (
     EvalCase,
@@ -166,6 +167,8 @@ class CaseEvidence:
     oracle_leak_terms: tuple[str, ...]
     plan: TaskPlan | None
     workspace_root: Path
+    question_hits: tuple[int, ...] = ()
+    oracle_evaluated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +514,23 @@ def _merge_terms(*groups: Sequence[str]) -> list[str]:
     return merged
 
 
+def _heuristic_hit_sequence(
+    asked_questions: Sequence[str],
+    slots: Sequence[HiddenSlot],
+) -> list[int]:
+    """Compute a deduplicated binary hit sequence using deterministic slot matching."""
+    seen: set[str] = set()
+    hits: list[int] = []
+    for question in asked_questions:
+        matched = match_slot(question, slots, exclude=seen)
+        if matched is None:
+            hits.append(0)
+        else:
+            seen.add(matched.slot_id)
+            hits.append(1)
+    return hits
+
+
 def evaluate_case_outcome(evidence: CaseEvidence) -> tuple[bool, float, RubricMetrics]:
     """Score one case, returning ``(passed, total_score, all_components)``."""
     case = evidence.case
@@ -553,27 +573,49 @@ def evaluate_case_outcome(evidence: CaseEvidence) -> tuple[bool, float, RubricMe
     )
     recall = ambiguity_recall(evidence.asked_questions, case.hidden_slots)
     precision = ask_precision(evidence.asked_questions, case.hidden_slots)
+    if evidence.oracle_evaluated and case.hidden_slots:
+        known_slot_ids = {slot.slot_id for slot in case.hidden_slots}
+        oracle_recall = len(evidence.revealed_slot_ids & known_slot_ids) / len(case.hidden_slots)
+        recall = max(recall, oracle_recall)
+        if evidence.question_hits:
+            oracle_precision = sum(evidence.question_hits) / len(evidence.question_hits)
+            precision = max(precision, oracle_precision)
     over_asking = over_asking_penalty(
         benchmark_class_is_c=is_class_c,
         expected=expected,
         questions_asked=len(evidence.asked_questions),
         spec=focus_spec,
     )
-    leak_terms = _merge_terms(
-        spec_leak_terms(
-            initial_spec=evidence.initial_spec,
-            final_spec=evidence.final_spec,
-            slots=case.hidden_slots,
-            revealed_slot_ids=evidence.revealed_slot_ids,
-        ),
-        evidence.oracle_leak_terms,
+    leak_terms = (
+        _merge_terms(
+            spec_leak_terms(
+                initial_spec=evidence.initial_spec,
+                final_spec=evidence.final_spec,
+                slots=case.hidden_slots,
+                revealed_slot_ids=evidence.revealed_slot_ids,
+            ),
+            evidence.oracle_leak_terms,
+        )
+        if expected.leak_check
+        else []
     )
-    leakage = bool(leak_terms) or evidence.oracle_leakage_detected
+    leakage = expected.leak_check and (bool(leak_terms) or evidence.oracle_leakage_detected)
     turns = bounded_turns_ok(
         clarify_rounds=evidence.clarify_rounds,
         max_rounds=expected.max_clarify_rounds,
         repeated_question_rate=evidence.repeated_question_rate,
     )
+    key_count = len(case.hidden_slots)
+    if key_count == 0:
+        tkqr = 1.0 if len(evidence.asked_questions) == 0 else 0.0
+    else:
+        hits = (
+            list(evidence.question_hits)
+            if evidence.question_hits
+            else _heuristic_hit_sequence(evidence.asked_questions, case.hidden_slots)
+        )
+        tkqr = calculate_tkqr(hits, key_count)
+    ora = calculate_ora(len(evidence.asked_questions), key_count)
 
     total = (
         WEIGHTS["bounded_scope"] * bounded
@@ -643,6 +685,8 @@ def evaluate_case_outcome(evidence: CaseEvidence) -> tuple[bool, float, RubricMe
         over_asking_penalty=over_asking,
         leakage_detected=leakage,
         bounded_turns_ok=turns,
+        tkqr=tkqr,
+        ora=ora,
         total_score=total,
         questions_asked=len(evidence.asked_questions),
         clarify_rounds=evidence.clarify_rounds,

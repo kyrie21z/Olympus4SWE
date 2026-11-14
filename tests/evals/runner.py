@@ -390,6 +390,8 @@ def build_mock_eval_provider(case: EvalCase, variant: str) -> MockLLMProvider:
 class ClarifyOutcome:
     spec: GoalSpec
     questions: tuple[str, ...]
+    question_hits: tuple[int, ...]
+    oracle_evaluated: bool
     rounds: int
     repeated_rate: float
 
@@ -431,6 +433,8 @@ def _empty_metrics(note: str) -> RubricMetrics:
         over_asking_penalty=0.0,
         leakage_detected=False,
         bounded_turns_ok=0.0,
+        tkqr=0.0,
+        ora=0.0,
         total_score=0.0,
         questions_asked=0,
         clarify_rounds=0,
@@ -702,6 +706,8 @@ class EvalRunner:
             final_confirmable = False
             final_spec = initial_spec
             questions: tuple[str, ...] = _unique_questions(initial_questions)
+            question_hits: tuple[int, ...] = ()
+            oracle_evaluated = False
             rounds = 0
             repeated_rate = 0.0
 
@@ -721,7 +727,12 @@ class EvalRunner:
                     case=case,
                     oracle=oracle,
                 )
-                questions = _unique_questions((*initial_questions, *outcome.questions))
+                if outcome.oracle_evaluated:
+                    questions = outcome.questions
+                    question_hits = outcome.question_hits
+                    oracle_evaluated = True
+                else:
+                    questions = _unique_questions((*initial_questions, *outcome.questions))
                 rounds = outcome.rounds
                 repeated_rate = outcome.repeated_rate
                 try:
@@ -764,6 +775,8 @@ class EvalRunner:
                 oracle_leak_terms=tuple(oracle.leak_terms),
                 plan=plan,
                 workspace_root=repo,
+                question_hits=question_hits,
+                oracle_evaluated=oracle_evaluated,
             )
             passed, total, metrics = evaluate_case_outcome(evidence)
             cost = self._estimate_cost(counting)
@@ -795,6 +808,8 @@ class EvalRunner:
     ) -> ClarifyOutcome:
         tracker = QuestionTracker()
         questions: list[str] = []
+        question_hits: list[int] = []
+        oracle_evaluated = False
         rounds = 0
         spec = _current_spec(store, run_id)
         for _ in range(case.expected.max_clarify_rounds):
@@ -803,9 +818,15 @@ class EvalRunner:
             if not pending:
                 break
             batch = [ambiguity.question for ambiguity in pending]
-            tracker.record(batch)
-            questions.extend(batch)
+            first_seen = tracker.record(batch)
             replies = oracle.reply(pending)
+            oracle_evaluated = True
+            for question_text, is_first, reply in zip(
+                batch, first_seen, replies, strict=True
+            ):
+                if is_first:
+                    questions.append(question_text)
+                    question_hits.append(1 if reply.revealed else 0)
             answers = {
                 ambiguity.id: reply.answer
                 for ambiguity, reply in zip(pending, replies, strict=True)
@@ -827,6 +848,8 @@ class EvalRunner:
         return ClarifyOutcome(
             spec=spec,
             questions=tuple(questions),
+            question_hits=tuple(question_hits),
+            oracle_evaluated=oracle_evaluated,
             rounds=rounds,
             repeated_rate=tracker.repeated_rate,
         )

@@ -168,6 +168,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 name: {
                     "pass@1": scorecard.pass_at_1,
                     "mean_total_score": scorecard.mean_total_score,
+                    "ambiguity_recall": scorecard.ambiguity_recall,
+                    "tkqr": scorecard.tkqr,
+                    "ora": scorecard.ora,
                     "leakage_rate": scorecard.leakage_rate,
                     "calls": scorecard.calls,
                 }

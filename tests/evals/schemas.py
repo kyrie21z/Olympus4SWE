@@ -77,6 +77,7 @@ class ExpectedCriteria(StrictModel):
     require_confirmable_at_end: bool = True
     require_downstream_plan_valid: bool = False
     acceptance_test_command: str | None = None
+    leak_check: bool = True
 
 
 class EvalCase(StrictModel):
@@ -124,6 +125,8 @@ class RubricMetrics(StrictModel):
     over_asking_penalty: float = Field(ge=0.0, le=1.0)
     leakage_detected: bool
     bounded_turns_ok: float = Field(ge=0.0, le=1.0)
+    tkqr: float = Field(default=1.0, ge=0.0, le=1.0)
+    ora: float = Field(default=1.0, ge=0.0, le=1.0)
     total_score: float = Field(ge=0.0, le=1.0)
     questions_asked: int = Field(ge=0)
     clarify_rounds: int = Field(ge=0)
@@ -183,6 +186,8 @@ class ClassScorecard(StrictModel):
     leakage_rate: float = Field(ge=0.0, le=1.0)
     avg_questions: float = Field(ge=0.0)
     avg_rounds: float = Field(ge=0.0)
+    tkqr: float = Field(default=0.0, ge=0.0, le=1.0)
+    ora: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class VariantScorecard(StrictModel):
@@ -201,6 +206,8 @@ class VariantScorecard(StrictModel):
     leakage_rate: float = Field(ge=0.0, le=1.0)
     avg_questions: float = Field(ge=0.0)
     avg_rounds: float = Field(ge=0.0)
+    tkqr: float = Field(default=0.0, ge=0.0, le=1.0)
+    ora: float = Field(default=0.0, ge=0.0, le=1.0)
     calls: int = Field(ge=0)
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
@@ -218,6 +225,8 @@ class VariantDelta(StrictModel):
     mean_total_score_delta: float
     ambiguity_recall_delta: float
     ask_precision_delta: float
+    tkqr_delta: float = 0.0
+    ora_delta: float = 0.0
     over_asking_penalty_delta: float
     leakage_rate_delta: float
     avg_questions_delta: float

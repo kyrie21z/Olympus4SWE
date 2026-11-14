@@ -74,6 +74,8 @@ def _class_scorecard(records: Sequence[CaseRunRecord], trials: int) -> ClassScor
         mean_total_score=_mean([record.total_score for record in records]),
         ambiguity_recall=_mean([record.metrics.ambiguity_recall for record in records]),
         ask_precision=_mean([record.metrics.ask_precision for record in records]),
+        tkqr=_mean([record.metrics.tkqr for record in records]),
+        ora=_mean([record.metrics.ora for record in records]),
         over_asking_penalty=_mean([record.metrics.over_asking_penalty for record in records]),
         leakage_rate=_mean(
             [1.0 if record.metrics.leakage_detected else 0.0 for record in records]
@@ -114,6 +116,8 @@ def summarize_variant(
         mean_total_score=_mean([record.total_score for record in subset]),
         ambiguity_recall=_mean([record.metrics.ambiguity_recall for record in subset]),
         ask_precision=_mean([record.metrics.ask_precision for record in subset]),
+        tkqr=_mean([record.metrics.tkqr for record in subset]),
+        ora=_mean([record.metrics.ora for record in subset]),
         over_asking_penalty=_mean([record.metrics.over_asking_penalty for record in subset]),
         leakage_rate=_mean(
             [1.0 if record.metrics.leakage_detected else 0.0 for record in subset]
@@ -137,6 +141,8 @@ def _delta(reference: VariantScorecard, candidate: VariantScorecard) -> VariantD
         mean_total_score_delta=candidate.mean_total_score - reference.mean_total_score,
         ambiguity_recall_delta=candidate.ambiguity_recall - reference.ambiguity_recall,
         ask_precision_delta=candidate.ask_precision - reference.ask_precision,
+        tkqr_delta=candidate.tkqr - reference.tkqr,
+        ora_delta=candidate.ora - reference.ora,
         over_asking_penalty_delta=(
             candidate.over_asking_penalty - reference.over_asking_penalty
         ),
@@ -183,10 +189,10 @@ def _fmt(value: float | None) -> str:
 def _variant_table(report: SuiteReport) -> list[str]:
     header = (
         "| Variant | Cases | Records | pass@1 | pass_all | mean_total_score | "
-        "ambiguity_recall | ask_precision | over_asking_penalty | leakage_rate | "
-        "avg_questions | avg_rounds | calls | tokens | cost_per_pass_usd |"
+        "ambiguity_recall | ask_precision | tkqr | ora | over_asking_penalty | "
+        "leakage_rate | avg_questions | avg_rounds | calls | tokens | cost_per_pass_usd |"
     )
-    separator = "|" + "---|" * 15
+    separator = "|" + "---|" * 17
     rows = [
         header,
         separator,
@@ -196,7 +202,8 @@ def _variant_table(report: SuiteReport) -> list[str]:
             f"| {scorecard.variant} | {scorecard.cases} | {scorecard.records} | "
             f"{_fmt(scorecard.pass_at_1)} | {_fmt(scorecard.pass_all)} | "
             f"{_fmt(scorecard.mean_total_score)} | {_fmt(scorecard.ambiguity_recall)} | "
-            f"{_fmt(scorecard.ask_precision)} | {_fmt(scorecard.over_asking_penalty)} | "
+            f"{_fmt(scorecard.ask_precision)} | {_fmt(scorecard.tkqr)} | "
+            f"{_fmt(scorecard.ora)} | {_fmt(scorecard.over_asking_penalty)} | "
             f"{_fmt(scorecard.leakage_rate)} | {scorecard.avg_questions:.2f} | "
             f"{scorecard.avg_rounds:.2f} | {scorecard.calls} | {scorecard.tokens} | "
             f"${scorecard.cost_per_pass_usd:.4f} |"
@@ -207,10 +214,10 @@ def _variant_table(report: SuiteReport) -> list[str]:
 def _per_class_table(report: SuiteReport) -> list[str]:
     header = (
         "| Variant | Class | Cases | Records | passed | pass@1 | pass_all | "
-        "mean_total_score | ambiguity_recall | ask_precision | over_asking_penalty | "
-        "leakage_rate | avg_questions | avg_rounds |"
+        "mean_total_score | ambiguity_recall | ask_precision | tkqr | ora | "
+        "over_asking_penalty | leakage_rate | avg_questions | avg_rounds |"
     )
-    separator = "|" + "---|" * 14
+    separator = "|" + "---|" * 16
     rows = [header, separator]
     for scorecard in report.variants.values():
         for class_name, class_score in scorecard.per_class.items():
@@ -220,6 +227,7 @@ def _per_class_table(report: SuiteReport) -> list[str]:
                 f"{_fmt(class_score.pass_at_1)} | {_fmt(class_score.pass_all)} | "
                 f"{_fmt(class_score.mean_total_score)} | "
                 f"{_fmt(class_score.ambiguity_recall)} | {_fmt(class_score.ask_precision)} | "
+                f"{_fmt(class_score.tkqr)} | {_fmt(class_score.ora)} | "
                 f"{_fmt(class_score.over_asking_penalty)} | {_fmt(class_score.leakage_rate)} | "
                 f"{class_score.avg_questions:.2f} | {class_score.avg_rounds:.2f} |"
             )
@@ -231,16 +239,17 @@ def _delta_table(report: SuiteReport) -> list[str]:
         return ["No comparison variants were executed."]
     header = (
         "| Variant | baseline | Δpass@1 | Δmean_total_score | Δambiguity_recall | "
-        "Δask_precision | Δover_asking_penalty | Δleakage_rate | Δcalls | Δtokens | "
-        "Δcost_per_pass_usd |"
+        "Δask_precision | Δtkqr | Δora | Δover_asking_penalty | Δleakage_rate | "
+        "Δcalls | Δtokens | Δcost_per_pass_usd |"
     )
-    separator = "|" + "---|" * 11
+    separator = "|" + "---|" * 13
     rows = [header, separator]
     for delta in report.comparison.deltas.values():
         rows.append(
             f"| {delta.variant} | {report.comparison.baseline} | "
             f"{delta.pass_at_1_delta:+.3f} | {delta.mean_total_score_delta:+.3f} | "
             f"{delta.ambiguity_recall_delta:+.3f} | {delta.ask_precision_delta:+.3f} | "
+            f"{delta.tkqr_delta:+.3f} | {delta.ora_delta:+.3f} | "
             f"{delta.over_asking_penalty_delta:+.3f} | {delta.leakage_rate_delta:+.3f} | "
             f"{delta.calls_delta:+d} | {delta.tokens_delta:+d} | "
             f"${delta.cost_per_pass_usd_delta:+.4f} |"

@@ -106,6 +106,12 @@ class WorkspaceToolkit:
                 files.append(Path(root) / fname)
         return files
 
+    def list_relative_files(self, *, max_files: int = 40) -> tuple[list[str], int]:
+        """Return up to ``max_files`` sorted repo-relative paths and total file count."""
+        all_files = self._iter_workspace_files(self.workspace_root)
+        rels = [p.resolve().relative_to(self.workspace_root).as_posix() for p in all_files]
+        return rels[: max(0, max_files)], len(rels)
+
     def _read_file(self, args: dict[str, Any]) -> str:
         target = self._resolve_abs_path(args.get("path"))
         if not target.is_file():

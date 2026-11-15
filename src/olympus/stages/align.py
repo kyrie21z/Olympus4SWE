@@ -31,20 +31,47 @@ class CritiqueOutput(StrictModel):
 
 
 _ALIGN_SYSTEM_PROMPT = """You are the Stage 1 Requirements Alignment Architect of Olympus4SWE.
-Your job is to inspect the target repository (using read-only tools when helpful) and convert
-the user's raw goal into a crisp, verifiable GoalSpec JSON object.
+Inspect the observed workspace context (and use read-only tools when deeper inspection is helpful)
+to convert the user's raw goal into a crisp, verifiable GoalSpec JSON object.
+
 Rules:
-1. Ground claims in observed repo files; never invent existing files or symbols.
-2. Separate clear requirements from genuine blocking ambiguities (open_ambiguities).
-3. Explicitly list out_of_scope items to prevent scope creep.
-4. Every requirement must have concrete, verifiable acceptance_criteria.
-5. Output ONLY a single JSON object conforming to GoalSpec."""
+1. Strict Path Grounding: Cite ONLY file paths listed in Observed workspace files or observed
+   via tool output. NEVER invent or mention unverified paths (e.g., `src/.../main.py` or
+   `tests/...`) inside `constraints`, `assumptions`, `open_ambiguities`, or `minority_notes`.
+   When a task is standalone or target layout is unspecified, refer to behavior/deliverables
+   conceptually rather than guessing repository paths.
+2. Semantic Audit & Genuine Blockers: Inspect the goal closely for contradictions with the repo,
+   missing high-level scope/success criteria (vague goals MUST stay blocked via `open_ambiguities`),
+   and genuine behavioral/logical ambiguities whose resolution would change correctness (e.g.,
+   undefined value domains, operation ordering/atomicity, output order/format/tie-breakers,
+   optimization targets like minimum vs any valid answer, or persistence/error contracts).
+3. Question Austerity (NO Shotgun Questioning): Treat clarification budget as precious.
+   - If requirements are already clear and verifiable, return `"open_ambiguities": []`.
+   - When clarifications are genuinely required, emit ONLY the minimal, distinct set of
+     decision-blocking questions (`blocking: true`, typically 1-3 focused items; merge
+     overlapping points instead of splitting them).
+   - NEVER pad with generic boilerplate questions about file paths/layout, language version,
+     CLI vs function signature, logging, test framework, or validation of inputs already ruled
+     out by stated constraints.
+4. Bounded Scope & Falsifiable Criteria: List explicit `out_of_scope` items to prevent scope
+   creep, and give every requirement concrete, verifiable `acceptance_criteria`.
+5. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
+   `$schema`, or unlisted extra keys."""
 
 _CRITIQUE_SYSTEM_TEMPLATE = """You are a cold-start read-only {perspective} reviewer.
 Inspect the draft GoalSpec (and repository files if needed) and report ONLY real omissions,
 hidden contradictions, feasibility risks, or untestable acceptance criteria.
 Do NOT invent scores or rewrite the spec. If no issues exist, return {{"notes": []}}.
-Output ONLY JSON conforming to {{"notes": [...]}}."""
+Output ONLY valid JSON matching {{"notes": [...]}} with no `$comment`, `$schema`, or extra keys."""
+
+
+def _format_workspace_inventory(toolkit: WorkspaceToolkit, *, max_files: int = 40) -> str:
+    """Format a bounded deterministic inventory of existing workspace paths."""
+    files, total = toolkit.list_relative_files(max_files=max_files)
+    if not files:
+        return "Observed workspace files: (none)"
+    suffix = f" (+{total - len(files)} more)" if total > len(files) else ""
+    return f"Observed workspace files ({len(files)}/{total}): " + ", ".join(files) + suffix
 
 
 class AlignStage:
@@ -89,9 +116,11 @@ class AlignStage:
             max_steps=max_steps,
             trace_path=self._trace_file(run_id, "align-proposer"),
         )
+        inventory = _format_workspace_inventory(toolkit)
         schema_json = json.dumps(GoalSpec.model_json_schema(), ensure_ascii=False)
         user_prompt = (
             f"Workspace root: {self.workspace_root}\n"
+            f"{inventory}\n"
             f"Raw user goal:\n{raw_goal}\n\n"
             f"Explicit constraints: {json.dumps(constraints or [], ensure_ascii=False)}\n\n"
             f"Return GoalSpec JSON matching schema:\n{schema_json}"
@@ -134,6 +163,8 @@ class AlignStage:
             CritiquePerspective.QA,
         )
 
+        critique_schema = json.dumps(CritiqueOutput.model_json_schema(), ensure_ascii=False)
+
         def run_one(perspective: CritiquePerspective) -> list[CritiqueNote]:
             toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
             loop = AgentLoop(
@@ -145,12 +176,15 @@ class AlignStage:
                 max_steps=6,
                 trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
             )
+            inventory = _format_workspace_inventory(toolkit)
             sys_prompt = _CRITIQUE_SYSTEM_TEMPLATE.format(perspective=perspective.value)
             user_prompt = (
                 f"Workspace root: {self.workspace_root}\n"
+                f"{inventory}\n"
                 f"Draft GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
                 f"Critique ONLY from the {perspective.value} perspective. "
-                f"Set perspective='{perspective.value}' on every note."
+                f"Set perspective='{perspective.value}' on every note.\n"
+                f"Return JSON matching schema:\n{critique_schema}"
             )
             out = run_structured_loop(
                 loop=loop,

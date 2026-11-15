@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -11,6 +12,32 @@ from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+_SCHEMA_META_KEYS = frozenset(
+    {
+        "$schema",
+        "$comment",
+        "$id",
+        "$defs",
+        "$ref",
+        "$anchor",
+        "$vocabulary",
+        "$dynamicRef",
+        "$dynamicAnchor",
+    }
+)
+
+
+def strip_schema_meta_keys(value: Any) -> Any:
+    """Recursively drop JSON Schema metadata keys while keeping extra='forbid' strictness."""
+    if isinstance(value, dict):
+        return {
+            key: strip_schema_meta_keys(val)
+            for key, val in value.items()
+            if not (isinstance(key, str) and (key in _SCHEMA_META_KEYS or key.startswith("$")))
+        }
+    if isinstance(value, list):
+        return [strip_schema_meta_keys(item) for item in value]
+    return value
 
 
 def extract_json_payload(raw_text: str) -> str:
@@ -25,6 +52,13 @@ def extract_json_payload(raw_text: str) -> str:
     if start_obj != -1 and end_obj > start_obj:
         return stripped[start_obj : end_obj + 1]
     return stripped
+
+
+def parse_model_json[T: BaseModel](raw_text: str, model_cls: type[T]) -> T:
+    """Extract JSON, strip schema meta-keys ($comment/$schema), and validate strictly."""
+    candidate = extract_json_payload(raw_text)
+    data = strip_schema_meta_keys(json.loads(candidate))
+    return model_cls.model_validate(data)
 
 
 def run_structured_loop[T: BaseModel](
@@ -44,10 +78,8 @@ def run_structured_loop[T: BaseModel](
             raise RuntimeError(
                 f"AgentLoop stopped before producing final output: {res.stop_reason}"
             )
-        candidate = extract_json_payload(res.final_content)
         try:
-            data = json.loads(candidate)
-            return model_cls.model_validate(data)
+            return parse_model_json(res.final_content, model_cls)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_err = str(exc)
             if attempt < max_parse_retries:
@@ -56,7 +88,8 @@ def run_structured_loop[T: BaseModel](
                     f"{user_prompt}\n\n"
                     f"[PREVIOUS OUTPUT FAILED VALIDATION]\n"
                     f"Error: {last_err}\n"
-                    f"Return ONLY valid JSON matching schema:\n{schema_hint}"
+                    "Return ONLY valid JSON matching schema (no $comment, $schema, "
+                    f"or extra keys):\n{schema_hint}"
                 )
     raise ValueError(f"Failed to parse {model_cls.__name__} JSON: {last_err}")
 

@@ -24,7 +24,7 @@ from pydantic import Field, ValidationError
 from olympus.core.contracts import GoalSpec, StrictModel, TaskPlan
 from olympus.core.dag import validate_plan
 from olympus.providers.types import ChatMessage, LLMProvider
-from olympus.stages.common import extract_json_payload
+from olympus.stages.common import parse_model_json
 from tests.evals.benchmarks.clarifycodebench import calculate_ora, calculate_tkqr
 from tests.evals.oracle import match_slot
 from tests.evals.schemas import (
@@ -571,15 +571,25 @@ def evaluate_case_outcome(evidence: CaseEvidence) -> tuple[bool, float, RubricMe
         refusal_confirm_rejected=evidence.refusal_confirm_rejected,
         fabricated_paths=fabricated,
     )
-    recall = ambiguity_recall(evidence.asked_questions, case.hidden_slots)
-    precision = ask_precision(evidence.asked_questions, case.hidden_slots)
-    if evidence.oracle_evaluated and case.hidden_slots:
+    key_count = len(case.hidden_slots)
+    if key_count > 0 and evidence.oracle_evaluated:
         known_slot_ids = {slot.slot_id for slot in case.hidden_slots}
-        oracle_recall = len(evidence.revealed_slot_ids & known_slot_ids) / len(case.hidden_slots)
-        recall = max(recall, oracle_recall)
+        recall = len(evidence.revealed_slot_ids & known_slot_ids) / key_count
         if evidence.question_hits:
-            oracle_precision = sum(evidence.question_hits) / len(evidence.question_hits)
-            precision = max(precision, oracle_precision)
+            hits = list(evidence.question_hits)
+            precision = sum(hits) / len(hits)
+        else:
+            hits = _heuristic_hit_sequence(evidence.asked_questions, case.hidden_slots)
+            precision = ask_precision(evidence.asked_questions, case.hidden_slots)
+        tkqr = calculate_tkqr(hits, key_count)
+    else:
+        recall = ambiguity_recall(evidence.asked_questions, case.hidden_slots)
+        precision = ask_precision(evidence.asked_questions, case.hidden_slots)
+        if key_count == 0:
+            tkqr = 1.0 if len(evidence.asked_questions) == 0 else 0.0
+        else:
+            hits = _heuristic_hit_sequence(evidence.asked_questions, case.hidden_slots)
+            tkqr = calculate_tkqr(hits, key_count)
     over_asking = over_asking_penalty(
         benchmark_class_is_c=is_class_c,
         expected=expected,
@@ -605,16 +615,6 @@ def evaluate_case_outcome(evidence: CaseEvidence) -> tuple[bool, float, RubricMe
         max_rounds=expected.max_clarify_rounds,
         repeated_question_rate=evidence.repeated_question_rate,
     )
-    key_count = len(case.hidden_slots)
-    if key_count == 0:
-        tkqr = 1.0 if len(evidence.asked_questions) == 0 else 0.0
-    else:
-        hits = (
-            list(evidence.question_hits)
-            if evidence.question_hits
-            else _heuristic_hit_sequence(evidence.asked_questions, case.hidden_slots)
-        )
-        tkqr = calculate_tkqr(hits, key_count)
     ora = calculate_ora(len(evidence.asked_questions), key_count)
 
     total = (
@@ -751,9 +751,7 @@ class LLMJudge:
             return JudgeResult(status="unscored", reason=f"judge provider error: {exc}")
 
         try:
-            payload = _JudgePayload.model_validate(
-                json.loads(extract_json_payload(response.content))
-            )
+            payload = parse_model_json(response.content, _JudgePayload)
         except (json.JSONDecodeError, ValidationError) as exc:
             return JudgeResult(status="unscored", reason=f"malformed judge output: {exc}")
         return JudgeResult(

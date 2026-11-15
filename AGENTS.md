@@ -12,6 +12,7 @@ Olympus4SWE 是一个以第一性原理驱动的 Agent-Native 全生命周期软
   - `tools/` — 绝对路径防呆 ACI 原语与输出截断引导
   - `harness/` — 透明 Append-Only Loop、`git worktree` 沙盒、Trace 落盘
   - `stages/` — Stage 1 `Align`（需求对齐冻结）与 Stage 2 `Orchestrate & Verify`（调度与独立验收）
+  - `web/` — M4 `Ariadne` 事件溯源只读投影、SSE 实时流与幂等人工控制 Web 控制台
   - `cli/` — CLI 交互入口
 - 测试与评测：`tests/unit/`、`tests/evals/`
 

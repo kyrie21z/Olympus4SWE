@@ -1,0 +1,1667 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ariadne · Olympus4SWE 研发编排与独立验收控制台</title>
+  <style>
+    :root {
+      --bg-canvas: #f3f5f8;
+      --surface-card: #ffffff;
+      --surface-subtle: #edf1f6;
+      --surface-selected: #eef4ff;
+      --border-subtle: #cfd7e3;
+      --border-strong: #94a3b8;
+      --text-primary: #111827;
+      --text-secondary: #334155;
+      --text-muted: #475569;
+
+      --ok-bg: #e6f6ee;
+      --ok-border: #2f9e6e;
+      --ok-text: #135337;
+
+      --run-bg: #eaf2ff;
+      --run-border: #2563eb;
+      --run-text: #1e40af;
+
+      --err-bg: #fdecec;
+      --err-border: #d64545;
+      --err-text: #7a1f1f;
+
+      --warn-bg: #fef4e6;
+      --warn-border: #d97706;
+      --warn-text: #7c2d12;
+
+      --wait-bg: #f5f6f8;
+      --wait-border: #94a3b8;
+      --wait-text: #334155;
+
+      --scrollbar-thumb: #64748b;
+      --scrollbar-track: #e2e8f0;
+
+      --radius-md: 8px;
+      --radius-sm: 6px;
+      --font-sans: "HarmonyOS Sans SC", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, ui-monospace, monospace;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.55;
+      overflow-x: hidden;
+    }
+
+    /* Modern Web Guidance: customize-scrollbar-color-and-thickness */
+    .scroller {
+      --scrollbar-thumb: #64748b;
+      --scrollbar-track: #e2e8f0;
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+      scrollbar-width: thin;
+    }
+
+    @supports not (scrollbar-color: auto) {
+      .scroller::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      .scroller::-webkit-scrollbar-thumb {
+        background: var(--scrollbar-thumb);
+        border-radius: 5px;
+      }
+      .scroller::-webkit-scrollbar-track {
+        background: var(--scrollbar-track);
+      }
+    }
+
+    .console-shell {
+      max-width: 1560px;
+      margin: 0 auto;
+      padding: 10px 16px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    /* Row 1: Compact Top Bar */
+    .topbar {
+      background: var(--surface-card);
+      border: 1.5px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 7px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      min-height: 46px;
+    }
+
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    .brand-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+    }
+
+    .run-select {
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+      background: var(--surface-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 4px 8px;
+      cursor: pointer;
+      max-width: min(340px, calc(100vw - 56px));
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .stage-pipeline {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+
+    .stage-step {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      border: 1.5px solid transparent;
+    }
+
+    .stage-step[data-status="done"] {
+      color: var(--ok-text);
+    }
+
+    .stage-step[data-status="active"] {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    .stage-step[data-status="blocked"] {
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-text);
+    }
+
+    .stage-arrow {
+      color: var(--text-muted);
+      font-size: 12px;
+      user-select: none;
+    }
+
+    .topbar-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .metric-pill {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      background: var(--surface-subtle);
+      padding: 3px 8px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+      white-space: nowrap;
+    }
+
+    /* Buttons */
+    .btn {
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 5px 11px;
+      border-radius: var(--radius-sm);
+      border: 1.5px solid var(--border-subtle);
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      transition: background-color 120ms ease, border-color 120ms ease, transform 80ms ease;
+      white-space: nowrap;
+    }
+
+    .btn:hover {
+      background: #e2e8f0;
+      border-color: var(--border-strong);
+    }
+
+    .btn:active {
+      transform: translateY(1px);
+    }
+
+    .btn:focus-visible {
+      outline: 2px solid var(--run-border);
+      outline-offset: 2px;
+    }
+
+    .btn-danger {
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-text);
+    }
+
+    .btn-danger:hover {
+      background: #fbd5d5;
+    }
+
+    .btn-primary {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    .btn-primary:hover {
+      background: #dbeafe;
+    }
+
+    .btn-warn {
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+
+    .btn-solid-primary {
+      background: #2563eb;
+      border-color: #1d4ed8;
+      color: #ffffff;
+    }
+
+    .btn-solid-primary:hover {
+      background: #1d4ed8;
+      border-color: #1e40af;
+    }
+
+    /* Row 2: Pinned HITL Alert Banner */
+    .hitl-banner {
+      border-radius: var(--radius-md);
+      padding: 8px 14px;
+      border: 1.5px solid var(--err-border);
+      background: var(--err-bg);
+      color: var(--err-text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .hitl-banner[data-tone="warn"] {
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+
+    .hitl-banner[data-tone="info"] {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    .hitl-banner[hidden] {
+      display: none;
+    }
+
+    .hitl-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .hitl-headline {
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .hitl-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .hitl-actions .btn-secondary {
+      background: var(--surface-card);
+      color: var(--text-primary);
+      border-color: var(--border-subtle);
+    }
+
+    .hitl-actions .btn-secondary:hover {
+      background: var(--surface-subtle);
+      border-color: var(--border-strong);
+    }
+
+    .hitl-divider {
+      width: 1px;
+      height: 18px;
+      background: rgba(122, 31, 31, 0.25);
+      margin: 0 3px;
+    }
+
+    /* Main Grid Layout */
+    .workspace-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.38fr) minmax(0, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .panel {
+      background: var(--surface-card);
+      border: 1.5px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 11px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+      transition: box-shadow 220ms ease, border-color 220ms ease;
+    }
+
+    .panel-emph {
+      border-color: #94a3b8;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+    }
+
+    @keyframes inspectorPulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.45);
+        border-color: var(--run-border);
+      }
+      100% {
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+        border-color: #94a3b8;
+      }
+    }
+
+    .panel-flash {
+      animation: inspectorPulse 520ms ease-out;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .panel-subtitle {
+      font-size: 12.5px;
+      color: var(--text-muted);
+    }
+
+    /* DAG Canvas */
+    .dag-viewport {
+      width: 100%;
+      overflow-x: auto;
+      background: #f8fafc;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 4px;
+    }
+
+    .dag-svg {
+      display: block;
+      width: 100%;
+      min-width: 660px;
+      height: 222px;
+      font-family: var(--font-sans);
+    }
+
+    .dag-node-group {
+      cursor: pointer;
+    }
+
+    .dag-node-group:hover rect.node-box {
+      stroke-width: 2.6px;
+    }
+
+    .dag-legend {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    /* Swimlanes */
+    .swimlanes-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+      justify-content: space-between;
+    }
+
+    .swimlane-row {
+      background: var(--surface-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 8px 11px;
+      display: grid;
+      grid-template-columns: 116px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+    }
+
+    .swimlane-actor {
+      font-family: var(--font-mono);
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .swimlane-blocks {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .lane-chip {
+      font-family: var(--font-sans);
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: var(--radius-sm);
+      border: 1.6px solid var(--border-subtle);
+      background: var(--surface-card);
+      color: var(--text-primary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: transform 100ms ease, box-shadow 120ms ease;
+    }
+
+    .lane-chip:hover {
+      transform: translateY(-1px);
+    }
+
+    .lane-chip[data-status="accepted"] {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+    }
+
+    .lane-chip[data-status="running"],
+    .lane-chip[data-status="verifying"] {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    .lane-chip[data-status="blocked"],
+    .lane-chip[data-status="failed"] {
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-text);
+    }
+
+    .lane-chip[data-selected="true"] {
+      box-shadow: 0 0 0 2px var(--text-primary);
+    }
+
+    .swimlane-telemetry {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      padding: 7px 10px;
+      border-radius: var(--radius-sm);
+      background: #f8fafc;
+      border: 1px solid var(--border-subtle);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .telemetry-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .telemetry-label {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .telemetry-val {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Requirement Traceability Matrix Summary Strip + Table */
+    .fr-strip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .fr-pill {
+      border-radius: 999px;
+      border: 1px solid var(--border-subtle);
+      background: var(--surface-subtle);
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .fr-pill[data-tone="ok"] {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+    }
+
+    .fr-pill[data-tone="run"] {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    .fr-pill[data-tone="err"] {
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-text);
+    }
+
+    .fr-pill[data-tone="warn"] {
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+
+    /* Modern Web Guidance: responsive-table */
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(265px, 52vh);
+      container-type: inline-size;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+    }
+
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--run-border);
+      outline-offset: 2px;
+    }
+
+    table.matrix-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 12.5px;
+      --label-2: "来源与需求描述";
+      --label-3: "承接任务";
+      --label-4: "验收状态与证据";
+    }
+
+    table.matrix-table caption {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    table.matrix-table thead {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 1;
+      background: var(--surface-subtle);
+    }
+
+    table.matrix-table th,
+    table.matrix-table td {
+      padding: 6px 9px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-subtle);
+      vertical-align: top;
+      line-height: 1.4;
+    }
+
+    table.matrix-table thead th {
+      font-weight: 700;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    table.matrix-table tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      background: var(--surface-card);
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    @container (width < 600px) {
+      table.matrix-table,
+      table.matrix-table thead,
+      table.matrix-table tbody,
+      table.matrix-table tr,
+      table.matrix-table th,
+      table.matrix-table td {
+        display: block;
+      }
+
+      table.matrix-table thead {
+        display: none;
+      }
+
+      table.matrix-table tr {
+        margin-block-end: 0.65rem;
+        border: 1px solid var(--border-subtle);
+      }
+
+      table.matrix-table tbody th {
+        position: sticky;
+        inset-block-start: 0;
+        z-index: 2;
+        background: var(--surface-subtle);
+      }
+
+      table.matrix-table td:nth-child(2)::before {
+        content: var(--label-2) "：";
+        font-weight: 700;
+      }
+
+      table.matrix-table td:nth-child(3)::before {
+        content: var(--label-3) "：";
+        font-weight: 700;
+      }
+
+      table.matrix-table td:nth-child(4)::before {
+        content: var(--label-4) "：";
+        font-weight: 700;
+      }
+    }
+
+    /* Task Execution Detail Inspector */
+    .inspector-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      max-width: 100%;
+    }
+
+    .tab-btn {
+      font-family: var(--font-sans);
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 4px 9px;
+      border-radius: var(--radius-sm);
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .tab-btn[aria-selected="true"] {
+      background: var(--surface-subtle);
+      border-color: var(--border-subtle);
+      color: var(--text-primary);
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: 74px minmax(0, 1fr);
+      row-gap: 6px;
+      column-gap: 10px;
+      font-size: 13px;
+      line-height: 1.45;
+      align-items: baseline;
+    }
+
+    .kv-label {
+      font-weight: 700;
+      color: var(--text-secondary);
+    }
+
+    .kv-value {
+      color: var(--text-primary);
+      word-break: break-word;
+    }
+
+    .kv-mono {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+    }
+
+    .code-box {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.45;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      overflow: auto;
+      max-height: 112px;
+      margin: 0;
+      white-space: pre-wrap;
+    }
+
+    .event-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      max-height: 235px;
+      overflow-y: auto;
+    }
+
+    .event-row {
+      display: grid;
+      grid-template-columns: 48px 128px 104px minmax(0, 1fr);
+      gap: 6px;
+      padding: 5px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-subtle);
+      font-size: 12.5px;
+      align-items: baseline;
+    }
+
+    /* Status Badge Pill */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      font-weight: 700;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .status-badge[data-status="verified"],
+    .status-badge[data-status="accepted"] {
+      background: var(--ok-bg);
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+    }
+
+    .status-badge[data-status="unverified_risk_accepted"] {
+      background: var(--warn-bg);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+
+    .status-badge[data-status="failed"],
+    .status-badge[data-status="blocked"] {
+      background: var(--err-bg);
+      border-color: var(--err-border);
+      color: var(--err-text);
+    }
+
+    .status-badge[data-status="running"],
+    .status-badge[data-status="verifying"] {
+      background: var(--run-bg);
+      border-color: var(--run-border);
+      color: var(--run-text);
+    }
+
+    /* Modern Web Guidance: dialog + light-dismiss-a-dialog */
+    dialog[open] {
+      border: 1.5px solid var(--border-strong);
+      border-radius: var(--radius-md);
+      padding: 18px 20px;
+      max-width: 480px;
+      width: calc(100vw - 32px);
+      background: var(--surface-card);
+      color: var(--text-primary);
+      box-shadow: 0 20px 35px -10px rgba(15, 23, 42, 0.28);
+    }
+
+    dialog:modal {
+      overscroll-behavior: contain;
+    }
+
+    dialog::backdrop {
+      overflow: hidden;
+      overscroll-behavior: contain;
+      background-color: rgba(15, 23, 42, 0.45);
+      backdrop-filter: blur(2px);
+    }
+
+    .dialog-title {
+      margin: 0 0 8px;
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .dialog-desc {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    .dialog-field {
+      width: 100%;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: 1.5px solid var(--border-subtle);
+      margin-bottom: 12px;
+      resize: vertical;
+    }
+
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .toast-bar {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 13.5px;
+      font-weight: 600;
+      box-shadow: 0 10px 25px rgba(15, 23, 42, 0.25);
+      z-index: 30;
+    }
+
+    .toast-bar[hidden] {
+      display: none;
+    }
+
+    @media (max-width: 1024px) {
+      .workspace-grid {
+        grid-template-columns: 1fr;
+      }
+      .swimlane-row {
+        grid-template-columns: 1fr;
+      }
+      .event-row {
+        grid-template-columns: 48px 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="console-shell">
+    <!-- Row 1: Compact Workspace Topbar -->
+    <header class="topbar" aria-label="编排阶段进度与全局控制">
+      <div class="brand-group">
+        <h1 class="brand-title">Ariadne 研发编排控制台</h1>
+        <label for="run-selector" class=" panel-subtitle">运行实例</label>
+        <select id="run-selector" class="run-select" aria-label="切换运行实例"></select>
+      </div>
+
+      <nav class="stage-pipeline" id="stage-pipeline" aria-label="阶段进度"></nav>
+
+      <div class="topbar-meta">
+        <span class="metric-pill" id="progress-pill">必要任务：0 / 0</span>
+        <span class="metric-pill" id="budget-pill">预算：0 / 120</span>
+        <span class="metric-pill" id="rev-pill">版本：r1</span>
+        <button type="button" class="btn btn-danger" id="btn-toggle-pause">暂停全部</button>
+      </div>
+    </header>
+
+    <!-- Row 2: Pinned HITL Gate Banner -->
+    <section class="hitl-banner" id="hitl-banner" aria-live="polite">
+      <div class="hitl-title-wrap">
+        <span id="hitl-icon" aria-hidden="true">✕</span>
+        <span class="hitl-headline" id="hitl-headline">正在加载编排状态…</span>
+      </div>
+      <div class="hitl-actions" id="hitl-actions">
+        <button type="button" class="btn btn-secondary" id="btn-banner-inspect">查看定位</button>
+        <button type="button" class="btn btn-solid-primary" id="btn-banner-hint">注入提示</button>
+        <button type="button" class="btn btn-primary" id="btn-banner-retry">重试</button>
+        <button type="button" class="btn btn-secondary" id="btn-banner-reassign">改派给人</button>
+        <span class="hitl-divider" aria-hidden="true"></span>
+        <button type="button" class="btn btn-warn" id="btn-banner-accept-risk">接受风险</button>
+      </div>
+    </section>
+
+    <!-- Row 3: Task Dependency Graph + Agent Execution Swimlanes -->
+    <main class="workspace-grid">
+      <section class="panel" aria-labelledby="dag-heading">
+        <div class="panel-head">
+          <h2 class="panel-title" id="dag-heading">任务依赖图</h2>
+          <div class="dag-legend" aria-label="图例">
+            <span class="legend-item"><strong style="color:var(--ok-border)">✓</strong> 已验收</span>
+            <span class="legend-item"><strong style="color:var(--run-border)">▶</strong> 运行中</span>
+            <span class="legend-item"><strong style="color:var(--err-border)">✕</strong> 阻塞</span>
+            <span class="legend-item"><strong style="color:var(--warn-border)">⚠</strong> 人工接受</span>
+            <span class="legend-item"><strong style="color:var(--wait-border)">◷</strong> 等待</span>
+            <span class="legend-item"><span style="display:inline-block;width:20px;height:3px;background:#475569"></span> 关键路径</span>
+            <span class="legend-item"><span style="display:inline-block;width:20px;border-top:2px dashed var(--err-border)"></span> 阻塞传递</span>
+          </div>
+        </div>
+        <div class="dag-viewport scroller">
+          <svg class="dag-svg" id="dag-svg" viewBox="0 0 860 222" role="img" aria-label="任务依赖有向无环图"></svg>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="swimlane-heading">
+        <div class="panel-head">
+          <h2 class="panel-title" id="swimlane-heading">Agent 泳道（时间 →）</h2>
+          <span class="metric-pill" id="swimlane-badge">3 隔离通道</span>
+        </div>
+        <div class="swimlanes-list" id="swimlanes-list"></div>
+        <div class="swimlane-telemetry" id="swimlane-telemetry" aria-label="沙盒隔离与写锁状态"></div>
+      </section>
+
+      <!-- Row 4: Requirement Traceability Matrix + Selected Task Inspector -->
+      <section class="panel" aria-labelledby="matrix-heading" id="matrix-panel">
+        <div class="panel-head">
+          <h2 class="panel-title" id="matrix-heading">需求追踪矩阵</h2>
+          <div class="fr-strip" id="fr-strip" aria-label="需求验证状态汇总"></div>
+        </div>
+        <div tabindex="0" role="region" aria-labelledby="matrix-caption" class="table-wrapper scroller">
+          <table class="matrix-table">
+            <caption id="matrix-caption">需求与任务双向追踪及验收结果表</caption>
+            <thead>
+              <tr>
+                <th scope="col">需求编号</th>
+                <th scope="col">来源与需求描述</th>
+                <th scope="col">承接任务</th>
+                <th scope="col">验收状态与证据</th>
+              </tr>
+            </thead>
+            <tbody id="matrix-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel panel-emph" aria-labelledby="inspector-heading" id="inspector-panel">
+        <div class="panel-head">
+          <h2 class="panel-title" id="inspector-heading">任务执行详情</h2>
+          <div class="inspector-tabs" role="tablist" aria-label="任务详情视图切换">
+            <button type="button" role="tab" class="tab-btn" data-tab="overview" aria-selected="true">执行概览与归因</button>
+            <button type="button" role="tab" class="tab-btn" data-tab="artifacts" aria-selected="false">产物 Diff 与审查</button>
+            <button type="button" role="tab" class="tab-btn" data-tab="events" aria-selected="false">事件溯源日志</button>
+          </div>
+        </div>
+        <div id="inspector-body"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Native Modal Dialog for HITL Commands (Modern Web Guidance: dialog + light-dismiss-a-dialog) -->
+  <dialog id="hitl-dialog" closedby="any" aria-labelledby="hitl-dialog-title">
+    <form method="dialog" id="hitl-dialog-form">
+      <h2 class="dialog-title" id="hitl-dialog-title">人工关口操作</h2>
+      <p class="dialog-desc" id="hitl-dialog-desc"></p>
+      <label for="hitl-dialog-input" id="hitl-dialog-label" style="display:block;font-weight:700;margin-bottom:6px;">补充说明</label>
+      <textarea id="hitl-dialog-input" class="dialog-field" rows="3" placeholder="请输入提示或风险接受理由…"></textarea>
+      <div class="dialog-actions">
+        <button type="submit" class="btn" value="cancel" autofocus>取消</button>
+        <button type="submit" class="btn btn-primary" id="hitl-dialog-submit" value="confirm">确认提交</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-bar" id="toast-bar" role="status" aria-live="polite" hidden></div>
+
+  <script>
+    (() => {
+      const state = {
+        runs: [],
+        currentRunId: null,
+        projection: null,
+        selectedTaskId: null,
+        activeTab: "overview",
+        pendingDialogAction: null,
+        sse: null,
+      };
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("tab")) {
+        state.activeTab = params.get("tab");
+      }
+
+      const elRunSelector = document.getElementById("run-selector");
+      const elStagePipeline = document.getElementById("stage-pipeline");
+      const elProgressPill = document.getElementById("progress-pill");
+      const elBudgetPill = document.getElementById("budget-pill");
+      const elRevPill = document.getElementById("rev-pill");
+      const elBtnTogglePause = document.getElementById("btn-toggle-pause");
+      const elHitlBanner = document.getElementById("hitl-banner");
+      const elHitlHeadline = document.getElementById("hitl-headline");
+      const elDagSvg = document.getElementById("dag-svg");
+      const elSwimlanesList = document.getElementById("swimlanes-list");
+      const elFrStrip = document.getElementById("fr-strip");
+      const elMatrixTbody = document.getElementById("matrix-tbody");
+      const elInspectorHeading = document.getElementById("inspector-heading");
+      const elInspectorBody = document.getElementById("inspector-body");
+      const elDialog = document.getElementById("hitl-dialog");
+      const elDialogTitle = document.getElementById("hitl-dialog-title");
+      const elDialogDesc = document.getElementById("hitl-dialog-desc");
+      const elDialogLabel = document.getElementById("hitl-dialog-label");
+      const elDialogInput = document.getElementById("hitl-dialog-input");
+      const elToast = document.getElementById("toast-bar");
+
+      function showToast(msg) {
+        elToast.textContent = msg;
+        elToast.hidden = false;
+        clearTimeout(showToast._timer);
+        showToast._timer = setTimeout(() => {
+          elToast.hidden = true;
+        }, 3200);
+      }
+
+      function statusMeta(status, riskReason) {
+        if (status === "accepted" && riskReason) {
+          return { icon: "⚠", label: "人工接受", fill: "#fef4e6", stroke: "#d97706", text: "#7c2d12" };
+        }
+        switch (status) {
+          case "accepted":
+          case "verified":
+          case "done":
+            return { icon: "✓", label: "已验收", fill: "#e6f6ee", stroke: "#2f9e6e", text: "#135337" };
+          case "running":
+          case "verifying":
+          case "active":
+            return { icon: "▶", label: status === "verifying" ? "待验收" : "运行中", fill: "#eaf2ff", stroke: "#2563eb", text: "#1e40af" };
+          case "blocked":
+          case "failed":
+            return { icon: "✕", label: status === "blocked" ? "阻塞" : "失败", fill: "#fdecec", stroke: "#d64545", text: "#7a1f1f" };
+          case "unverified_risk_accepted":
+            return { icon: "⚠", label: "未验证 · 人工接受", fill: "#fef4e6", stroke: "#d97706", text: "#7c2d12" };
+          default:
+            return { icon: "◷", label: status === "ready" ? "就绪" : "等待", fill: "#f5f6f8", stroke: "#94a3b8", text: "#334155" };
+        }
+      }
+
+      function escapeHtml(str) {
+        return String(str ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function renderTopbar(proj) {
+        elStagePipeline.innerHTML = proj.stage_pipeline
+          .map((s, idx) => {
+            const icon = s.status === "done" ? "✓" : s.status === "active" ? "▶" : s.status === "blocked" ? "✕" : "◷";
+            const arrow = idx < proj.stage_pipeline.length - 1 ? '<span class="stage-arrow">→</span>' : "";
+            return `<span class="stage-step" data-status="${escapeHtml(s.status)}"><span>${icon}</span><span>${escapeHtml(s.label)}</span></span>${arrow}`;
+          })
+          .join("");
+
+        elProgressPill.textContent = `已验收：${proj.progress.ratio_text}`;
+        elBudgetPill.textContent = `预算：${proj.budget.calls_used} / ${proj.budget.max_calls}`;
+        elRevPill.textContent = `修订：r${proj.state_revision}`;
+
+        if (proj.status === "paused") {
+          elBtnTogglePause.textContent = "恢复运行";
+          elBtnTogglePause.className = "btn btn-primary";
+        } else {
+          elBtnTogglePause.textContent = "暂停全部";
+          elBtnTogglePause.className = "btn btn-danger";
+        }
+      }
+
+      function renderBanner(proj) {
+        const b = proj.hitl_banner;
+        if (!b) {
+          elHitlBanner.hidden = true;
+          return;
+        }
+        elHitlBanner.hidden = false;
+        elHitlBanner.dataset.tone = b.tone || "danger";
+        elHitlHeadline.textContent = b.headline;
+      }
+
+      function renderDag(proj) {
+        const nodes = proj.dag.nodes || [];
+        const edges = proj.dag.edges || [];
+        if (!nodes.length) {
+          elDagSvg.innerHTML = '<text x="40" y="150" fill="#475569" font-size="14">当前运行尚未生成任务 DAG</text>';
+          return;
+        }
+
+        // Group nodes by topological layer
+        const byLayer = new Map();
+        for (const n of nodes) {
+          const l = n.layer || 0;
+          if (!byLayer.has(l)) byLayer.set(l, []);
+          byLayer.get(l).push(n);
+        }
+        const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
+        const maxLayer = Math.max(...layers, 1);
+        const nodeW = 110;
+        const nodeH = 50;
+        const rowGap = 15;
+        const svgW = Math.max(820, (maxLayer + 1) * 164 + 32);
+        const svgH = 222;
+        elDagSvg.setAttribute("viewBox", `0 0 ${svgW} ${svgH}`);
+
+        const coords = new Map();
+        layers.forEach((l, colIdx) => {
+          const colNodes = byLayer.get(l);
+          const x = 24 + colIdx * 162;
+          const totalH = colNodes.length * nodeH + (colNodes.length - 1) * rowGap;
+          const startY = Math.max(14, Math.round((svgH - totalH) / 2));
+          colNodes.forEach((n, rowIdx) => {
+            const y = startY + rowIdx * (nodeH + rowGap);
+            coords.set(n.task_id, { x, y, cx: x + nodeW / 2, cy: y + nodeH / 2, node: n });
+          });
+        });
+
+        let svg = `
+          <defs>
+            <marker id="arrow-norm" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto">
+              <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+            </marker>
+            <marker id="arrow-block" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto">
+              <path d="M0,0 L10,5 L0,10 z" fill="#d64545"/>
+            </marker>
+          </defs>
+        `;
+
+        for (const e of edges) {
+          const src = coords.get(e.from);
+          const dst = coords.get(e.to);
+          if (!src || !dst) continue;
+          const x1 = src.x + nodeW;
+          const y1 = src.cy;
+          const x2 = dst.x;
+          const y2 = dst.cy;
+          const midX = (x1 + x2) / 2;
+          const stroke = e.blocked_edge ? "#d64545" : "#64748b";
+          const width = e.critical ? "3.2" : (e.blocked_edge ? "2.2" : "1.5");
+          const dash = e.blocked_edge ? 'stroke-dasharray="7 5"' : "";
+          const marker = e.blocked_edge ? "url(#arrow-block)" : "url(#arrow-norm)";
+          svg += `<path d="M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}" fill="none" stroke="${stroke}" stroke-width="${width}" ${dash} marker-end="${marker}"/>`;
+        }
+
+        for (const [tid, pos] of coords.entries()) {
+          const n = pos.node;
+          const meta = statusMeta(n.status, n.accepted_risk_reason);
+          const selected = tid === state.selectedTaskId;
+          const strokeColor = selected ? "#111827" : meta.stroke;
+          const strokeW = selected ? "2.6" : "1.8";
+          svg += `
+            <g class="dag-node-group" data-task-id="${escapeHtml(tid)}" tabindex="0" role="button" aria-label="任务 ${escapeHtml(tid)} ${escapeHtml(meta.label)}">
+              <rect class="node-box" x="${pos.x}" y="${pos.y}" width="${nodeW}" height="${nodeH}" rx="6" fill="${meta.fill}" stroke="${strokeColor}" stroke-width="${strokeW}"/>
+              <text x="${pos.cx}" y="${pos.y + 20}" font-size="14" text-anchor="middle" font-weight="700" fill="#111827">${escapeHtml(tid)}</text>
+              <text x="${pos.cx}" y="${pos.y + 39}" font-size="12.5" text-anchor="middle" font-weight="600" fill="${meta.text}">${meta.icon} ${escapeHtml(meta.label)}</text>
+            </g>
+          `;
+        }
+
+        elDagSvg.innerHTML = svg;
+        elDagSvg.querySelectorAll(".dag-node-group").forEach((g) => {
+          g.addEventListener("click", () => {
+            selectTask(g.dataset.taskId);
+          });
+          g.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              selectTask(g.dataset.taskId);
+            }
+          });
+        });
+      }
+
+      function renderSwimlanes(proj) {
+        const lanes = proj.swimlanes || [];
+        const badgeEl = document.getElementById("swimlane-badge");
+        if (badgeEl) {
+          badgeEl.textContent = `${lanes.length} 隔离通道`;
+        }
+        elSwimlanesList.innerHTML = lanes
+          .map((lane) => {
+            const chips = (lane.items || [])
+              .map((item) => {
+                const meta = statusMeta(item.status, null);
+                const selected = item.task_id && item.task_id === state.selectedTaskId;
+                return `<button type="button" class="lane-chip" data-task-id="${escapeHtml(item.task_id || "")}" data-status="${escapeHtml(item.status)}" data-selected="${selected}">
+                  <span>${meta.icon}</span>
+                  <span>${escapeHtml(item.label)}</span>
+                </button>`;
+              })
+              .join("");
+            return `
+              <div class="swimlane-row">
+                <div class="swimlane-actor">${escapeHtml(lane.actor)}</div>
+                <div class="swimlane-blocks">${chips}</div>
+              </div>
+            `;
+          })
+          .join("");
+
+        elSwimlanesList.querySelectorAll(".lane-chip").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            if (btn.dataset.taskId) {
+              selectTask(btn.dataset.taskId);
+            }
+          });
+        });
+
+        const telemetryEl = document.getElementById("swimlane-telemetry");
+        if (telemetryEl) {
+          const nodes = proj.dag.nodes || [];
+          const activeNodes = nodes.filter((n) => n.status === "running" || n.status === "verifying");
+          const activeLocks = activeNodes.map((n) => n.task_id).join(", ") || "无活动锁";
+          const selTask = nodes.find((n) => n.task_id === state.selectedTaskId) || nodes[0];
+          const selScope = selTask && selTask.write_scope && selTask.write_scope.length
+            ? selTask.write_scope[0]
+            : "只读沙盒";
+          telemetryEl.innerHTML = `
+            <div class="telemetry-cell">
+              <span class="telemetry-label">沙盒隔离 (git worktree)</span>
+              <span class="telemetry-val">${lanes.length} 通道 · 0 交叉污染</span>
+            </div>
+            <div class="telemetry-cell">
+              <span class="telemetry-label">并发写锁持有</span>
+              <span class="telemetry-val">${escapeHtml(activeLocks)}</span>
+            </div>
+            <div class="telemetry-cell">
+              <span class="telemetry-label">选中任务写入边界</span>
+              <span class="telemetry-val">${escapeHtml(selScope)}</span>
+            </div>
+          `;
+        }
+      }
+
+      function renderTraceabilityMatrix(proj) {
+        const rows = proj.traceability_matrix || [];
+        const counts = { verified: 0, running: 0, failed: 0, risk: 0, pending: 0 };
+        for (const r of rows) {
+          if (r.verification_status === "verified") counts.verified++;
+          else if (r.verification_status === "running") counts.running++;
+          else if (r.verification_status === "failed") counts.failed++;
+          else if (r.verification_status === "unverified_risk_accepted") counts.risk++;
+          else counts.pending++;
+        }
+        const pills = [];
+        if (counts.verified > 0) pills.push(`<span class="fr-pill" data-tone="ok">✓ 已验证 ${counts.verified}</span>`);
+        if (counts.running > 0) pills.push(`<span class="fr-pill" data-tone="run">▶ 验证中 ${counts.running}</span>`);
+        if (counts.failed > 0) pills.push(`<span class="fr-pill" data-tone="err">✕ 失败 ${counts.failed}</span>`);
+        if (counts.risk > 0) pills.push(`<span class="fr-pill" data-tone="warn">⚠ 人工接受 ${counts.risk}</span>`);
+        if (counts.pending > 0) pills.push(`<span class="fr-pill">◷ 待验证 ${counts.pending}</span>`);
+        elFrStrip.innerHTML = pills.join("");
+
+        elMatrixTbody.innerHTML = rows
+          .map((r) => {
+            const meta = statusMeta(r.verification_status, null);
+            const taskBadges = (r.task_ids || [])
+              .map((tid) => `<button type="button" class="btn" style="padding:1px 6px;font-size:11.5px;" data-jump-task="${escapeHtml(tid)}">${escapeHtml(tid)}</button>`)
+              .join(" ");
+            return `
+              <tr>
+                <th scope="row">${escapeHtml(r.requirement_id)}</th>
+                <td><strong>[${escapeHtml(r.source_ref)}]</strong> ${escapeHtml(r.description)}</td>
+                <td>${taskBadges || "—"}</td>
+                <td>
+                  <span class="status-badge" data-status="${escapeHtml(r.verification_status)}">${meta.icon} ${escapeHtml(r.verification_label)}</span>
+                  <span style="margin-left:4px;color:var(--text-secondary);">${escapeHtml(r.evidence_note)}</span>
+                </td>
+              </tr>
+            `;
+          })
+          .join("");
+
+        elMatrixTbody.querySelectorAll("[data-jump-task]").forEach((btn) => {
+          btn.addEventListener("click", () => selectTask(btn.dataset.jumpTask));
+        });
+      }
+
+      function renderInspector(proj) {
+        const nodes = proj.dag.nodes || [];
+        const task = nodes.find((n) => n.task_id === state.selectedTaskId) || nodes[0];
+        if (!task) {
+          elInspectorHeading.textContent = "任务执行详情";
+          elInspectorBody.innerHTML = '<p class="panel-subtitle">暂无选中任务</p>';
+          return;
+        }
+        state.selectedTaskId = task.task_id;
+        elInspectorHeading.textContent = `任务执行详情（选中 ${task.task_id}）`;
+
+        document.querySelectorAll(".tab-btn").forEach((btn) => {
+          btn.setAttribute("aria-selected", btn.dataset.tab === state.activeTab ? "true" : "false");
+        });
+
+        if (state.activeTab === "overview") {
+          const meta = statusMeta(task.status, task.accepted_risk_reason);
+          const retryText = task.status === "blocked"
+            ? `重试 ${task.attempt} / ${task.max_cycles}（额度用尽）`
+            : `重试 ${task.attempt} / ${task.max_cycles}`;
+          const riskBanner = task.accepted_risk_reason
+            ? `<div style="margin-top:6px;padding:6px 9px;border-radius:6px;background:var(--warn-bg);border:1px solid var(--warn-border);color:var(--warn-text);font-weight:600;font-size:12.5px;">
+                 ⚠ 未验证 · 人工接受理由：${escapeHtml(task.accepted_risk_reason)}
+               </div>`
+            : "";
+
+          elInspectorBody.innerHTML = `
+            <div class="kv-grid">
+              <div class="kv-label">任务目标</div>
+              <div class="kv-value"><strong>${escapeHtml(task.title)}</strong> — ${escapeHtml(task.objective)}</div>
+              <div class="kv-label">状态与重试</div>
+              <div class="kv-value">
+                <span class="status-badge" data-status="${escapeHtml(task.accepted_risk_reason ? "unverified_risk_accepted" : task.status)}">${meta.icon} ${escapeHtml(meta.label)}</span>
+                <span class="kv-mono" style="margin-left:8px;color:var(--text-secondary);">${escapeHtml(retryText)}</span>
+              </div>
+              <div class="kv-label">执行者</div>
+              <div class="kv-value kv-mono">${escapeHtml(task.executor)}（写入范围：${escapeHtml((task.write_scope || []).join(", "))}）</div>
+              <div class="kv-label">工具调用</div>
+              <div class="kv-value kv-mono">${escapeHtml(task.diagnostic_tool)}</div>
+              <div class="kv-label">失败输出</div>
+              <div class="kv-value" style="color:${task.status === "blocked" || task.status === "failed" ? "var(--err-text)" : "var(--text-primary)"};font-weight:600;">${escapeHtml(task.diagnostic_output)}</div>
+              <div class="kv-label">归因建议</div>
+              <div class="kv-value">${escapeHtml(task.diagnostic_attribution)}</div>
+            </div>
+            ${riskBanner}
+          `;
+        } else if (state.activeTab === "artifacts") {
+          const art = task.artifacts || {};
+          const logs = Object.entries(art.check_logs || {})
+            .map(([k, v]) => `[${k}]\n${v}`)
+            .join("\n\n");
+          const verdicts = (art.verdicts || [])
+            .map((v) => JSON.stringify(v, null, 2))
+            .join("\n\n");
+          elInspectorBody.innerHTML = `
+            <div style="display:flex;flex-direction:column;gap:6px;">
+              <div style="font-weight:700;font-size:12.5px;color:var(--text-secondary);">沙盒产物 Diff (diff.patch)</div>
+              <pre class="code-box scroller">${escapeHtml(art.diff_patch || "（该任务暂无 diff.patch 记录）")}</pre>
+              <div style="font-weight:700;font-size:12.5px;color:var(--text-secondary);">验收检查与 Argus 独立复核记录</div>
+              <pre class="code-box scroller">${escapeHtml([logs, verdicts].filter(Boolean).join("\n\n") || "（暂无检查日志或复核记录）")}</pre>
+            </div>
+          `;
+        } else {
+          const evs = (proj.events || []).slice().reverse();
+          elInspectorBody.innerHTML = `
+            <div class="event-list scroller">
+              ${evs
+                .map(
+                  (e) => `
+                <div class="event-row">
+                  <span class="kv-mono">#${e.event_seq}</span>
+                  <span class="kv-mono">${escapeHtml(e.event_type)}</span>
+                  <span class="kv-mono">${escapeHtml(e.actor)}</span>
+                  <span>r${e.state_revision} · ${escapeHtml(JSON.stringify(e.payload || {}))}</span>
+                </div>`
+                )
+                .join("")}
+            </div>
+          `;
+        }
+      }
+
+      function selectTask(taskId) {
+        if (!state.projection) return;
+        state.selectedTaskId = taskId;
+        renderDag(state.projection);
+        renderSwimlanes(state.projection);
+        renderInspector(state.projection);
+        const inspPanel = document.getElementById("inspector-panel");
+        if (inspPanel) {
+          inspPanel.classList.remove("panel-flash");
+          void inspPanel.offsetWidth;
+          inspPanel.classList.add("panel-flash");
+        }
+      }
+
+      function renderAll(proj) {
+        state.projection = proj;
+        if (!state.selectedTaskId) {
+          const requestedTask = params.get("task");
+          const blocked = (proj.dag.nodes || []).find((n) => n.status === "blocked" || n.status === "failed");
+          state.selectedTaskId = requestedTask || (blocked ? blocked.task_id : ((proj.dag.nodes || [])[0] || {}).task_id);
+        }
+        renderTopbar(proj);
+        renderBanner(proj);
+        renderDag(proj);
+        renderSwimlanes(proj);
+        renderTraceabilityMatrix(proj);
+        renderInspector(proj);
+      }
+
+      async function loadRun(runId) {
+        state.currentRunId = runId;
+        const resp = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+        const data = await resp.json();
+        if (!data.ok) {
+          showToast(data.error || "加载运行实例失败");
+          return;
+        }
+        renderAll(data.projection);
+        connectSse(runId, data.projection.latest_event_seq || 0);
+      }
+
+      function connectSse(runId, afterSeq) {
+        if (state.sse) {
+          state.sse.close();
+          state.sse = null;
+        }
+        if (typeof EventSource === "undefined") return;
+        const es = new EventSource(`/api/runs/${encodeURIComponent(runId)}/stream?after_seq=${afterSeq}`);
+        es.addEventListener("state", async (ev) => {
+          try {
+            const payload = JSON.parse(ev.data);
+            if (state.projection && payload.state_revision !== state.projection.state_revision) {
+              const r = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+              const d = await r.json();
+              if (d.ok) renderAll(d.projection);
+            }
+          } catch (_) {
+            // ignore transient parse errors
+          }
+        });
+        state.sse = es;
+      }
+
+      async function sendHitlCommand(body, successMessage) {
+        if (!state.currentRunId || !state.projection) return;
+        const payload = {
+          operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          expected_state_revision: state.projection.state_revision,
+          actor: "zeus",
+          ...body,
+        };
+        const resp = await fetch(`/api/runs/${encodeURIComponent(state.currentRunId)}/command`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!data.ok) {
+          showToast(`操作被拒绝：${data.error || "未知错误"}`);
+          return;
+        }
+        renderAll(data.projection);
+        showToast(successMessage);
+      }
+
+      function openHitlModal(config) {
+        state.pendingDialogAction = config;
+        elDialogTitle.textContent = config.title;
+        elDialogDesc.textContent = config.description;
+        elDialogLabel.textContent = config.label;
+        elDialogInput.value = config.defaultValue || "";
+        elDialogInput.placeholder = config.placeholder || "";
+        elDialog.showModal();
+      }
+
+      // Modern Web Guidance: reset dialog.returnValue on close so Esc never leaks stale value
+      elDialog.addEventListener("close", async () => {
+        const choice = elDialog.returnValue;
+        elDialog.returnValue = "";
+        const pending = state.pendingDialogAction;
+        state.pendingDialogAction = null;
+        if (choice !== "confirm" || !pending) return;
+
+        const text = elDialogInput.value.trim();
+        if (pending.requireNonEmpty && !text) {
+          showToast("必须填写理由或提示后才能提交");
+          return;
+        }
+        await pending.onConfirm(text);
+      });
+
+      // Modern Web Guidance: MANDATORY fallback for browsers without native dialog.closedBy
+      if (!("closedBy" in HTMLDialogElement.prototype)) {
+        elDialog.addEventListener("click", (event) => {
+          if (event.target !== elDialog) return;
+          const rect = elDialog.getBoundingClientRect();
+          const isDialogContent =
+            rect.top <= event.clientY &&
+            event.clientY <= rect.top + rect.height &&
+            rect.left <= event.clientX &&
+            event.clientX <= rect.left + rect.width;
+          if (isDialogContent) return;
+          elDialog.close();
+        });
+      }
+
+      // Wire topbar & banner buttons
+      elBtnTogglePause.addEventListener("click", async () => {
+        if (!state.projection) return;
+        const action = state.projection.status === "paused" ? "resume" : "pause";
+        await sendHitlCommand(
+          { action },
+          action === "pause" ? "已暂停新任务派发" : "已恢复任务编排调度"
+        );
+      });
+
+      document.getElementById("btn-banner-inspect").addEventListener("click", () => {
+        const tid = state.projection?.hitl_banner?.task_id || state.selectedTaskId;
+        if (tid) {
+          state.activeTab = "overview";
+          selectTask(tid);
+        }
+      });
+
+      document.getElementById("btn-banner-retry").addEventListener("click", async () => {
+        const tid = state.projection?.hitl_banner?.task_id || state.selectedTaskId;
+        if (!tid) return;
+        await sendHitlCommand(
+          { action: "retry_task", task_id: tid, hint: "" },
+          `已将任务 ${tid} 重置为就绪 (READY)`
+        );
+      });
+
+      document.getElementById("btn-banner-hint").addEventListener("click", () => {
+        const tid = state.projection?.hitl_banner?.task_id || state.selectedTaskId;
+        if (!tid) return;
+        openHitlModal({
+          title: `向任务 ${tid} 注入人工提示并重试`,
+          description: "提示原文将保留在审计事件中，并随下次隔离沙盒执行一并注入 Worker 上下文，不直接篡改需求契约。",
+          label: "注入提示内容",
+          defaultValue: "在 BEGIN IMMEDIATE 事务内同时执行 SELECT WAITLISTED 与 UPDATE status='CONFIRMED'，避免并发取消重复递补。",
+          requireNonEmpty: true,
+          onConfirm: async (hint) => {
+            await sendHitlCommand(
+              { action: "retry_task", task_id: tid, hint },
+              `已向 ${tid} 注入提示并重新排入就绪队列`
+            );
+          },
+        });
+      });
+
+      document.getElementById("btn-banner-reassign").addEventListener("click", () => {
+        const tid = state.projection?.hitl_banner?.task_id || state.selectedTaskId;
+        if (!tid) return;
+        openHitlModal({
+          title: `将任务 ${tid} 改派给人工工程师`,
+          description: "改派给人后，人工提交的产物仍须经过相同的程序门禁与 Argus 独立复核才能成为已验收状态。",
+          label: "改派备注",
+          defaultValue: "由值班后端工程师接手修复事务锁边界，提交后走同等验收。",
+          requireNonEmpty: true,
+          onConfirm: async (note) => {
+            await sendHitlCommand(
+              { action: "reassign_human", task_id: tid, note },
+              `已记录 ${tid} 改派人工并回到就绪态`
+            );
+          },
+        });
+      });
+
+      document.getElementById("btn-banner-accept-risk").addEventListener("click", () => {
+        const tid = state.projection?.hitl_banner?.task_id || state.selectedTaskId;
+        if (!tid) return;
+        openHitlModal({
+          title: `接受风险完成任务 ${tid}`,
+          description: "必须填写明确理由。该决定与 Agent 建议分开存储，追踪矩阵将标为“未验证 · 人工接受”，绝不显示为“已验证”。",
+          label: "接受风险理由（必填）",
+          defaultValue: "首期社团活动仅单管理员人工触发取消，并发取消概率极低，接受已知风险先行放行。",
+          requireNonEmpty: true,
+          onConfirm: async (reason) => {
+            await sendHitlCommand(
+              { action: "accept_risk", task_id: tid, reason },
+              `已记录人工接受风险，${tid} 标记为未验证 · 人工接受`
+            );
+          },
+        });
+      });
+
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.activeTab = btn.dataset.tab;
+          if (state.projection) renderInspector(state.projection);
+        });
+      });
+
+      elRunSelector.addEventListener("change", () => {
+        state.selectedTaskId = null;
+        loadRun(elRunSelector.value);
+      });
+
+      async function bootstrap() {
+        let resp = await fetch("/api/runs");
+        let data = await resp.json();
+        if (!data.runs || !data.runs.length) {
+          resp = await fetch("/api/seed-demo", { method: "POST", body: "{}" });
+          data = await resp.json();
+        }
+        state.runs = data.runs || [];
+        elRunSelector.innerHTML = state.runs
+          .map((r) => `<option value="${escapeHtml(r.run_id)}">${escapeHtml(r.title)} (${escapeHtml(r.run_id)})</option>`)
+          .join("");
+        const initialRun = params.get("run") || data.default_run_id || (state.runs[0] && state.runs[0].run_id);
+        if (initialRun) {
+          elRunSelector.value = initialRun;
+          await loadRun(initialRun);
+        }
+      }
+
+      bootstrap();
+    })();
+  </script>
+</body>
+</html>

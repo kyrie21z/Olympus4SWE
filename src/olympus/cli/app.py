@@ -376,3 +376,30 @@ def run_events(
     store = RunStore(_resolve_db(ws, db))
     events = [e.model_dump(mode="json") for e in store.list_events(run_id, after_seq=after_seq)]
     typer.echo(json.dumps(events, ensure_ascii=False, indent=2))
+
+
+@app.command("serve")
+def cmd_serve(
+    host: Annotated[str, typer.Option("--host", help="Bind host.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", "-p", min=1, max=65535)] = 8765,
+    seed_demo: Annotated[
+        bool,
+        typer.Option("--seed-demo", help="Seed walkthrough demo runs if missing."),
+    ] = True,
+    workspace: WorkspaceOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """M4 Ariadne: Launch the event-sourced Web Console and HITL control server."""
+    from olympus.web.server import serve_ariadne
+
+    ws = _resolve_workspace(workspace)
+    store = RunStore(_resolve_db(ws, db))
+    typer.echo(f"Ariadne Web Console listening on http://{host}:{port}")
+    serve_ariadne(
+        store=store,
+        workspace_root=ws,
+        host=host,
+        port=port,
+        seed_demo=seed_demo,
+    )
+

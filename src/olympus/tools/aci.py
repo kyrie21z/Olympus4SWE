@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from olympus.core.dag import paths_overlap
+from olympus.harness.worktree import build_sandbox_env
 from olympus.providers.base import ToolSpec
 
 _IGNORED_DIR_NAMES = frozenset(
@@ -43,8 +44,10 @@ class WorkspaceToolkit:
         allowed_write_scope: list[str] | None = None,
         read_only: bool = False,
         max_output_chars: int = 12_000,
+        env_root: Path | str | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self.env_root = Path(env_root).resolve() if env_root is not None else self.workspace_root
         self.allowed_write_scope = allowed_write_scope
         self.read_only = read_only
         self.max_output_chars = max_output_chars
@@ -248,6 +251,7 @@ class WorkspaceToolkit:
         proc = subprocess.run(
             ["bash", "-lc", cmd],
             cwd=self.workspace_root,
+            env=build_sandbox_env(self.workspace_root, host_root=self.env_root),
             capture_output=True,
             text=True,
             timeout=timeout,

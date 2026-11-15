@@ -566,3 +566,176 @@ def test_stage1_propose_spec_injects_observed_workspace_inventory(tmp_path: Path
     assert len(captured_user_prompts) == 1
     assert "Observed workspace files (2/2): README.md, src/mod.py" in captured_user_prompts[0]
     assert ".git" not in captured_user_prompts[0]
+
+
+def test_build_sandbox_env_isolates_venv_and_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.harness.worktree import build_sandbox_env
+
+    host_root = tmp_path / "host"
+    (host_root / ".venv" / "bin").mkdir(parents=True)
+    sandbox_root = tmp_path / "sandbox"
+    (sandbox_root / "src").mkdir(parents=True)
+
+    monkeypatch.setenv("VIRTUAL_ENV", "/polluted/olympus/.venv")
+    monkeypatch.setenv("PYTHONHOME", "/polluted/pythonhome")
+    monkeypatch.setenv("PYTHONPATH", "/polluted/other")
+    monkeypatch.setenv("PATH", "/polluted/olympus/.venv/bin:/usr/bin")
+
+    env = build_sandbox_env(sandbox_root, host_root=host_root)
+    assert env["VIRTUAL_ENV"] == str((host_root / ".venv").resolve())
+    assert "PYTHONHOME" not in env
+    assert env["PATH"].split(":")[0] == str((host_root / ".venv" / "bin").resolve())
+    pythonpath_parts = env["PYTHONPATH"].split(":")
+    assert pythonpath_parts[:2] == [
+        str((sandbox_root / "src").resolve()),
+        str(sandbox_root.resolve()),
+    ]
+
+
+def test_stage2_planner_inventory_and_clarification_propagation(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "app.py").write_text("def greet():\n    return ''\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "add app"], cwd=tmp_path, check=True, capture_output=True
+    )
+
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Propagate Q&A", mode=RunMode.EXECUTION)
+
+    captured_planner_prompts: list[str] = []
+    captured_worker_prompts: list[str] = []
+    captured_reviewer_prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        sys_msg = messages[0].content
+        user_msg = messages[1].content
+        if "Requirements Alignment Architect" in sys_msg:
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "spec_id": "spec-prop",
+                        "version": 1,
+                        "goal": "Implement transform()",
+                        "constraints": ["Preserve insertion order"],
+                        "requirements": [
+                            {
+                                "id": "R1",
+                                "description": "Transform dict keys",
+                                "acceptance_criteria": ["Handles empty dicts"],
+                            }
+                        ],
+                        "open_ambiguities": [
+                            {
+                                "id": "AMB-1",
+                                "question": "What should transform({}) return?",
+                                "impact": "Empty dict edge case",
+                                "blocking": True,
+                            }
+                        ],
+                    }
+                )
+            )
+        if "Task Planner" in sys_msg:
+            captured_planner_prompts.append(user_msg)
+            m = re.search(r"Set spec_id='([^']+)' and spec_hash='([^']+)'", user_msg)
+            assert m is not None
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "plan_id": "plan-prop",
+                        "spec_id": m.group(1),
+                        "spec_hash": m.group(2),
+                        "tasks": [
+                            {
+                                "task_id": "T1",
+                                "title": "Update app.py",
+                                "objective": "Implement transform in app.py",
+                                "requirement_refs": ["R1"],
+                                "write_scope": ["app.py"],
+                                "acceptance_checks": [
+                                    {
+                                        "id": "C1",
+                                        "kind": CheckKind.COMMAND.value,
+                                        "description": "Verify transform handles empty dict",
+                                        "command": (
+                                            "python3 -c 'import app; "
+                                            "assert app.transform({}) == {}'"
+                                        ),
+                                    },
+                                    {
+                                        "id": "C2",
+                                        "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                                        "description": "Verify constraints and Q&A adherence",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                )
+            )
+        if "Execution Engineer" in sys_msg:
+            if not any(msg.role == "tool" for msg in messages):
+                captured_worker_prompts.append(user_msg)
+                ws_match = re.search(r"Sandbox workspace root: (.+)", user_msg)
+                assert ws_match is not None
+                ws = Path(ws_match.group(1).strip())
+                return LLMResponse(
+                    content="",
+                    tool_calls=(
+                        ToolCall(
+                            id="call-write",
+                            name="write_file",
+                            arguments={
+                                "path": str(ws / "app.py"),
+                                "content": "def transform(d):\n    return dict(d)\n",
+                            },
+                        ),
+                    ),
+                )
+            return LLMResponse(content="Updated app.py cleanly.")
+        if "Independent Verifier" in sys_msg:
+            captured_reviewer_prompts.append(user_msg)
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T1",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "Matches constraint and clarified empty-dict behavior.",
+                        "findings": [],
+                    }
+                )
+            )
+        raise AssertionError(f"Unexpected prompt: {sys_msg}")
+
+    provider = MockLLMProvider(responder=responder)
+    align = AlignStage(store=store, provider=provider, workspace_root=tmp_path)
+    align.propose_spec(run_id=run_id, raw_goal="Implement transform()")
+    align.apply_clarifications(
+        run_id=run_id,
+        answers={"AMB-1": "Return an empty dict {} rather than None"},
+    )
+    align.confirm_spec(run_id=run_id)
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=provider,
+        workspace_root=tmp_path,
+        artifacts_root=tmp_path / ".olympus" / "artifacts",
+    )
+    orch.propose_plan(run_id=run_id, auto_approve=True)
+    final_snap = orch.run_execution(run_id=run_id, apply_to_workspace=True)
+    tasks_by_id = {t.task_id: t for t in final_snap["plan"].tasks}
+    assert tasks_by_id["T1"].status == TaskStatus.ACCEPTED
+    assert (
+        len(captured_planner_prompts) == 1
+        and "Observed workspace files" in captured_planner_prompts[0]
+        and "'command', 'independent_review', or 'human'" in captured_planner_prompts[0]
+    )
+    for prompt_list in (captured_worker_prompts, captured_reviewer_prompts):
+        assert len(prompt_list) == 1
+        assert "Preserve insertion order" in prompt_list[0]
+        assert "Return an empty dict {} rather than None" in prompt_list[0]

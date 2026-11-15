@@ -22,7 +22,7 @@ from olympus.core.contracts import (
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import run_structured_loop
+from olympus.stages.common import format_workspace_inventory, run_structured_loop
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -40,22 +40,26 @@ Rules:
    `tests/...`) inside `constraints`, `assumptions`, `open_ambiguities`, or `minority_notes`.
    When a task is standalone or target layout is unspecified, refer to behavior/deliverables
    conceptually rather than guessing repository paths.
-2. Semantic Audit & Genuine Blockers: Inspect the goal closely for contradictions with the repo,
-   missing high-level scope/success criteria (vague goals MUST stay blocked via `open_ambiguities`),
-   and genuine behavioral/logical ambiguities whose resolution would change correctness (e.g.,
-   undefined value domains, operation ordering/atomicity, output order/format/tie-breakers,
-   optimization targets like minimum vs any valid answer, or persistence/error contracts).
+2. Semantic Audit & Genuine Blockers: Inspect the goal (and existing code via read-only tools)
+   across each distinct behavioral dimension — contradictions with the repo, missing high-level
+   scope/success criteria (vague goals MUST stay blocked via `open_ambiguities`), undefined value
+   domains, empty/boundary/error/status contracts, operation ordering/tie-breakers/idempotency,
+   schema/output format/precision/serialization, optimization targets, and persistence/compatibility
+   defaults — so no correctness-critical choice is silently guessed.
 3. Question Austerity (NO Shotgun Questioning): Treat clarification budget as precious.
    - If requirements are already clear and verifiable, return `"open_ambiguities": []`.
-   - When clarifications are genuinely required, emit ONLY the minimal, distinct set of
-     decision-blocking questions (`blocking: true`, typically 1-3 focused items; merge
-     overlapping points instead of splitting them).
+   - When clarifications are genuinely required, cover every distinct decision blocker
+     (`blocking: true`, typically 1-4 focused items): keep independent behavioral dimensions
+     separate when merging would leave a sub-decision ambiguous, and merge only truly overlapping
+     points.
    - NEVER pad with generic boilerplate questions about file paths/layout, language version,
      CLI vs function signature, logging, test framework, or validation of inputs already ruled
      out by stated constraints.
 4. Bounded Scope & Falsifiable Criteria: List explicit `out_of_scope` items to prevent scope
    creep, and give every requirement concrete, verifiable `acceptance_criteria`.
-5. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
+5. Exploration Discipline: Limit read-only repo checks to 2-4 focused calls (public API/module
+   layout only) before returning GoalSpec JSON; leave deep implementation reading to Stage 2.
+6. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
    `$schema`, or unlisted extra keys."""
 
 _CRITIQUE_SYSTEM_TEMPLATE = """You are a cold-start read-only {perspective} reviewer.
@@ -63,15 +67,6 @@ Inspect the draft GoalSpec (and repository files if needed) and report ONLY real
 hidden contradictions, feasibility risks, or untestable acceptance criteria.
 Do NOT invent scores or rewrite the spec. If no issues exist, return {{"notes": []}}.
 Output ONLY valid JSON matching {{"notes": [...]}} with no `$comment`, `$schema`, or extra keys."""
-
-
-def _format_workspace_inventory(toolkit: WorkspaceToolkit, *, max_files: int = 40) -> str:
-    """Format a bounded deterministic inventory of existing workspace paths."""
-    files, total = toolkit.list_relative_files(max_files=max_files)
-    if not files:
-        return "Observed workspace files: (none)"
-    suffix = f" (+{total - len(files)} more)" if total > len(files) else ""
-    return f"Observed workspace files ({len(files)}/{total}): " + ", ".join(files) + suffix
 
 
 class AlignStage:
@@ -116,7 +111,7 @@ class AlignStage:
             max_steps=max_steps,
             trace_path=self._trace_file(run_id, "align-proposer"),
         )
-        inventory = _format_workspace_inventory(toolkit)
+        inventory = format_workspace_inventory(toolkit)
         schema_json = json.dumps(GoalSpec.model_json_schema(), ensure_ascii=False)
         user_prompt = (
             f"Workspace root: {self.workspace_root}\n"
@@ -176,7 +171,7 @@ class AlignStage:
                 max_steps=6,
                 trace_path=self._trace_file(run_id, f"align-critic-{perspective.value}"),
             )
-            inventory = _format_workspace_inventory(toolkit)
+            inventory = format_workspace_inventory(toolkit)
             sys_prompt = _CRITIQUE_SYSTEM_TEMPLATE.format(perspective=perspective.value)
             user_prompt = (
                 f"Workspace root: {self.workspace_root}\n"

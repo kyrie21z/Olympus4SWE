@@ -35,13 +35,14 @@ from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
     SandboxHandle,
+    build_sandbox_env,
     capture_sandbox_diff,
     create_sandbox,
     remove_sandbox,
 )
 from olympus.providers.base import LLMProvider
-from olympus.stages.common import run_structured_loop
-from olympus.tools.aci import WorkspaceToolkit
+from olympus.stages.common import format_workspace_inventory, run_structured_loop
+from olympus.tools.aci import _IGNORED_DIR_NAMES, WorkspaceToolkit
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
 Decompose the confirmed GoalSpec into a minimal TaskPlan JSON.
@@ -49,11 +50,16 @@ Rules:
 1. Keep simple tasks as a single TaskNode; split into a DAG ONLY when modules are truly separable.
 2. Tasks that can run concurrently (neither depends on the other) MUST have disjoint write_scope.
 3. Every requirement in GoalSpec must appear in at least one task's requirement_refs.
-4. Every task must have >=1 concrete acceptance_check (prefer kind='command' where runnable).
+4. Keep tasks cohesive (1-3 checks per task, not redundant prose checks).
+   Valid acceptance_checks[*].kind values are strictly: 'command', 'independent_review', or 'human'
+   (NEVER invent values like 'review'). Whenever kind='command', supply a non-empty shell string
+   in 'command' (e.g. 'python -m pytest ...'); if there is no shell command, use
+   kind='independent_review' instead.
 5. Acceptance check commands execute with cwd ALREADY set to an isolated sandbox copy of the repo.
    NEVER use 'cd <host_path>' or hardcoded host workspace paths inside check commands; use
    repo-relative paths only.
-6. Output ONLY a single JSON object conforming to TaskPlan."""
+6. Honor all GoalSpec constraints and resolved open_ambiguities answers in task objectives/checks.
+7. Output ONLY a single JSON object matching TaskPlan (no $comment, $schema, or extra keys)."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
@@ -88,7 +94,8 @@ def _copy_matching_scope(
         if not p.is_file():
             continue
         rel_path = p.relative_to(src_root)
-        if ".git" in rel_path.parts or ".olympus" in rel_path.parts:
+        ignored = _IGNORED_DIR_NAMES | {".olympus"}
+        if any(part in ignored for part in rel_path.parts):
             continue
         rel = rel_path.as_posix()
         if write_scope is not None and not any(paths_overlap(rel, scope) for scope in write_scope):
@@ -96,6 +103,30 @@ def _copy_matching_scope(
         dst = dst_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, dst)
+
+
+def _format_spec_context(spec: GoalSpec) -> str:
+    """Format constraints, assumptions, and resolved Stage 1 clarifications for Stage 2 roles."""
+    clarifications = [
+        {"id": amb.id, "question": amb.question, "answer": amb.answer}
+        for amb in spec.open_ambiguities
+        if amb.answer is not None and amb.answer.strip()
+    ]
+    unresolved = [
+        {"id": amb.id, "question": amb.question, "blocking": amb.blocking}
+        for amb in spec.open_ambiguities
+        if amb.answer is None or not amb.answer.strip()
+    ]
+    lines = [
+        f"Constraints: {json.dumps(spec.constraints, ensure_ascii=False)}",
+        f"Assumptions: {json.dumps(spec.assumptions, ensure_ascii=False)}",
+        f"Clarifications (resolved Q&A): {json.dumps(clarifications, ensure_ascii=False)}",
+    ]
+    if unresolved:
+        lines.append(
+            f"Unresolved ambiguities (accepted risk): {json.dumps(unresolved, ensure_ascii=False)}"
+        )
+    return "\n".join(lines)
 
 
 class OrchestrateStage:
@@ -157,11 +188,17 @@ class OrchestrateStage:
             max_steps=max_steps,
             trace_path=self._run_dir(run_id) / "traces" / "planner.jsonl",
         )
+        planner_toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
+        inventory = format_workspace_inventory(planner_toolkit)
         schema_json = json.dumps(TaskPlan.model_json_schema(), ensure_ascii=False)
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
+            f"{inventory}\n"
             f"Note: acceptance_checks[*].command will run in an isolated sandbox worktree "
             f"(cwd = sandbox root). NEVER reference '{self.workspace_root}' inside commands.\n"
+            f"Remember: acceptance_checks[*].kind MUST be one of "
+            f"'command', 'independent_review', or 'human' (never 'review'), and every "
+            f"kind='command' check MUST include a non-empty 'command' string.\n"
             f"Confirmed GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
             f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'.\n"
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
@@ -250,9 +287,14 @@ class OrchestrateStage:
                 updated_checks.append(check)
                 continue
             assert check.command is not None
+            sandbox_env = build_sandbox_env(
+                sandbox.workspace_path,
+                host_root=self.workspace_root,
+            )
             proc = subprocess.run(
                 ["bash", "-lc", check.command],
                 cwd=sandbox.workspace_path,
+                env=sandbox_env,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -325,10 +367,12 @@ class OrchestrateStage:
             [r.model_dump(mode="json") for r in relevant_reqs], ensure_ascii=False
         )
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
+        spec_ctx = _format_spec_context(spec)
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
             f"TaskNode: {task_summary}\n"
             f"Relevant requirements: {reqs_json}\n"
+            f"{spec_ctx}\n"
             f"Out of scope (MUST NOT be added): {oos_json}\n"
             f"Incremental review cycle={task.review_cycle + 1} (incremental_only={incremental})\n"
             f"{prior_ctx}\n"
@@ -397,6 +441,7 @@ class OrchestrateStage:
                 sandbox.workspace_path,
                 allowed_write_scope=leased.write_scope,
                 read_only=False,
+                env_root=self.workspace_root,
             )
             worker_loop = AgentLoop(
                 provider=self.provider,
@@ -406,6 +451,7 @@ class OrchestrateStage:
                 actor=f"hephaestus:{leased.task_id}",
                 max_steps=worker_max_steps,
                 trace_path=art_dir / "worker.jsonl",
+                synthesize_on_max_steps=True,
             )
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"
@@ -419,11 +465,15 @@ class OrchestrateStage:
                 ],
                 ensure_ascii=False,
             )
+            spec_ctx = _format_spec_context(spec)
             worker_prompt = (
                 f"Sandbox workspace root: {sandbox.workspace_path}\n"
                 f"Task {leased.task_id}: {leased.title}\n"
                 f"Objective: {leased.objective}\n"
+                f"Step budget: {worker_max_steps} turns max (keep exploration focused <= 6 steps, "
+                f"implement edits early, verify with targeted commands, and stop once passing).\n"
                 f"Allowed write_scope (relative): {json.dumps(leased.write_scope)}\n"
+                f"{spec_ctx}\n"
                 f"Out of scope: {json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
                 f"Acceptance checks: {checks_json}"
                 f"{rework_ctx}"

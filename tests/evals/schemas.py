@@ -359,9 +359,14 @@ class LeakGuard:
         """Case-insensitively replace leaked terms with a redaction marker."""
         redacted = text
         for term in terms:
-            if not term.strip():
+            cleaned = term.strip()
+            if not cleaned:
                 continue
-            redacted = re.sub(re.escape(term), "[redacted]", redacted, flags=re.IGNORECASE)
+            if _ASCII_TERM_RE.fullmatch(cleaned.casefold()):
+                pattern = rf"(?<![a-z0-9_]){re.escape(cleaned)}(?![a-z0-9_])"
+            else:
+                pattern = re.escape(cleaned)
+            redacted = re.sub(pattern, "[redacted]", redacted, flags=re.IGNORECASE)
         return redacted
 
 

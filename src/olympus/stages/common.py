@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
+from olympus.tools.aci import WorkspaceToolkit
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 _SCHEMA_META_KEYS = frozenset(
@@ -25,6 +26,15 @@ _SCHEMA_META_KEYS = frozenset(
         "$dynamicAnchor",
     }
 )
+
+
+def format_workspace_inventory(toolkit: WorkspaceToolkit, *, max_files: int = 40) -> str:
+    """Format a bounded deterministic inventory of existing workspace paths."""
+    files, total = toolkit.list_relative_files(max_files=max_files)
+    if not files:
+        return "Observed workspace files: (none)"
+    suffix = f" (+{total - len(files)} more)" if total > len(files) else ""
+    return f"Observed workspace files ({len(files)}/{total}): " + ", ".join(files) + suffix
 
 
 def strip_schema_meta_keys(value: Any) -> Any:
@@ -70,28 +80,37 @@ def run_structured_loop[T: BaseModel](
     max_parse_retries: int = 1,
 ) -> T:
     """Run an AgentLoop and validate final JSON response against a Pydantic model."""
-    prompt = user_prompt
     last_err = ""
-    for attempt in range(max_parse_retries + 1):
-        res = loop.run(system_prompt=system_prompt, user_prompt=prompt)
-        if not res.completed:
-            raise RuntimeError(
-                f"AgentLoop stopped before producing final output: {res.stop_reason}"
-            )
-        try:
-            return parse_model_json(res.final_content, model_cls)
-        except (json.JSONDecodeError, ValidationError) as exc:
-            last_err = str(exc)
-            if attempt < max_parse_retries:
-                schema_hint = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
-                prompt = (
-                    f"{user_prompt}\n\n"
-                    f"[PREVIOUS OUTPUT FAILED VALIDATION]\n"
-                    f"Error: {last_err}\n"
-                    "Return ONLY valid JSON matching schema (no $comment, $schema, "
-                    f"or extra keys):\n{schema_hint}"
+    prev_synth = loop.synthesize_on_max_steps
+    loop.synthesize_on_max_steps = True
+    try:
+        res = loop.run(system_prompt=system_prompt, user_prompt=user_prompt)
+        for attempt in range(max_parse_retries + 1):
+            if not res.completed:
+                raise RuntimeError(
+                    f"AgentLoop stopped before producing final output: {res.stop_reason}"
                 )
-    raise ValueError(f"Failed to parse {model_cls.__name__} JSON: {last_err}")
+            try:
+                return parse_model_json(res.final_content, model_cls)
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_err = str(exc)
+                if attempt < max_parse_retries:
+                    schema_hint = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
+                    correction = (
+                        f"[PREVIOUS OUTPUT FAILED VALIDATION]\n"
+                        f"Error: {last_err}\n"
+                        "Fix the validation errors using what you already observed. "
+                        "Return ONLY valid JSON matching schema (no $comment, $schema, "
+                        f"or extra keys):\n{schema_hint}"
+                    )
+                    res = loop.complete_repair(
+                        prior_messages=res.messages,
+                        correction=correction,
+                        step=attempt + 1,
+                    )
+        raise ValueError(f"Failed to parse {model_cls.__name__} JSON: {last_err}")
+    finally:
+        loop.synthesize_on_max_steps = prev_synth
 
 
 def build_read_only_loop(

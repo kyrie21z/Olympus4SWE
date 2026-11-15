@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import capture_sandbox_diff, create_sandbox, remove_sandbox
-from olympus.providers.base import LLMResponse, MockLLMProvider, ToolCall, UsageStats
+from olympus.providers.base import (
+    ChatMessage,
+    LLMResponse,
+    MockLLMProvider,
+    ToolCall,
+    ToolSpec,
+    UsageStats,
+)
 from olympus.tools.aci import WorkspaceToolkit
 
 
@@ -208,3 +216,101 @@ def test_agent_loop_stops_on_budget_exhaustion_and_max_steps(tmp_path: Path) -> 
     assert res2.completed is False
     assert res2.stop_reason == "max_steps_exceeded"
     assert res2.steps_taken == 2
+
+
+def test_agent_loop_synthesizes_final_answer_when_enabled(tmp_path: Path) -> None:
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    seen_tool_counts: list[int] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages
+        seen_tool_counts.append(len(tools))
+        if len(seen_tool_counts) == 1:
+            return LLMResponse(
+                content="reading",
+                tool_calls=(
+                    ToolCall(
+                        id="tc-1",
+                        name="read_file",
+                        arguments={"path": str(tmp_path / "mod.py")},
+                    ),
+                ),
+            )
+        return LLMResponse(content="synthesized answer")
+
+    loop = AgentLoop(
+        provider=MockLLMProvider(responder=responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=2,
+        synthesize_on_max_steps=True,
+    )
+    res = loop.run(system_prompt="SYS", user_prompt="Go")
+    assert res.completed is True
+    assert res.final_content == "synthesized answer"
+    assert seen_tool_counts[0] > 0
+    assert seen_tool_counts[1] == 0
+
+
+def test_run_structured_loop_repairs_invalid_json_without_reexploring(tmp_path: Path) -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+    from olympus.stages.common import run_structured_loop
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    tool_counts: list[int] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        tool_counts.append(len(tools))
+        if len(tool_counts) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=(
+                    ToolCall(
+                        id="tc-1",
+                        name="read_file",
+                        arguments={"path": str(tmp_path / "mod.py")},
+                    ),
+                ),
+            )
+        if len(tool_counts) == 2:
+            return LLMResponse(content=json.dumps({"value": 0}))
+        assert len(messages) >= 5
+        assert "mod.py" in messages[2].content or "x = 1" in messages[3].content
+        return LLMResponse(content=json.dumps({"value": 7}))
+
+    loop = AgentLoop(
+        provider=MockLLMProvider(responder=responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=4,
+    )
+    out = run_structured_loop(
+        loop=loop,
+        system_prompt="SYS",
+        user_prompt="Go",
+        model_cls=Out,
+    )
+    assert out.value == 7
+    assert tool_counts[0] > 0 and tool_counts[1] > 0
+    assert tool_counts[2] == 0
+
+
+def test_agent_loop_retries_once_on_transient_timeout() -> None:
+    calls = 0
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal calls
+        del messages, tools
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("The read operation timed out")
+        return LLMResponse(content="recovered")
+
+    loop = AgentLoop(provider=MockLLMProvider(responder=responder), max_steps=2)
+    res = loop.run(system_prompt="SYS", user_prompt="Go")
+    assert res.completed is True
+    assert res.final_content == "recovered"
+    assert calls == 2

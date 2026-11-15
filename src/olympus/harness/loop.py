@@ -51,6 +51,7 @@ class AgentLoop:
         actor: str = "agent",
         max_steps: int = 20,
         trace_path: Path | None = None,
+        synthesize_on_max_steps: bool = False,
     ) -> None:
         self.provider = provider
         self.toolkit = toolkit
@@ -59,6 +60,7 @@ class AgentLoop:
         self.actor = actor
         self.max_steps = max_steps
         self.trace_path = trace_path
+        self.synthesize_on_max_steps = synthesize_on_max_steps
 
     def _append_trace(self, entry: dict[str, Any]) -> None:
         if self.trace_path is None:
@@ -66,6 +68,114 @@ class AgentLoop:
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         with self.trace_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _call_provider_with_budget(
+        self,
+        *,
+        step: int,
+        purpose: str,
+        messages: list[ChatMessage],
+        tools: Sequence[ToolSpec],
+        prefix_hash: str,
+        temperature: float,
+    ) -> tuple[Any, str | None]:
+        """Reserve budget, invoke provider (with 1 transient timeout retry), settle usage."""
+        for net_attempt in range(2):
+            call_purpose = purpose if net_attempt == 0 else f"{purpose}_retry"
+            if self.store is not None and self.run_id is not None:
+                try:
+                    self.store.reserve_llm_call(
+                        self.run_id, actor=self.actor, purpose=call_purpose
+                    )
+                except ValueError as exc:
+                    return None, f"budget_exhausted: {exc}"
+            try:
+                resp = self.provider.complete(
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                )
+            except Exception as exc:
+                if self.store is not None and self.run_id is not None:
+                    self.store.settle_llm_call(self.run_id, actor=self.actor, unknown=True)
+                self._append_trace(
+                    {
+                        "timestamp": utc_now().isoformat(),
+                        "actor": self.actor,
+                        "step": step,
+                        "prefix_hash": prefix_hash,
+                        "error": str(exc),
+                        "retry": net_attempt,
+                    }
+                )
+                is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(exc).lower()
+                if is_timeout and net_attempt == 0:
+                    continue
+                return None, f"provider_error: {exc}"
+
+            if self.store is not None and self.run_id is not None:
+                self.store.settle_llm_call(
+                    self.run_id,
+                    actor=self.actor,
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                )
+            return resp, None
+        return None, "provider_error: retry exhausted"
+
+    def complete_repair(
+        self,
+        *,
+        prior_messages: Sequence[ChatMessage],
+        correction: str,
+        step: int = 1,
+        temperature: float = 0.0,
+    ) -> LoopResult:
+        """Run one tool-free repair turn preserving prior exploration messages."""
+        messages = [*prior_messages, ChatMessage(role="user", content=correction)]
+        prefix_hash = content_hash({"actor": self.actor, "repair": True})
+        resp, err = self._call_provider_with_budget(
+            step=step,
+            purpose=f"repair_step_{step}",
+            messages=messages,
+            tools=(),
+            prefix_hash=prefix_hash,
+            temperature=temperature,
+        )
+        if resp is None:
+            return LoopResult(
+                completed=False,
+                stop_reason=err or "provider_error",
+                final_content="",
+                steps_taken=0,
+                messages=tuple(messages),
+            )
+        messages.append(ChatMessage(role="assistant", content=resp.content, tool_calls=()))
+        self._append_trace(
+            {
+                "timestamp": utc_now().isoformat(),
+                "actor": self.actor,
+                "step": step,
+                "prefix_hash": prefix_hash,
+                "message_count": len(messages),
+                "assistant_content": resp.content,
+                "tool_calls": [],
+                "tool_outputs": [],
+                "usage": {
+                    "input_tokens": resp.usage.input_tokens,
+                    "output_tokens": resp.usage.output_tokens,
+                },
+            }
+        )
+        return LoopResult(
+            completed=True,
+            stop_reason="final_response",
+            final_content=resp.content,
+            steps_taken=1,
+            messages=tuple(messages),
+            total_input_tokens=resp.usage.input_tokens,
+            total_output_tokens=resp.usage.output_tokens,
+        )
 
     def run(
         self,
@@ -98,59 +208,46 @@ class AgentLoop:
         total_out = 0
 
         for step in range(1, self.max_steps + 1):
-            if self.store is not None and self.run_id is not None:
-                try:
-                    self.store.reserve_llm_call(
-                        self.run_id,
-                        actor=self.actor,
-                        purpose=f"loop_step_{step}",
+            step_tools = frozen_tools
+            if (
+                self.synthesize_on_max_steps
+                and frozen_tools
+                and step == self.max_steps
+                and self.max_steps > 1
+                and any(msg.role == "tool" for msg in messages)
+            ):
+                step_tools = ()
+                messages.append(
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            "[EXPLORATION BUDGET REACHED] Stop calling tools now and output "
+                            "your final response using the repository facts already observed."
+                        ),
                     )
-                except ValueError as exc:
-                    return LoopResult(
-                        completed=False,
-                        stop_reason=f"budget_exhausted: {exc}",
-                        final_content="",
-                        steps_taken=step - 1,
-                        messages=tuple(messages),
-                        total_input_tokens=total_in,
-                        total_output_tokens=total_out,
-                    )
+                )
 
-            try:
-                resp = self.provider.complete(
-                    messages=messages,
-                    tools=frozen_tools,
-                    temperature=temperature,
-                )
-            except Exception as exc:
-                if self.store is not None and self.run_id is not None:
-                    self.store.settle_llm_call(self.run_id, actor=self.actor, unknown=True)
-                self._append_trace(
-                    {
-                        "timestamp": utc_now().isoformat(),
-                        "actor": self.actor,
-                        "step": step,
-                        "prefix_hash": prefix_hash,
-                        "error": str(exc),
-                    }
-                )
+            resp, err = self._call_provider_with_budget(
+                step=step,
+                purpose=f"loop_step_{step}",
+                messages=messages,
+                tools=step_tools,
+                prefix_hash=prefix_hash,
+                temperature=temperature,
+            )
+            if resp is None:
+                stop = err or "provider_error"
+                steps = step - 1 if stop.startswith("budget_exhausted") else step
                 return LoopResult(
                     completed=False,
-                    stop_reason=f"provider_error: {exc}",
+                    stop_reason=stop,
                     final_content="",
-                    steps_taken=step,
+                    steps_taken=steps,
                     messages=tuple(messages),
                     total_input_tokens=total_in,
                     total_output_tokens=total_out,
                 )
 
-            if self.store is not None and self.run_id is not None:
-                self.store.settle_llm_call(
-                    self.run_id,
-                    actor=self.actor,
-                    input_tokens=resp.usage.input_tokens,
-                    output_tokens=resp.usage.output_tokens,
-                )
             total_in += resp.usage.input_tokens
             total_out += resp.usage.output_tokens
 

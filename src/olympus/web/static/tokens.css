@@ -62,12 +62,13 @@
   --font-weight-medium: 500;
   --tracking-label: 0.14em;
 
-  /* Shape */
-  --radius: 2px;
-  --shape-chip: 2px;
+  /* Shape — concentric soft radius + pill badges */
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shape-chip: 999px;
   --shape-circle: 999px;
   --shape-pill: 999px;
-  --shape-bubble: 2px;
+  --shape-bubble: 12px;
 
   /* Spacing */
   --space-1: 4px;

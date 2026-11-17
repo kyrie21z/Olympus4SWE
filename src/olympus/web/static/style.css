@@ -184,7 +184,7 @@ body[data-dock="closed"] #dock {
   gap: var(--space-2);
   padding: var(--space-2);
   border-inline-start: 2px solid transparent;
-  border-radius: 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
   color: var(--text-secondary);
   text-decoration: none;
   font-size: var(--text-sm);
@@ -557,7 +557,7 @@ button {
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--bad);
   border-inline-start-width: 3px;
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--bad-soft);
   color: var(--text-ink);
 }
@@ -661,7 +661,7 @@ button {
   min-inline-size: 0;
   padding: var(--space-4);
   border: 1px solid var(--rule);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-paper);
 }
 
@@ -729,7 +729,7 @@ button {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  padding: 0 var(--space-2);
+  padding: 2px var(--space-2);
   border: 1px solid var(--rule);
   border-radius: var(--shape-chip);
   font-family: var(--face-mono);
@@ -811,7 +811,7 @@ button {
   gap: var(--space-2);
   padding: var(--space-2);
   border: 1px solid var(--rule);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-paper);
   overflow-x: auto;
 }
@@ -982,7 +982,7 @@ button {
   gap: var(--space-1);
   padding: var(--space-1) var(--space-2);
   border: 1px solid var(--rule);
-  border-radius: var(--shape-chip);
+  border-radius: var(--radius);
   background: transparent;
   color: var(--text-secondary);
   font-family: var(--face-mono);
@@ -1028,7 +1028,7 @@ button {
   max-inline-size: 100%;
   container-type: inline-size;
   border: 1px solid var(--rule);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-paper);
 }
 
@@ -1314,7 +1314,7 @@ table.matrix-table tbody tr:hover {
 
 .subpane {
   border: 1px solid var(--rule-hard);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-sunk);
   overflow: hidden;
 }
@@ -1389,7 +1389,7 @@ table.matrix-table tbody tr:hover {
 
 .tool-list {
   border: 1px solid var(--rule);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-raised);
   overflow: hidden;
 }
@@ -1620,7 +1620,7 @@ dialog {
 dialog[open] {
   padding: var(--space-5);
   border: 1px solid var(--rule-hard);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface-paper);
   color: var(--text-ink);
   box-shadow: var(--shadow-md);
@@ -1746,6 +1746,7 @@ dialog::backdrop {
   .rail-link {
     border-inline-start: 0;
     border-block-end: 2px solid transparent;
+    border-radius: var(--radius) var(--radius) 0 0;
     padding: var(--space-1) var(--space-2);
   }
 

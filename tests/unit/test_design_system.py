@@ -154,11 +154,22 @@ def test_two_weights() -> None:
 SHAPES = {
     "0",
     "var(--radius)",
+    "var(--radius-lg)",
     "var(--shape-chip)",
     "var(--shape-circle)",
     "var(--shape-pill)",
     "var(--shape-bubble)",
 }
+
+
+def test_soft_rounded_tokens() -> None:
+    tokens = _text("tokens.css")
+    assert "--radius: 8px;" in tokens
+    assert "--radius-lg: 12px;" in tokens
+    assert "--shape-chip: 999px;" in tokens
+    app = _text("app.js")
+    assert 'rx="8"' in app
+    assert 'rx="2"' not in app
 
 
 def test_faces_and_corners_come_from_tokens() -> None:

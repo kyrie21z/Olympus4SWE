@@ -250,7 +250,7 @@
           node.task_id
         )} ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
           pos.y
-        }" width="${nodeWidth}" height="${nodeHeight}" rx="2"></rect><text class="dag-node-title" x="${centerX}" y="${
+        }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
           pos.y + 23
         }" text-anchor="middle">${esc(node.task_id)}</text><text class="dag-node-meta" x="${centerX}" y="${
           pos.y + 41

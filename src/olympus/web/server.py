@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from olympus.core.contracts import (
     RunStatus,
@@ -23,6 +23,14 @@ from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection, seed_demo_runs
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Only these extensions are ever served from /static/; everything else is a 404.
+_STATIC_MIME_TYPES: dict[str, str] = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
 
 
 class AriadneApp:
@@ -305,13 +313,43 @@ def create_http_server(
             self.end_headers()
             self.wfile.write(raw)
 
-        def _send_html(self, html_bytes: bytes) -> None:
+        def _send_bytes(self, content_type: str, body: bytes) -> None:
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html_bytes)))
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(html_bytes)
+            self.wfile.write(body)
+
+        def _send_html(self, html_bytes: bytes) -> None:
+            self._send_bytes("text/html; charset=utf-8", html_bytes)
+
+        def _serve_static(self, relpath: str) -> None:
+            """Serve one whitelisted asset from static/, refusing any escape of the root."""
+            root = _STATIC_DIR.resolve()
+            requested = unquote(relpath)
+            try:
+                candidate: Path | None = (root / requested).resolve()
+            except (OSError, ValueError):
+                candidate = None
+            if (
+                candidate is None
+                or not candidate.is_relative_to(root)
+                or not candidate.is_file()
+            ):
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"ok": False, "error": f"Unknown static asset: {requested}"},
+                )
+                return
+            content_type = _STATIC_MIME_TYPES.get(candidate.suffix.lower())
+            if content_type is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"ok": False, "error": f"Unsupported static type: {candidate.suffix}"},
+                )
+                return
+            self._send_bytes(content_type, candidate.read_bytes())
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -319,6 +357,10 @@ def create_http_server(
             qs = parse_qs(parsed.query)
 
             try:
+                if path.startswith("/static/"):
+                    self._serve_static(path[len("/static/") :])
+                    return
+
                 if path in ("/", "/index.html"):
                     index_file = _STATIC_DIR / "index.html"
                     if not index_file.exists():

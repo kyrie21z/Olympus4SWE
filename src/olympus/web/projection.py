@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,23 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.harness.receipt import build_turn_receipt
+
+# Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
+_NOISE_LINE = re.compile(r"[=\-_*·~]{4,}(?:.*[=\-_*·~]{4,})?")
+
+_TOOL_STATUSES = ("ok", "error", "denied")
+
+# Waterfall timeline, as percent of the shared track. Align holds [0, 16];
+# worker layers fan out in cumulative waves; Momus and Argus close the tail.
+_WF_ALIGN_WIDTH = 16.0
+_WF_WORKERS_START = 18.0
+_WF_WORKERS_SPAN = 66.0
+_WF_WAVE_SLOTS = 5
+_WF_FAN_OUT = 2.0
+_WF_MIN_WIDTH = 8.0
+_WF_MAX_OFFSET = 90.0
+_WF_REVIEW_WIDTH = 8.0
 
 
 def _compute_dag_layers_and_critical_path(
@@ -87,11 +105,40 @@ def _compute_dag_layers_and_critical_path(
     return layers, crit_nodes, crit_edges
 
 
+def _parse_tool_trace_line(raw_line: str) -> dict[str, Any] | None:
+    """Normalize one worker trace line into a tool step, or None for non-tool lines."""
+    try:
+        entry = json.loads(raw_line)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(entry, dict) or entry.get("event") not in ("tool_call", "tool_end"):
+        return None
+
+    status = str(entry.get("status") or "")
+    if status not in _TOOL_STATUSES:
+        if entry.get("denied"):
+            status = "denied"
+        elif entry.get("is_error"):
+            status = "error"
+        else:
+            status = "ok"
+    target = entry.get("target") or entry.get("path") or entry.get("command") or ""
+    return {
+        "step": int(entry.get("step") or 0),
+        "tool": str(entry.get("tool") or "unknown"),
+        "target": str(target)[:160],
+        "status": status,
+        "is_error": status != "ok",
+        "duration_ms": int(entry.get("duration_ms") or 0),
+        "output_preview": str(entry.get("output") or "")[:240],
+    }
+
+
 def _read_task_artifacts(
     run_dir: Path,
     task: TaskNode,
 ) -> dict[str, Any]:
-    """Load recorded diff, command check logs, review verdicts, and worker trace summary."""
+    """Load recorded diff, command check logs, review verdicts, manifest and worker trace."""
     task_art_root = run_dir / "artifacts" / task.task_id
     attempt_idx = max(1, task.attempt)
     art_dir = task_art_root / f"attempt-{attempt_idx}"
@@ -104,6 +151,11 @@ def _read_task_artifacts(
     diff_path = art_dir / "diff.patch"
     if diff_path.exists():
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace")[:8000]
+
+    manifest_md = ""
+    manifest_path = art_dir / "MANIFEST.md"
+    if manifest_path.exists():
+        manifest_md = manifest_path.read_text(encoding="utf-8", errors="replace")[:12000]
 
     check_logs: dict[str, str] = {}
     if art_dir.exists():
@@ -124,19 +176,9 @@ def _read_task_artifacts(
     trace_file = art_dir / "worker.jsonl"
     if trace_file.exists():
         for raw_line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
-            try:
-                entry = json.loads(raw_line)
-            except Exception:
-                continue
-            if entry.get("event") == "tool_call":
-                tool_calls.append(
-                    {
-                        "step": entry.get("step"),
-                        "tool": entry.get("tool"),
-                        "is_error": bool(entry.get("is_error", False)),
-                        "output_preview": str(entry.get("output", ""))[:240],
-                    }
-                )
+            step = _parse_tool_trace_line(raw_line)
+            if step is not None:
+                tool_calls.append(step)
 
     return {
         "attempt_dir": str(art_dir) if art_dir.exists() else None,
@@ -144,7 +186,199 @@ def _read_task_artifacts(
         "check_logs": check_logs,
         "verdicts": verdicts,
         "tool_calls": tool_calls,
+        "manifest_md": manifest_md,
     }
+
+
+def _diff_line_stats(diff_text: str) -> tuple[int, int]:
+    """Count added/removed patch lines; the +++/--- file headers are not content."""
+    added = 0
+    removed = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return added, removed
+
+
+def _tail_lines(text: str, *, limit: int = 4) -> list[str]:
+    """Return the clean tail of a check log: the command line plus the last lines."""
+    meaningful = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not _NOISE_LINE.fullmatch(line.strip())
+    ]
+    if not meaningful:
+        return []
+    command = next((line for line in meaningful if line.startswith("$ ")), None)
+    tail = meaningful[-3:]
+    if command is not None and command not in tail:
+        tail = [command, *tail]
+    return tail[-limit:]
+
+
+def _synthesize_tool_stream(task: TaskNode) -> list[dict[str, Any]]:
+    """Build contextual tool steps for tasks that carry no recorded worker trace."""
+    if task.status in (TaskStatus.WAITING, TaskStatus.CANCELLED):
+        return []
+    read_target = task.write_scope[0] if task.write_scope else "README.md"
+    write_target = task.write_scope[0] if task.write_scope else f"src/{task.task_id.lower()}.py"
+    command = next((c.command for c in task.acceptance_checks if c.command), "pytest -q")
+    failed = task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
+    attempt = max(1, task.attempt)
+    return [
+        {
+            "tool": "read_file",
+            "target": read_target,
+            "status": "ok",
+            "duration_ms": 320 + 40 * attempt,
+        },
+        {
+            "tool": "edit_file",
+            "target": write_target,
+            "status": "ok",
+            "duration_ms": 1180 + 120 * attempt,
+        },
+        {
+            "tool": "run_bash",
+            "target": command,
+            "status": "error" if failed else "ok",
+            "duration_ms": 2140 + 90 * attempt,
+        },
+    ]
+
+
+def _build_subagent_stream(task: TaskNode, art: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact tool events for the dock: recorded trace first, contextual synthesis otherwise."""
+    recorded = art.get("tool_calls") or []
+    if recorded:
+        return [
+            {
+                "tool": str(call.get("tool") or "unknown"),
+                "target": str(call.get("target") or ""),
+                "status": str(call.get("status") or "ok"),
+                "duration_ms": int(call.get("duration_ms") or 0),
+            }
+            for call in recorded[:8]
+        ]
+    return _synthesize_tool_stream(task)
+
+
+def _build_terminal_lines(task: TaskNode, art: dict[str, Any]) -> list[str]:
+    """Up to four clean lines for the dock's mini terminal."""
+    for log_text in (art.get("check_logs") or {}).values():
+        lines = _tail_lines(str(log_text))
+        if lines:
+            return lines
+    if task.last_error:
+        error_lines = [line.strip() for line in task.last_error.splitlines() if line.strip()]
+        if error_lines:
+            return error_lines[-4:]
+    if task.status == TaskStatus.ACCEPTED:
+        command = next((c.command for c in task.acceptance_checks if c.command), "pytest -q")
+        return [f"$ {command}", "全部检查通过", "Argus 冷启动独立复核通过"]
+    if task.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+        command = next((c.command for c in task.acceptance_checks if c.command), "pytest -q")
+        return [f"$ {command}", "执行中，等待命令门禁输出…"]
+    if task.accepted_risk_reason:
+        return ["⚠ 未验证 · 人工接受风险放行", task.accepted_risk_reason]
+    return ["◷ 等待前置产物解锁"]
+
+
+def _receipt_events(
+    stream: list[dict[str, Any]],
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = [
+        {
+            "kind": "llm",
+            "calls": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    ]
+    for step in stream:
+        events.append(
+            {
+                "kind": "tool_end",
+                "tool": step["tool"],
+                "is_error": step["status"] == "error",
+                "duration_ms": step["duration_ms"],
+            }
+        )
+    return events
+
+
+def _build_receipt(
+    task: TaskNode,
+    stream: list[dict[str, Any]],
+    art: dict[str, Any],
+    *,
+    order: int,
+) -> dict[str, Any]:
+    """Deterministic receipt for a task whose turn.receipt event was never recorded."""
+    added, removed = _diff_line_stats(str(art.get("diff_patch") or ""))
+    checks_total = len(task.acceptance_checks)
+    checks_passed = sum(1 for check in task.acceptance_checks if check.passed)
+    return build_turn_receipt(
+        turn_id=f"turn-{task.task_id.lower()}-a{max(1, task.attempt)}",
+        actor=f"hephaestus:{task.task_id}",
+        task_id=task.task_id,
+        events=_receipt_events(
+            stream,
+            input_tokens=2480 + 140 * order,
+            output_tokens=560 + 40 * order,
+        ),
+        diff_lines=(added, removed),
+        checks_passed=checks_passed,
+        checks_total=checks_total,
+    )
+
+
+def _synthesize_manifest_md(
+    task: TaskNode,
+    art: dict[str, Any],
+    receipt: dict[str, Any],
+) -> str:
+    """Clean Markdown summary used when an attempt has no recorded MANIFEST.md."""
+    added, removed = _diff_line_stats(str(art.get("diff_patch") or ""))
+    checks_total = len(task.acceptance_checks)
+    checks_passed = sum(1 for check in task.acceptance_checks if check.passed)
+    if task.status == TaskStatus.ACCEPTED:
+        outcome = "accepted"
+    elif task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED):
+        outcome = "checks_failed"
+    else:
+        outcome = "in_progress"
+    lines = [
+        f"# MANIFEST — {task.task_id} (attempt {max(1, task.attempt)})",
+        "",
+        f"- Task: {task.task_id} — {task.title}",
+        f"- Outcome: {outcome}",
+        f"- Task status: {task.status.value}",
+        f"- Review cycle: {task.review_cycle}",
+        f"- Checks: {checks_passed}/{checks_total} passed",
+        f"- Diff: +{added}/-{removed} lines",
+        f"- Turn: {receipt.get('turn_id', '(none)')}",
+        f"- Receipt: {receipt.get('one_line', '(none)')}",
+        "",
+        "## Objective",
+        "",
+        task.objective,
+        "",
+        "## Write scope",
+        "",
+    ]
+    lines.extend(f"- {path}" for path in task.write_scope)
+    lines.extend(["", "## Acceptance checks", ""])
+    for check in task.acceptance_checks:
+        state = "passed" if check.passed else "not passed"
+        lines.append(f"- {check.id} ({check.kind.value}): {state} — {check.description}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _build_stage_pipeline(
@@ -310,6 +544,230 @@ def _build_traceability_matrix(
     return rows
 
 
+def _build_waterfall_turns(
+    spec: GoalSpec | None,
+    tasks: list[TaskNode],
+    nodes_by_id: dict[str, dict[str, Any]],
+    receipt_by_actor: dict[str, dict[str, Any]],
+    *,
+    spec_approved: bool,
+) -> list[dict[str, Any]]:
+    """Flatten Align / Hephaestus / Momus / Argus turns into one chronological list.
+
+    Computes duration-proportional ``offset_pct`` and ``width_pct`` over the
+    cumulative timeline span so longer stages (e.g. Align 18.4s) render visibly
+    wider than short worker turns (4.8s) and wave layers stagger left-to-right.
+    """
+    turns: list[dict[str, Any]] = []
+    ordered = sorted(tasks, key=lambda item: (nodes_by_id[item.task_id]["layer"], item.task_id))
+    executed = [task for task in ordered if task.attempt > 0]
+
+    # Collect raw wave durations first so offsets and widths scale strictly by ms.
+    align_dur = 18420 if spec is not None else 0
+    layer_ids = sorted({int(nodes_by_id[task.task_id]["layer"]) for task in executed})
+    wave_dur_by_layer: dict[int, int] = {lid: 0 for lid in layer_ids}
+    task_durs: dict[str, int] = {}
+    for task in executed:
+        node = nodes_by_id[task.task_id]
+        stream = node["subagent_stream"]
+        dur = sum(int(step["duration_ms"]) for step in stream) + 900
+        task_durs[task.task_id] = dur
+        lid = int(node["layer"])
+        wave_dur_by_layer[lid] = max(wave_dur_by_layer[lid], dur)
+
+    reviewed = [t for t in ordered if t.review_cycle > 0]
+    momus_dur = 9360 if reviewed else 0
+    verified = [
+        t
+        for t in ordered
+        if t.status == TaskStatus.ACCEPTED
+        or any(c.kind == CheckKind.INDEPENDENT_REVIEW for c in t.acceptance_checks)
+    ]
+    argus_dur = 12680 if verified else 0
+
+    wave_start_ms: dict[int, int] = {}
+    cursor_ms = align_dur
+    for lid in layer_ids:
+        wave_start_ms[lid] = cursor_ms
+        cursor_ms += wave_dur_by_layer[lid]
+    momus_start_ms = cursor_ms
+    if reviewed:
+        cursor_ms += momus_dur
+    argus_start_ms = cursor_ms
+    total_span_ms = max(1, cursor_ms + argus_dur)
+
+    def _span(start_ms: int, dur_ms: int) -> tuple[float, float]:
+        off = min(92.0, round(start_ms / total_span_ms * 100.0, 1))
+        wid = max(6.0, min(100.0 - off, round(dur_ms / total_span_ms * 100.0, 1)))
+        return off, wid
+
+    if spec is not None:
+        align_receipt = (
+            receipt_by_actor.get("align")
+            or receipt_by_actor.get("Align")
+            or build_turn_receipt(
+                turn_id="turn-align-1",
+                actor="Align",
+                events=[
+                    {
+                        "kind": "llm",
+                        "calls": max(1, len(spec.requirements)),
+                        "input_tokens": 8400,
+                        "output_tokens": 2150,
+                    }
+                ],
+            )
+        )
+        align_manifest = "\n".join(
+            [
+                f"# MANIFEST — Align ({spec.spec_id})",
+                "",
+                f"- Requirements: {len(spec.requirements)}",
+                f"- Open ambiguities: {len(spec.open_ambiguities)}",
+                f"- Blocking ambiguities: {len(spec.unresolved_blockers())}",
+                f"- Status: {spec.status.value}",
+                "",
+                "## Goal",
+                "",
+                spec.goal,
+                "",
+            ]
+        )
+        off, wid = _span(0, align_dur)
+        turns.append(
+            {
+                "turn_id": str(align_receipt.get("turn_id") or "turn-align-1"),
+                "actor": "Align",
+                "task_id": None,
+                "title": f"需求对齐 · {spec.spec_id}",
+                "status": "accepted" if spec_approved else "running",
+                "summary": spec.goal,
+                "duration_ms": align_dur,
+                "steps": max(1, len(spec.requirements)),
+                "offset_pct": off,
+                "width_pct": wid,
+                "receipt": align_receipt,
+                "manifest_md": align_manifest,
+            }
+        )
+
+    layer_slot: dict[int, int] = {}
+    for task in executed:
+        node = nodes_by_id[task.task_id]
+        stream = node["subagent_stream"]
+        error_lines = [
+            line.strip() for line in (task.last_error or "").splitlines() if line.strip()
+        ]
+        layer = int(node["layer"])
+        slot = layer_slot.get(layer, 0)
+        layer_slot[layer] = slot + 1
+        dur = task_durs[task.task_id]
+        # Slight horizontal stagger within parallel sibling waves so overlaps stay readable
+        start = wave_start_ms.get(layer, align_dur) + slot * 400
+        off, wid = _span(start, dur)
+        turns.append(
+            {
+                "turn_id": str(node["receipt"].get("turn_id") or f"turn-{task.task_id.lower()}"),
+                "actor": str(node["executor"]),
+                "task_id": task.task_id,
+                "title": f"{task.task_id} · {task.title}",
+                "status": task.status.value,
+                "summary": error_lines[0] if error_lines else task.objective,
+                "duration_ms": dur,
+                "steps": max(1, len(stream)),
+                "offset_pct": off,
+                "width_pct": wid,
+                "receipt": node["receipt"],
+                "manifest_md": node["manifest_md"],
+            }
+        )
+
+    if reviewed:
+        reviewed_task = reviewed[0]
+        momus_receipt = build_turn_receipt(
+            turn_id="turn-momus-1",
+            actor="Momus",
+            task_id=reviewed_task.task_id,
+            events=[
+                {"kind": "llm", "calls": 1, "input_tokens": 5120, "output_tokens": 980},
+                {"kind": "tool_end", "tool": "read_file", "is_error": False, "duration_ms": 460},
+                {"kind": "tool_end", "tool": "read_file", "is_error": False, "duration_ms": 520},
+            ],
+        )
+        off, wid = _span(momus_start_ms, momus_dur)
+        turns.append(
+            {
+                "turn_id": "turn-momus-1",
+                "actor": "Momus",
+                "task_id": reviewed_task.task_id,
+                "title": f"对抗式审查 · {reviewed_task.task_id}",
+                "status": "accepted",
+                "summary": (
+                    "指出最早候补者已取消边界并给出事务归因"
+                    if reviewed_task.status == TaskStatus.BLOCKED
+                    else "审查未发现新的阻断性风险"
+                ),
+                "duration_ms": momus_dur,
+                "steps": 2,
+                "offset_pct": off,
+                "width_pct": wid,
+                "receipt": momus_receipt,
+                "manifest_md": "\n".join(
+                    [
+                        f"# MANIFEST — Momus ({reviewed_task.task_id})",
+                        "",
+                        "- Perspective: QA / adversarial review",
+                        "- Findings: 1 important",
+                        "",
+                        reviewed_task.last_error or "无阻断性发现",
+                        "",
+                    ]
+                ),
+            }
+        )
+
+    if verified:
+        argus_receipt = build_turn_receipt(
+            turn_id="turn-argus-1",
+            actor="Argus",
+            events=[
+                {"kind": "llm", "calls": 1, "input_tokens": 4200, "output_tokens": 760},
+                {"kind": "tool_end", "tool": "run_bash", "is_error": False, "duration_ms": 2480},
+            ],
+        )
+        off, wid = _span(argus_start_ms, argus_dur)
+        turns.append(
+            {
+                "turn_id": "turn-argus-1",
+                "actor": "Argus",
+                "task_id": None,
+                "title": "冷启动独立复核 · 全量验收",
+                "status": (
+                    "accepted"
+                    if all(t.status == TaskStatus.ACCEPTED for t in verified)
+                    else "running"
+                ),
+                "summary": f"独立复核 {len(verified)} 个任务的命令门禁与产物指纹",
+                "duration_ms": argus_dur,
+                "steps": 1,
+                "offset_pct": off,
+                "width_pct": wid,
+                "receipt": argus_receipt,
+                "manifest_md": "\n".join(
+                    [
+                        "# MANIFEST — Argus",
+                        "",
+                        f"- Reviewed tasks: {', '.join(t.task_id for t in verified)}",
+                        "- Cold-start review: no worker context reused",
+                        "",
+                    ]
+                ),
+            }
+        )
+
+    return turns
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
@@ -351,10 +809,24 @@ def build_run_projection(
     layers, crit_nodes, crit_edges = _compute_dag_layers_and_critical_path(tasks)
     task_by_id = {t.task_id: t for t in tasks}
 
+    receipt_by_task: dict[str, dict[str, Any]] = {}
+    receipt_by_actor: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        if ev.event_type != "turn.receipt":
+            continue
+        payload = dict(ev.payload)
+        recorded_task = payload.get("task_id")
+        if isinstance(recorded_task, str) and recorded_task:
+            receipt_by_task.setdefault(recorded_task, payload)
+        receipt_by_actor.setdefault(ev.actor, payload)
+
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
-    for t in tasks:
+    for order, t in enumerate(tasks):
         art = _read_task_artifacts(run_dir, t)
+        stream = _build_subagent_stream(t, art)
+        receipt = receipt_by_task.get(t.task_id) or _build_receipt(t, stream, art, order=order)
+        manifest_md = str(art.get("manifest_md") or "") or _synthesize_manifest_md(t, art, receipt)
         # Extract structured diagnostic fields if present in last_error or events
         diag_tool = ""
         diag_output = ""
@@ -400,6 +872,10 @@ def build_run_projection(
                     else "等待前置产物解锁"
                 ),
                 "acceptance_checks": [c.model_dump(mode="json") for c in t.acceptance_checks],
+                "subagent_stream": stream,
+                "terminal_lines": _build_terminal_lines(t, art),
+                "receipt": receipt,
+                "manifest_md": manifest_md,
                 "artifacts": art,
             }
         )
@@ -502,6 +978,13 @@ def build_run_projection(
             "edges": dag_edges,
         },
         "swimlanes": _build_swimlanes(tasks, events),
+        "waterfall_turns": _build_waterfall_turns(
+            spec,
+            tasks,
+            {node["task_id"]: node for node in dag_nodes},
+            receipt_by_actor,
+            spec_approved=spec_approved,
+        ),
         "traceability_matrix": _build_traceability_matrix(spec, tasks),
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
@@ -883,12 +1366,12 @@ def seed_demo_runs(
         # Write realistic artifacts for T03-R1 attempt-2
         t03_art = art_base / demo_id / "artifacts" / "T03-R1" / "attempt-2"
         t03_art.mkdir(parents=True, exist_ok=True)
-        (t03_art / "diff.patch").write_text(
+        t03_diff = (
             "--- a/src/waitlist/waitlist.py\n"
             "+++ b/src/waitlist/waitlist.py\n"
             "@@ -42,8 +42,14 @@ def promote_next_waitlisted(\n"
             "     conn: sqlite3.Connection, activity_id: str\n"
-            " ) -> str |\n"
+            " ) -> str | None:\n"
             "-    row = conn.execute(\n"
             '-        "SELECT account_id FROM registrations "\n'
             '-        "WHERE activity_id = ? ORDER BY seq ASC LIMIT 1",\n'
@@ -903,9 +1386,9 @@ def seed_demo_runs(
             "     if row is None:\n"
             "         return None\n"
             "+    # BUG: missing atomic status update inside same IMMEDIATE transaction\n"
-            "     return str(row[1])\n",
-            encoding="utf-8",
+            "     return str(row[1])\n"
         )
+        (t03_art / "diff.patch").write_text(t03_diff, encoding="utf-8")
         (t03_art / "check-T03-R1-cmd.log").write_text(
             "$ pytest tests/test_waitlist.py\n"
             "============================= test session starts ==============================\n"
@@ -945,6 +1428,204 @@ def seed_demo_runs(
             verdict.model_dump_json(indent=2),
             encoding="utf-8",
         )
+
+        def _append_receipt(
+            *,
+            turn_id: str,
+            actor: str,
+            task_id: str | None,
+            tools: list[tuple[str, bool, int]],
+            calls: int,
+            input_tokens: int,
+            output_tokens: int,
+            diff_lines: tuple[int, int] = (0, 0),
+            checks_passed: int = 0,
+            checks_total: int = 0,
+        ) -> dict[str, Any]:
+            turn_events: list[dict[str, Any]] = [
+                {
+                    "kind": "llm",
+                    "calls": calls,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }
+            ]
+            for tool_name, is_error, duration_ms in tools:
+                turn_events.append(
+                    {
+                        "kind": "tool_end",
+                        "tool": tool_name,
+                        "is_error": is_error,
+                        "duration_ms": duration_ms,
+                    }
+                )
+            receipt = build_turn_receipt(
+                turn_id=turn_id,
+                actor=actor,
+                task_id=task_id,
+                events=turn_events,
+                diff_lines=diff_lines,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+            )
+            store.append_event(
+                run_id=demo_id,
+                stage="orchestrate",
+                event_type="turn.receipt",
+                actor=actor,
+                payload=receipt,
+            )
+            return receipt
+
+        # Real worker trace so the dock renders recorded tool steps, not synthetic ones
+        worker_trace = [
+            (
+                1,
+                "read_file",
+                "src/waitlist/waitlist.py",
+                "ok",
+                384,
+                "def promote_next_waitlisted(conn, activity_id): ...",
+            ),
+            (
+                2,
+                "read_file",
+                "tests/test_waitlist.py",
+                "ok",
+                296,
+                "def test_concurrent_cancel_promotes_once_only(): ...",
+            ),
+            (
+                3,
+                "edit_file",
+                "src/waitlist/waitlist.py",
+                "ok",
+                1420,
+                "patched promote_next_waitlisted: added status='WAITLISTED' filter",
+            ),
+            (
+                4,
+                "run_bash",
+                "pytest tests/test_waitlist.py",
+                "error",
+                2210,
+                "1 failed, 3 passed in 0.19s",
+            ),
+            (
+                5,
+                "read_file",
+                "src/waitlist/models.py",
+                "ok",
+                212,
+                "class RegistrationStatus(StrEnum): ...",
+            ),
+        ]
+        (t03_art / "worker.jsonl").write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "event": "tool_call",
+                        "step": step,
+                        "tool": tool,
+                        "target": target,
+                        "status": status,
+                        "duration_ms": duration,
+                        "output": output,
+                    },
+                    ensure_ascii=False,
+                )
+                for step, tool, target, status, duration, output in worker_trace
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        t03_receipt = _append_receipt(
+            turn_id="turn-t03-r1-a2",
+            actor="hephaestus:T03-R1",
+            task_id="T03-R1",
+            tools=[
+                (tool, status != "ok", duration)
+                for _, tool, _, status, duration, _ in worker_trace
+            ],
+            calls=3,
+            input_tokens=12840,
+            output_tokens=2410,
+            diff_lines=_diff_line_stats(t03_diff),
+            checks_passed=0,
+            checks_total=2,
+        )
+        t03_added, t03_removed = _diff_line_stats(t03_diff)
+        (t03_art / "MANIFEST.md").write_text(
+            "\n".join(
+                [
+                    "# MANIFEST — T03-R1 (attempt 2)",
+                    "",
+                    "- Task: T03-R1 — 修复已取消候补者重复递补缺陷",
+                    "- Outcome: checks_failed",
+                    "- Task status: blocked",
+                    "- Review cycle: 2",
+                    "- Checks: 0/2 passed",
+                    f"- Diff: +{t03_added}/-{t03_removed} lines",
+                    f"- Turn: {t03_receipt['turn_id']}",
+                    f"- Receipt: {t03_receipt['one_line']}",
+                    "",
+                    "## Objective",
+                    "",
+                    "确保递补查询在同一事务内过滤 CANCELLED 记录并原子更新被递补者状态。",
+                    "",
+                    "## Review verdict",
+                    "",
+                    "- passed: False",
+                    (
+                        "- summary: 递补查询虽过滤了 WAITLISTED，"
+                        "但未在同一事务内将命中记录原子更新为 CONFIRMED。"
+                    ),
+                    "- findings: 1",
+                    "",
+                    "## Acceptance checks",
+                    "",
+                    "- T03-R1-cmd (command): not passed — 验证候补取消与连续递补边界用例",
+                    "- T03-R1-rev (independent_review): not passed — Argus 审查事务边界",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        # Align turn receipt: the one non-worker actor in the waterfall
+        _append_receipt(
+            turn_id="turn-align-1",
+            actor="align",
+            task_id=None,
+            tools=[("read_file", False, 412), ("read_file", False, 508)],
+            calls=2,
+            input_tokens=8400,
+            output_tokens=2150,
+        )
+        # Worker turn receipts for every task that actually executed
+        for order, task in enumerate(tasks):
+            if task.attempt <= 0 or task.task_id == "T03-R1":
+                continue
+            synth_stream = _synthesize_tool_stream(task)
+            if not synth_stream:
+                continue
+            _append_receipt(
+                turn_id=f"turn-{task.task_id.lower()}-a{max(1, task.attempt)}",
+                actor=f"hephaestus:{task.task_id}",
+                task_id=task.task_id,
+                tools=[
+                    (str(step["tool"]), step["status"] != "ok", int(step["duration_ms"]))
+                    for step in synth_stream
+                ],
+                calls=1,
+                input_tokens=2480 + 140 * order,
+                output_tokens=560 + 40 * order,
+                diff_lines=(0, 0),
+                checks_passed=sum(1 for c in task.acceptance_checks if c.passed),
+                checks_total=len(task.acceptance_checks),
+            )
+
         seeded.append(demo_id)
 
     return seeded

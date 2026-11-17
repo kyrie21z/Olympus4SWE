@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -32,6 +32,7 @@ from olympus.core.dag import (
     validate_plan,
 )
 from olympus.core.store import RunStore
+from olympus.harness.hooks import default_write_scope_hook
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
     SandboxHandle,
@@ -127,6 +128,86 @@ def _format_spec_context(spec: GoalSpec) -> str:
             f"Unresolved ambiguities (accepted risk): {json.dumps(unresolved, ensure_ascii=False)}"
         )
     return "\n".join(lines)
+
+
+def _diff_stats(diff_text: str) -> tuple[int, int]:
+    """Count added/removed lines, including raw contents of newly created files."""
+    added = 0
+    removed = 0
+    for block in diff_text.split("\n\n"):
+        lines = block.splitlines()
+        is_new_file = (
+            len(lines) >= 2
+            and lines[0].startswith("--- /dev/null")
+            and lines[1].startswith("+++ b/")
+        )
+        if is_new_file:
+            added += sum(1 for line in lines[2:] if line.strip())
+            continue
+        for line in lines:
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+    return added, removed
+
+
+def _write_manifest_md(
+    *,
+    art_dir: Path,
+    task: TaskNode,
+    diff_text: str,
+    checks: Sequence[AcceptanceCheck],
+    verdict: ReviewVerdict | None,
+    receipt: dict[str, Any],
+) -> Path:
+    """Write a human-readable MANIFEST.md summarizing integrity artifacts for one attempt."""
+    added, removed = _diff_stats(diff_text)
+    passed_checks = sum(1 for check in checks if check.passed)
+    failed_checks = [check for check in checks if not check.passed]
+    if verdict is not None:
+        outcome = "accepted" if verdict.passed else "rejected"
+    elif any(check.evidence_ref is not None for check in failed_checks):
+        outcome = "checks_failed"
+    else:
+        outcome = "incomplete"
+
+    lines = [
+        f"# MANIFEST — {task.task_id} (attempt {task.attempt})",
+        "",
+        f"- Task: {task.task_id} — {task.title}",
+        f"- Outcome: {outcome}",
+        f"- Task status: {task.status.value}",
+        f"- Review cycle: {task.review_cycle}",
+        f"- Checks: {passed_checks}/{len(checks)} passed",
+        f"- Diff: +{added}/-{removed} lines",
+        f"- Turn: {receipt.get('turn_id', '(none)')}",
+        f"- Receipt: {receipt.get('one_line', '(none)')}",
+        "",
+        "## Objective",
+        "",
+        task.objective,
+        "",
+    ]
+    if verdict is not None:
+        lines.extend(
+            [
+                "## Review verdict",
+                "",
+                f"- passed: {verdict.passed}",
+                f"- summary: {verdict.summary}",
+                f"- findings: {len(verdict.findings)}",
+                "",
+            ]
+        )
+    lines.extend(["## Acceptance checks", ""])
+    for check in checks:
+        state = "passed" if check.passed else "not passed"
+        lines.append(f"- {check.id} ({check.kind.value}): {state} — {check.description}")
+    lines.append("")
+    manifest_path = art_dir / "MANIFEST.md"
+    manifest_path.write_text("\n".join(lines), encoding="utf-8")
+    return manifest_path
 
 
 class OrchestrateStage:
@@ -452,6 +533,10 @@ class OrchestrateStage:
                 max_steps=worker_max_steps,
                 trace_path=art_dir / "worker.jsonl",
                 synthesize_on_max_steps=True,
+                task_id=leased.task_id,
+                pre_tool_hook=default_write_scope_hook(
+                    leased.write_scope, workspace_root=sandbox.workspace_path
+                ),
             )
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"
@@ -503,6 +588,14 @@ class OrchestrateStage:
             diff_file.write_text(diff_text, encoding="utf-8")
 
             if not loop_res.completed:
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=verifying.acceptance_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -517,6 +610,14 @@ class OrchestrateStage:
                 art_dir=art_dir,
             )
             if cmd_failures:
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=updated_checks,
+                    verdict=None,
+                    receipt=loop_res.receipt,
+                )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -544,6 +645,14 @@ class OrchestrateStage:
                     if f.severity == ReviewSeverity.IMPORTANT
                 ]
                 err_msg = f"Review rejected: {verdict.summary}\n" + "\n".join(important_lines)
+                _write_manifest_md(
+                    art_dir=art_dir,
+                    task=verifying,
+                    diff_text=diff_text,
+                    checks=updated_checks,
+                    verdict=verdict,
+                    receipt=loop_res.receipt,
+                )
                 return self._fail_or_requeue(
                     run_id=run_id,
                     task=verifying,
@@ -566,7 +675,7 @@ class OrchestrateStage:
                 else c
                 for c in updated_checks
             ]
-            return self.store.update_task_with_lease(
+            accepted = self.store.update_task_with_lease(
                 run_id,
                 verifying.task_id,
                 expected_lease_generation=verifying.lease_generation,
@@ -581,6 +690,15 @@ class OrchestrateStage:
                 actor="chronos",
                 event_type="task.accepted",
             )
+            _write_manifest_md(
+                art_dir=art_dir,
+                task=accepted,
+                diff_text=diff_text,
+                checks=final_checks,
+                verdict=verdict,
+                receipt=loop_res.receipt,
+            )
+            return accepted
         finally:
             remove_sandbox(sandbox)
 

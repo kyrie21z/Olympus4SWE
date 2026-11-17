@@ -52,6 +52,46 @@ def test_seed_demo_and_projection_invariants(tmp_path: Path) -> None:
     assert matrix_by_req["FR-003"]["verification_status"] == "failed"
     assert matrix_by_req["FR-005"]["verification_status"] == "pending"
 
+    # Every node carries the cockpit's per-task panels
+    for node in proj["dag"]["nodes"]:
+        assert isinstance(node["subagent_stream"], list)
+        assert isinstance(node["terminal_lines"], list)
+        assert len(node["terminal_lines"]) <= 4
+        assert node["receipt"]["turn_id"]
+        assert node["receipt"]["one_line"]
+        assert node["manifest_md"].startswith("# MANIFEST")
+
+    blocked_node = nodes_by_id["T03-R1"]
+    assert [step["tool"] for step in blocked_node["subagent_stream"]] == [
+        "read_file",
+        "read_file",
+        "edit_file",
+        "run_bash",
+        "read_file",
+    ]
+    assert blocked_node["subagent_stream"][3]["status"] == "error"
+    assert blocked_node["receipt"]["task_id"] == "T03-R1"
+    assert blocked_node["receipt"]["artifacts"]["checks_total"] == 2
+    assert "MANIFEST — T03-R1" in blocked_node["manifest_md"]
+    assert blocked_node["terminal_lines"][-1].startswith("1 failed, 3 passed")
+
+    # Seeds write the real trace + manifest so the frontend renders recorded data
+    t03_art = tmp_path / ".olympus" / "runs" / "run-campus-waitlist" / "artifacts" / "T03-R1"
+    assert (t03_art / "attempt-2" / "worker.jsonl").exists()
+    assert (t03_art / "attempt-2" / "MANIFEST.md").exists()
+
+    # Waterfall: chronological Align -> Hephaestus -> Momus -> Argus turns
+    turns = proj["waterfall_turns"]
+    assert [turn["actor"] for turn in turns][0] == "Align"
+    assert [turn["actor"] for turn in turns][-1] == "Argus"
+    actors = {turn["actor"] for turn in turns}
+    assert {"Align", "Hephaestus-1", "Hephaestus-2", "Momus", "Argus"} <= actors
+    assert {turn["task_id"] for turn in turns} >= {"T03-R1", "T05"}
+    for turn in turns:
+        assert turn["receipt"]["turn_id"] == turn["turn_id"]
+        assert turn["steps"] >= 1
+        assert turn["duration_ms"] > 0
+
 
 def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
     db_path = tmp_path / ".olympus" / "olympus.db"
@@ -71,8 +111,37 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             html_res = client.get("/")
             assert html_res.status_code == 200
             assert 'closedby="any"' in html_res.text
-            assert "scrollbar-color" in html_res.text
             assert "需求追踪矩阵" in html_res.text
+            assert 'href="/static/tokens.css"' in html_res.text
+            assert 'href="/static/style.css"' in html_res.text
+            assert 'src="/static/ui.js"' in html_res.text
+            assert 'src="/static/app.js"' in html_res.text
+
+            # 1b. Static assets are served with the right MIME types and no caching
+            tokens_res = client.get("/static/tokens.css")
+            assert tokens_res.status_code == 200
+            assert tokens_res.headers["content-type"].startswith("text/css")
+            assert tokens_res.headers["cache-control"] == "no-store"
+            assert "--surface-bg" in tokens_res.text
+
+            css_res = client.get("/static/style.css")
+            assert css_res.status_code == 200
+            assert css_res.headers["content-type"].startswith("text/css")
+            assert css_res.headers["cache-control"] == "no-store"
+            assert "scrollbar-color" in css_res.text
+
+            ui_res = client.get("/static/ui.js")
+            assert ui_res.status_code == 200
+            assert "javascript" in ui_res.headers["content-type"]
+            assert "function watchSlots(" in ui_res.text
+
+            app_res = client.get("/static/app.js")
+            assert app_res.status_code == 200
+            assert "javascript" in app_res.headers["content-type"]
+            assert "watchSlots();" in app_res.text
+
+            assert client.get("/static/missing.css").status_code == 404
+            assert client.get("/static/..%2fserver.py").status_code == 404
 
             health = client.get("/healthz").json()
             assert health["ok"] is True
@@ -84,6 +153,16 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             run_res = client.get("/api/runs/run-campus-waitlist").json()
             assert run_res["ok"] is True
             rev0 = int(run_res["projection"]["state_revision"])
+
+            # 2b. The projection powers toolRow / subPane / receiptBlock / waterfall
+            proj0 = run_res["projection"]
+            t03r1 = next(n for n in proj0["dag"]["nodes"] if n["task_id"] == "T03-R1")
+            assert t03r1["subagent_stream"][0]["tool"] == "read_file"
+            assert t03r1["receipt"]["turn_id"] == "turn-t03-r1-a2"
+            assert "MANIFEST — T03-R1" in t03r1["manifest_md"]
+            assert len(t03r1["terminal_lines"]) <= 4
+            assert proj0["waterfall_turns"][0]["actor"] == "Align"
+            assert any(turn["actor"] == "Argus" for turn in proj0["waterfall_turns"])
 
             # 3. SSE stream (once=1)
             sse_res = client.get("/api/runs/run-campus-waitlist/stream?after_seq=0&once=1")

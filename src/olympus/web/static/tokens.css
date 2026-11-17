@@ -1,0 +1,122 @@
+/* Olympus4SWE · Ariadne tokens — Warm Editorial Stone.
+ *
+ * This is the only stylesheet in the console that may hold colour literals.
+ * Everything else reads a token so the light and dark grounds stay in step.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces — warm stone paper, never pure white */
+  --surface-bg: #f2eee6;
+  --surface-paper: #fbf9f4;
+  --surface-raised: #ffffff;
+  --surface-sunk: #e9e3d7;
+  --scrim: rgba(30, 26, 20, 0.52);
+
+  /* Text */
+  --text-ink: #1d1a15;
+  --text-secondary: #4b443a;
+  --text-muted: #6b6152;
+
+  /* Hairlines */
+  --rule: #d9d1c2;
+  --rule-hard: #b3a894;
+
+  /* Accent and semantic tones */
+  --accent: #a8621b;
+  --accent-fg: #8a4d12;
+  --accent-ink: #fdf7ec;
+  --accent-soft: #f2e2c8;
+  --ok: #2f6b4a;
+  --ok-soft: #e0ede4;
+  --warn: #9a6a12;
+  --warn-soft: #f6e9cd;
+  --bad: #a13a2e;
+  --bad-soft: #f7e2dd;
+  --live: #2c5f92;
+  --live-soft: #e0e9f3;
+  --code-bg: #221f1a;
+  --code-fg: #f1ebdf;
+
+  /* Scrollbars */
+  --scrollbar-thumb: #b3a894;
+  --scrollbar-track: #e9e3d7;
+
+  /* Faces — system stacks only, nothing is fetched */
+  --face-sans: "Inter", "Helvetica Neue", "PingFang SC", "Noto Sans CJK SC",
+    "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --face-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas,
+    ui-monospace, monospace;
+  --face-display: "Playfair Display", "Songti SC", "Noto Serif CJK SC", Georgia,
+    "Times New Roman", serif;
+
+  /* Type scale */
+  --text-xs: 11px;
+  --text-sm: 12.5px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 21px;
+  --text-2xl: 29px;
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --tracking-label: 0.14em;
+
+  /* Shape */
+  --radius: 2px;
+  --shape-chip: 2px;
+  --shape-circle: 999px;
+  --shape-pill: 999px;
+  --shape-bubble: 2px;
+
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 40px;
+  --space-8: 56px;
+
+  /* Motion and elevation */
+  --motion-fast: 140ms ease;
+  --shadow-md: 0 18px 40px -18px rgba(30, 26, 20, 0.4);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-bg: #16140f;
+  --surface-paper: #1d1a15;
+  --surface-raised: #25211a;
+  --surface-sunk: #100f0c;
+  --scrim: rgba(0, 0, 0, 0.62);
+
+  --text-ink: #f2ecdf;
+  --text-secondary: #c9bfad;
+  --text-muted: #938878;
+
+  --rule: #322d25;
+  --rule-hard: #4a4337;
+
+  --accent: #d99a4c;
+  --accent-fg: #eebc7b;
+  --accent-ink: #1a150e;
+  --accent-soft: #372a18;
+  --ok: #6db88f;
+  --ok-soft: #1b2b22;
+  --warn: #d6a459;
+  --warn-soft: #302512;
+  --bad: #dd8276;
+  --bad-soft: #311e1a;
+  --live: #7aaee0;
+  --live-soft: #16232f;
+  --code-bg: #0d0c0a;
+  --code-fg: #ece5d6;
+
+  --scrollbar-thumb: #4a4337;
+  --scrollbar-track: #100f0c;
+
+  --shadow-md: 0 22px 48px -20px rgba(0, 0, 0, 0.72);
+}

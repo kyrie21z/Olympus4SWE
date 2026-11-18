@@ -1470,6 +1470,11 @@
         return;
       }
     });
+    source.addEventListener("error", () => {
+      if (state.runId === runId && source.readyState === EventSource.CLOSED) {
+        toast("实时流已断开，请检查后台服务状态");
+      }
+    });
     state.sse = source;
   }
 

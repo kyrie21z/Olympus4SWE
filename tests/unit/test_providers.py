@@ -577,6 +577,35 @@ def test_openai_dialect_compat_flags_shape_payload(monkeypatch: pytest.MonkeyPat
     assert body["tools"][0]["function"]["name"] == "read_file"
 
 
+def test_openai_chat_compat_extra_body_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> Any:
+        del url, headers, timeout
+        captured["body"] = json
+        return _completion_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    compat = OpenAIChatCompat.from_mapping(
+        {
+            "non_null_assistant_content": True,
+            "extra_body": {"enable_thinking": False, "model": "should-not-override"},
+        }
+    )
+    dialect = OpenAIChatDialect(compat=compat)
+    dialect.send(
+        EndpointTarget(api_key="sk-key", base_url="https://host.example.com/v1"),
+        model="wire-model",
+        messages=[ChatMessage(role="user", content="hello")],
+    )
+    body = captured["body"]
+    assert body["enable_thinking"] is False
+    assert body["model"] == "wire-model"
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+
+
 def test_anthropic_dialect_serializes_messages_and_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

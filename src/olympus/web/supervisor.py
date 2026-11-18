@@ -530,6 +530,38 @@ class RunSupervisor:
             return None
         return future.result(timeout=timeout)
 
+    def recover_orphaned_runs(self) -> list[str]:
+        """Mark interrupted supervised runs as FAILED on startup so UI can retry cleanly."""
+        recovered: list[str] = []
+        active_statuses = ("created", "aligning", "designing", "planning", "running")
+        for row in self.store.list_runs(limit=100):
+            if row.get("status") not in active_statuses:
+                continue
+            run_id = str(row["run_id"])
+            if not self.is_supervised(run_id):
+                continue
+            with self._guard:
+                future = self._future_by_run.get(run_id)
+            if future is not None and not future.done():
+                continue
+            msg = "服务重启导致阶段执行中断，可从当前断点直接重试"
+            self.store.append_event(
+                run_id=run_id,
+                stage="graph",
+                event_type="graph.failed",
+                actor="supervisor",
+                payload={"error": msg},
+            )
+            self.store.set_run_status(
+                run_id,
+                RunStatus.FAILED,
+                actor="supervisor",
+                stage="graph",
+                detail={"reason": "orphan_recovered", "error": msg},
+            )
+            recovered.append(run_id)
+        return recovered
+
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 

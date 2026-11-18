@@ -45,6 +45,7 @@ class OpenAIChatCompat:
     max_tokens_field: MaxTokensField | None = None
     include_tool_result_name: bool = False
     non_null_assistant_content: bool = False
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> OpenAIChatCompat:
@@ -52,10 +53,12 @@ class OpenAIChatCompat:
         tokens_field: MaxTokensField | None = None
         if raw_field in ("max_tokens", "max_completion_tokens"):
             tokens_field = raw_field
+        raw_extra = mapping.get("extra_body")
         return cls(
             max_tokens_field=tokens_field,
             include_tool_result_name=bool(mapping.get("include_tool_result_name", False)),
             non_null_assistant_content=bool(mapping.get("non_null_assistant_content", False)),
+            extra_body=dict(raw_extra) if isinstance(raw_extra, Mapping) else {},
         )
 
 
@@ -153,4 +156,6 @@ class OpenAIChatDialect:
             body["tools"] = serialize_tool_schemas_openai(tools)
         if self.max_tokens is not None and self.compat.max_tokens_field is not None:
             body[self.compat.max_tokens_field] = self.max_tokens
+        for key, value in self.compat.extra_body.items():
+            body.setdefault(key, value)
         return body

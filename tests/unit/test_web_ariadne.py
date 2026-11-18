@@ -865,3 +865,41 @@ def test_failed_workflow_projection_and_retry_workflow(tmp_path: Path) -> None:
         assert after["spec"] is not None
     finally:
         app.supervisor.shutdown()
+
+
+def test_recover_orphaned_supervised_runs(tmp_path: Path) -> None:
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+
+    # Supervised run left mid-flight in ALIGNING
+    orphan_id = store.create_run(
+        title="Orphan Run",
+        workflow_name="product_blueprint",
+        provider_config={"provider": "mock"},
+    )
+    store.append_event(
+        run_id=orphan_id,
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "align", "kind": "align_goal"},
+    )
+    store.set_run_status(orphan_id, RunStatus.ALIGNING, actor="align", stage="align")
+
+    # Unsupervised run in RUNNING (e.g. demo or CLI without graph events) stays untouched
+    manual_id = store.create_run(title="Manual Run", workflow_name="repo_fast_patch")
+    store.set_run_status(manual_id, RunStatus.RUNNING, actor="zeus", stage="orchestrate")
+
+    supervisor = RunSupervisor(store=store, workspace_root=tmp_path)
+    try:
+        recovered = supervisor.recover_orphaned_runs()
+        assert recovered == [orphan_id]
+
+        proj = build_run_projection(store, tmp_path, orphan_id)
+        assert proj["status"] == "failed"
+        assert proj["workflow"]["failed_node"] == "align"
+        assert proj["hitl_banner"] is not None
+        assert proj["hitl_banner"]["kind"] == "run_failed"
+        assert store.get_run(manual_id)["status"] == RunStatus.RUNNING
+    finally:
+        supervisor.shutdown()

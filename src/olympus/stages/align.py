@@ -61,7 +61,17 @@ Rules:
 5. Exploration Discipline: Limit read-only repo checks to 2-4 focused calls (public API/module
    layout only) before returning GoalSpec JSON; leave deep implementation reading to Stage 2.
 6. Output ONLY a single valid JSON object conforming to GoalSpec. Never emit `$comment`,
-   `$schema`, or unlisted extra keys."""
+   `$schema`, or unlisted extra keys.
+7. Greenfield vs. Brownfield: First check whether `Raw user goal` asks to modify the observed
+   workspace repository or to build a brand-new standalone product unrelated to the existing
+   workspace files (e.g., building a consumer app while the workspace holds an unrelated
+   framework). If it is a new standalone product unrelated to the workspace files, treat it as
+   GREENFIELD immediately: do NOT call tools to inspect unrelated host repo files or treat
+   host files as contradictions; synthesize the standalone GoalSpec directly.
+8. Language Mirroring: Write all human-facing prose (`goal`, `description`,
+   `acceptance_criteria`, `out_of_scope`, `constraints`, `question`, `impact`, `options`,
+   `default_assumption`) in the same natural language as `Raw user goal` (e.g., Chinese when
+   `Raw user goal` is Chinese), keeping IDs and enum values in ASCII."""
 
 _CRITIQUE_SYSTEM_TEMPLATE = """You are a cold-start read-only {perspective} reviewer.
 Inspect the draft GoalSpec (and repository files if needed) and report ONLY real omissions,

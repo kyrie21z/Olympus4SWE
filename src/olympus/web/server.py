@@ -622,6 +622,7 @@ def serve_ariadne(
     if seed_demo:
         seed_demo_runs(store, ws)
     app = AriadneApp(store=store, workspace_root=ws)
+    app.supervisor.recover_orphaned_runs()
     httpd = create_http_server(app, host=host, port=port)
     try:
         httpd.serve_forever()

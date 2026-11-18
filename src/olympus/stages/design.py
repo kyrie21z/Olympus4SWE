@@ -82,7 +82,11 @@ Rules:
    micro-module sprawl), and pin concrete request/response fields + error cases on every
    InterfaceContract.
 7. Set spec_id and spec_hash to the frozen values supplied in the prompt.
-8. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+8. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
+   human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
+   `risks_and_tradeoffs`); for greenfield products unrelated to the host workspace, choose
+   clean standalone repo-relative `target_paths` (e.g. `backend/...`, `frontend/...`).
+9. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:

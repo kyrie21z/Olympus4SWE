@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from http import HTTPStatus
@@ -497,10 +498,11 @@ def create_http_server(
         def _handle_sse(self, run_id: str, *, after_seq: int = 0, once: bool = False) -> None:
             # Validate run exists before starting stream
             payload = app.get_events_payload(run_id, after_seq=after_seq)
+            self.close_connection = True
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close" if once else "keep-alive")
+            self.send_header("Connection", "close")
             self.end_headers()
 
             def _write_sse(event_name: str, data: dict[str, Any]) -> None:
@@ -508,27 +510,31 @@ def create_http_server(
                 self.wfile.write(chunk.encode("utf-8"))
                 self.wfile.flush()
 
-            _write_sse("state", payload)
-            if once:
-                return
+            try:
+                _write_sse("state", payload)
+                if once:
+                    return
 
-            last_rev = int(payload["state_revision"])
-            events = payload["events"]
-            cur_seq = int(events[-1]["event_seq"]) if events else after_seq
-            for _ in range(120):
-                time.sleep(1.0)
-                try:
+                last_rev = int(payload["state_revision"])
+                events = payload["events"]
+                cur_seq = int(events[-1]["event_seq"]) if events else after_seq
+                ticks = 0
+                while True:
+                    time.sleep(0.5)
+                    ticks += 1
                     nxt = app.get_events_payload(run_id, after_seq=cur_seq)
                     if int(nxt["state_revision"]) != last_rev or nxt["events"]:
                         last_rev = int(nxt["state_revision"])
                         if nxt["events"]:
                             cur_seq = int(nxt["events"][-1]["event_seq"])
                         _write_sse("state", nxt)
-                    else:
+                    elif ticks % 10 == 0:
                         self.wfile.write(b": heartbeat\n\n")
                         self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    break
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                self.close_connection = True
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
@@ -597,7 +603,21 @@ def create_http_server(
             except FileNotFoundError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             except ConcurrencyConflictError as exc:
-                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                conflict_payload: dict[str, Any] = {
+                    "ok": False,
+                    "conflict": True,
+                    "error": str(exc),
+                }
+                req_parts = [p for p in path.split("/") if p]
+                if len(req_parts) == 4 and req_parts[0] == "api" and req_parts[1] == "runs":
+                    with contextlib.suppress(Exception):
+                        conflict_payload["projection"] = build_run_projection(
+                            app.store,
+                            app.workspace_root,
+                            req_parts[2],
+                            artifacts_root=app.artifacts_root,
+                        )
+                self._send_json(HTTPStatus.CONFLICT, conflict_payload)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             except Exception as exc:

@@ -903,3 +903,123 @@ def test_recover_orphaned_supervised_runs(tmp_path: Path) -> None:
         assert store.get_run(manual_id)["status"] == RunStatus.RUNNING
     finally:
         supervisor.shutdown()
+
+
+def test_clarify_settles_gate_sync_and_409_returns_projection(tmp_path: Path) -> None:
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(
+        title="Clarify Gate Revision Sync",
+        workflow_name="product_blueprint",
+        provider_config={"provider": "mock"},
+    )
+    spec = GoalSpec(
+        spec_id="spec-clarify-sync",
+        version=1,
+        goal="构建社区笔记分享核心能力并验证澄清到关口的状态修订一致性。",
+        requirements=[
+            RequirementItem(
+                id="FR-101",
+                description="支持发布与浏览图文笔记",
+                acceptance_criteria=["POST /notes 创建笔记并可在 GET /notes 列表中查到"],
+                source_ref="REQ-101",
+            )
+        ],
+        out_of_scope=["不接入直播间打赏"],
+        constraints=["使用单一 SQLite 事务落盘"],
+        open_ambiguities=[
+            AmbiguityItem(
+                id="AMB-1",
+                question="首期是否支持视频笔记？",
+                impact="决定媒体上传接口契约",
+                options=["首期仅支持图文", "图文与短视频"],
+                default_assumption="首期仅支持图文",
+                blocking=True,
+                answer=None,
+            )
+        ],
+        status=SpecStatus.DRAFT,
+    )
+    store.save_spec(run_id, spec, actor="align")
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.node_finished",
+        actor="supervisor",
+        payload={"node": "align", "kind": "align_goal"},
+    )
+    store.set_run_status(
+        run_id,
+        RunStatus.AWAITING_HUMAN,
+        actor="supervisor",
+        stage="graph",
+        detail={"paused_node": "gate_spec"},
+    )
+
+    app = AriadneApp(store=store, workspace_root=tmp_path)
+    httpd = create_http_server(app, host="127.0.0.1", port=0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with httpx.Client(base_url=base_url, timeout=10.0) as client:
+            initial = client.get(f"/api/runs/{run_id}").json()["projection"]
+
+            # Default clarify (auto_advance omitted -> True, sync omitted -> False)
+            # must enter gate_spec synchronously so returned state_revision is settled.
+            clarify_res = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "operation_id": "op-clarify-sync-1",
+                    "action": "clarify",
+                    "answers": {"AMB-1": "首期仅支持图文"},
+                    "expected_state_revision": initial["state_revision"],
+                },
+            )
+            assert clarify_res.status_code == 200
+            clarify_proj = clarify_res.json()["projection"]
+            assert clarify_proj["status"] == "awaiting_human"
+            assert clarify_proj["workflow"]["paused"]["node"] == "gate_spec"
+            assert clarify_proj["spec"]["version"] == 2
+            assert clarify_proj["spec_approved"] is False
+
+            # Stale revision -> 409 with conflict=True and live projection for client resync.
+            stale_rev = initial["state_revision"]
+            conflict_res = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "operation_id": "op-approve-stale-1",
+                    "action": "approve_spec",
+                    "expected_state_revision": stale_rev,
+                    "auto_advance": False,
+                },
+            )
+            assert conflict_res.status_code == 409
+            conflict_body = conflict_res.json()
+            assert conflict_body["ok"] is False
+            assert conflict_body["conflict"] is True
+            assert conflict_body["projection"]["state_revision"] == clarify_proj["state_revision"]
+
+            # Immediate approve_spec using clarify's returned revision succeeds (never 409).
+            approve_res = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "operation_id": "op-approve-fresh-1",
+                    "action": "approve_spec",
+                    "expected_state_revision": clarify_proj["state_revision"],
+                    "auto_advance": False,
+                },
+            )
+            assert approve_res.status_code == 200
+            approve_proj = approve_res.json()["projection"]
+            assert approve_proj["spec_approved"] is True
+
+            # SSE once=1 explicitly uses Connection: close under HTTP/1.1.
+            sse_res = client.get(f"/api/runs/{run_id}/stream?after_seq=0&once=1")
+            assert sse_res.status_code == 200
+            assert sse_res.headers.get("connection") == "close"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        app.supervisor.shutdown()

@@ -19,6 +19,7 @@
     clarifySig: "",
     userOpenedDock: false,
     sse: null,
+    reconnectTimer: null,
   };
 
   const el = {
@@ -1440,6 +1441,10 @@
   }
 
   function connectStream(runId, afterSeq) {
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
     if (state.sse) {
       state.sse.close();
       state.sse = null;
@@ -1464,7 +1469,10 @@
           const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
           const data = await response.json();
           if (state.runId !== runId) return;
-          if (data.ok) renderAll(data.projection);
+          if (data.ok) {
+            renderAll(data.projection);
+            refreshRuns().catch(() => {});
+          }
         }
       } catch (error) {
         return;
@@ -1472,14 +1480,38 @@
     });
     source.addEventListener("error", () => {
       if (state.runId === runId && source.readyState === EventSource.CLOSED) {
-        toast("实时流已断开，请检查后台服务状态");
+        source.close();
+        if (state.sse === source) state.sse = null;
+        if (!state.reconnectTimer) {
+          state.reconnectTimer = window.setTimeout(() => {
+            state.reconnectTimer = null;
+            if (state.runId === runId) loadRun(runId);
+          }, 1500);
+        }
       }
     });
     state.sse = source;
   }
 
-  async function sendCommand(body, successMessage) {
+  function gateContentHash(projection, action) {
+    if (!projection) return null;
+    if (action === "approve_spec") {
+      return !projection.spec_approved && projection.spec ? projection.spec.content_hash : null;
+    }
+    if (action === "approve_design") {
+      return !projection.design_approved && projection.design
+        ? projection.design.content_hash
+        : null;
+    }
+    if (action === "approve_plan") {
+      return !projection.plan_approved && projection.plan ? projection.plan.content_hash : null;
+    }
+    return null;
+  }
+
+  async function sendCommand(body, successMessage, isRetry = false) {
     if (!state.runId || !state.projection) return;
+    const priorGateHash = gateContentHash(state.projection, body.action);
     const payload = Object.assign(
       {
         operation_id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1495,10 +1527,33 @@
     });
     const data = await response.json();
     if (!data.ok) {
+      if (response.status === 409 || data.conflict) {
+        let fresh = data.projection || null;
+        if (!fresh) {
+          try {
+            const latestRes = await fetch(`/api/runs/${encodeURIComponent(state.runId)}`);
+            const latestData = await latestRes.json();
+            if (latestData.ok) fresh = latestData.projection;
+          } catch (error) {
+            fresh = null;
+          }
+        }
+        if (fresh) {
+          renderAll(fresh);
+          refreshRuns().catch(() => {});
+        }
+        const nextGateHash = gateContentHash(fresh, body.action);
+        if (!isRetry && priorGateHash && nextGateHash && priorGateHash === nextGateHash) {
+          return sendCommand(body, successMessage, true);
+        }
+        toast(`状态已同步至最新修订 (r${fresh ? fresh.state_revision : "?"})，请确认后重试`);
+        return;
+      }
       toast(`操作被拒绝：${data.error || "未知错误"}`);
       return;
     }
     renderAll(data.projection);
+    refreshRuns().catch(() => {});
     toast(successMessage);
   }
 
@@ -1690,7 +1745,12 @@
     });
 
     el.approvePlan.addEventListener("click", async () => {
-      await sendCommand({ action: "approve_plan" }, "已批准任务计划，开始执行");
+      const stopAfter =
+        state.projection && state.projection.workflow && state.projection.workflow.stop_after;
+      await sendCommand(
+        { action: "approve_plan" },
+        stopAfter === "plan" ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行"
+      );
     });
 
     el.retryWorkflow.addEventListener("click", async () => {

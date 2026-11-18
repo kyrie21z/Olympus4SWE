@@ -514,12 +514,14 @@ class RunSupervisor:
                 "paused": None,
                 "complete": True,
             }
+        entry_node = definition.node(entry)
+        effective_sync = sync or (entry_node is not None and entry_node.type == "human_gate")
         return self._launch(
             run_id,
             raw_input=self._recorded_raw_input(run_id, str(snap["title"])),
             start_from=entry,
             auto_approve=False,
-            sync=sync,
+            sync=effective_sync,
         )
 
     def wait(self, run_id: str, *, timeout: float | None = None) -> dict[str, Any] | None:

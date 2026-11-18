@@ -531,6 +531,38 @@ def test_parse_model_json_strips_meta_keys_and_preserves_extra_forbid() -> None:
         )
 
 
+def test_parse_model_json_ignores_embedded_markdown_fences_inside_json_strings() -> None:
+    from olympus.core.contracts import ReviewVerdict
+    from olympus.stages.common import extract_json_payload
+
+    payload = json.dumps(
+        {
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": True,
+            "summary": (
+                "Handled exception cleanly:\n"
+                "```python\nexcept ValueError:\n    raise\n```\n"
+            ),
+            "findings": [],
+        }
+    )
+    assert parse_model_json(payload, ReviewVerdict).passed is True
+    wrapped = f"Here is the verdict:\n```json\n{payload}\n```\nDone."
+    assert parse_model_json(wrapped, ReviewVerdict).summary.startswith("Handled exception")
+
+    # Broken JSON containing a ```python snippet must report the outer JSON error, not 'char 0'
+    # from extracting the inner code block.
+    broken = (
+        '{\n"summary": "see:\n```python\nx = 1\n```\n"broken",\n"passed": true\n}'
+    )
+    extracted = extract_json_payload(broken)
+    assert extracted.lstrip().startswith("{")
+    with pytest.raises(json.JSONDecodeError) as exc:
+        json.loads(extracted)
+    assert exc.value.pos > 0
+
+
 def test_stage1_propose_spec_injects_observed_workspace_inventory(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / "src").mkdir()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -12,7 +13,8 @@ from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
 from olympus.tools.aci import WorkspaceToolkit
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+_OUTER_FENCE_RE = re.compile(r"^\s*```(?:json|[a-zA-Z0-9_-]+)?\s*\n(.*)\n```\s*$", re.DOTALL)
+_FENCE_RE = re.compile(r"```([a-zA-Z0-9_-]*)\s*\n?(.*?)\n?```", re.DOTALL)
 _SCHEMA_META_KEYS = frozenset(
     {
         "$schema",
@@ -50,17 +52,59 @@ def strip_schema_meta_keys(value: Any) -> Any:
     return value
 
 
+def _is_valid_json(candidate: str) -> bool:
+    if not candidate:
+        return False
+    with suppress(json.JSONDecodeError):
+        json.loads(candidate)
+        return True
+    return False
+
+
+def _outermost_delimited_slice(text: str) -> str | None:
+    spans: list[tuple[int, int]] = []
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start != -1 and end > start:
+            spans.append((start, end))
+    if not spans:
+        return None
+    start, end = min(spans, key=lambda pair: pair[0])
+    return text[start : end + 1]
+
+
 def extract_json_payload(raw_text: str) -> str:
-    """Extract JSON object/array from plain text or fenced Markdown blocks."""
+    """Extract outer JSON payload cleanly without letting inner code fences hijack strings."""
     stripped = raw_text.strip()
-    match = _FENCE_RE.search(stripped)
-    if match:
-        return match.group(1).strip()
-    # Fallback: locate outermost braces
-    start_obj = stripped.find("{")
-    end_obj = stripped.rfind("}")
-    if start_obj != -1 and end_obj > start_obj:
-        return stripped[start_obj : end_obj + 1]
+    if not stripped:
+        return ""
+    # 1. Valid JSON as-is (must check BEFORE regex fence scanning to protect ``` in strings).
+    if _is_valid_json(stripped):
+        return stripped
+    # 2. Genuine outer Markdown code fence wrapping the whole payload.
+    outer_match = _OUTER_FENCE_RE.match(stripped)
+    if outer_match:
+        outer_body = outer_match.group(1).strip()
+        if _is_valid_json(outer_body):
+            return outer_body
+    # 3. Valid JSON enclosed in outermost braces/brackets inside surrounding prose.
+    delimited = _outermost_delimited_slice(stripped)
+    if delimited and _is_valid_json(delimited):
+        return delimited
+    # 4. Tagged ```json (or untagged) fenced blocks that parse cleanly.
+    fences = [(m.group(1).lower(), m.group(2).strip()) for m in _FENCE_RE.finditer(stripped)]
+    for tag, body in fences:
+        if tag in ("", "json") and _is_valid_json(body):
+            return body
+    # 5. Best fallback for error reporting: prefer outer body/braces over unrelated code blocks.
+    if outer_match:
+        return outer_match.group(1).strip()
+    if delimited:
+        return delimited
+    for tag, body in fences:
+        if tag in ("", "json"):
+            return body
     return stripped
 
 

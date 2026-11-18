@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import re
+import shlex
+import sys
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from olympus.core.contracts import (
@@ -419,6 +424,289 @@ def validate_design_spec(
     return violations
 
 
+_PYTHON_BIN_RE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*")
+_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "\n"})
+
+
+def _split_shell_segments(command: str) -> tuple[list[list[str]], str | None]:
+    """Tokenize a shell command and split on unquoted command separators."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        return [], f"invalid shell syntax ({exc})"
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments, None
+
+
+def _extract_segment_python_inline(segment: list[str]) -> tuple[str | None, str | None, int]:
+    """Return `(inline_code, error, arg_start_idx)` when a segment invokes `python -c`."""
+    idx = 0
+    while idx < len(segment):
+        tok = segment[idx]
+        if _ENV_ASSIGN_RE.match(tok) or tok == "env":
+            idx += 1
+            continue
+        if tok in ("uv", "poetry") and idx + 1 < len(segment) and segment[idx + 1] == "run":
+            idx += 2
+            continue
+        break
+    if idx >= len(segment):
+        return None, None, len(segment)
+    exe = PurePosixPath(segment[idx]).name
+    if not _PYTHON_BIN_RE.match(exe):
+        return None, None, idx + 1
+    idx += 1
+    while idx < len(segment):
+        arg = segment[idx]
+        if arg in ("-W", "-X"):
+            idx += 2
+            continue
+        if arg == "-c":
+            if idx + 1 >= len(segment):
+                return None, "python -c is missing its inline script argument", idx + 1
+            return segment[idx + 1], None, idx + 2
+        if arg.startswith("-c") and len(arg) > 2:
+            return arg[2:], None, idx + 1
+        if arg == "-m" or not arg.startswith("-"):
+            return None, None, idx
+        idx += 1
+    return None, None, idx
+
+
+def _module_candidates(
+    mod: str,
+    *,
+    include_init: bool = True,
+    include_src_prefix: bool = True,
+) -> list[str]:
+    parts = [p for p in mod.split(".") if p]
+    if not parts or parts[0] in sys.stdlib_module_names:
+        return []
+    joined = "/".join(parts)
+    out = [f"{joined}.py", f"{joined}/"]
+    if include_init:
+        out.append(f"{joined}/__init__.py")
+    if include_src_prefix and parts[0] != "src":
+        src_joined = f"src/{joined}"
+        out.extend([f"{src_joined}.py", f"{src_joined}/"])
+        if include_init:
+            out.append(f"{src_joined}/__init__.py")
+    return out
+
+
+def _imported_module_paths(tree: ast.AST) -> list[tuple[str, list[str], bool]]:
+    """Extract `(display_module, candidate_paths, is_package_from)` for non-stdlib imports."""
+    refs: list[tuple[str, list[str], bool]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                cands = _module_candidates(alias.name, include_src_prefix=True)
+                if cands:
+                    refs.append((alias.name, cands, False))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            cands = _module_candidates(node.module, include_src_prefix=True)
+            if cands:
+                refs.append((node.module, cands, True))
+            if node.module.split(".", 1)[0] not in sys.stdlib_module_names:
+                for alias in node.names:
+                    if alias.name != "*":
+                        sub = f"{node.module}.{alias.name}"
+                        sub_cands = _module_candidates(
+                            sub, include_init=False, include_src_prefix=True
+                        )
+                        if sub_cands:
+                            refs.append((sub, sub_cands, False))
+    return refs
+
+
+def _scopes_share_package(pkg_dir: str, visible_scopes: Sequence[str]) -> bool:
+    norm_pkg = pkg_dir.rstrip("/") + "/"
+    return any(
+        s.startswith(norm_pkg) or norm_pkg.startswith(s.rstrip("/") + "/")
+        for s in visible_scopes
+        if s
+    )
+
+
+def _check_inline_python_imports(
+    *,
+    task: TaskNode,
+    check_id: str,
+    tree: ast.AST,
+    visible_scopes: list[str],
+    non_ancestors: Sequence[TaskNode],
+) -> list[str]:
+    violations: list[str] = []
+    for mod_name, cands, is_pkg_from in _imported_module_paths(tree):
+        filtered = [
+            c
+            for c in cands
+            if not (
+                is_pkg_from
+                and c.endswith("/__init__.py")
+                and _scopes_share_package(c[: -len("/__init__.py")], visible_scopes)
+            )
+        ]
+        if not filtered or scopes_overlap(filtered, visible_scopes):
+            continue
+        direct_cands = [
+            c for c in filtered if mod_name.startswith("src.") or not c.startswith("src/")
+        ]
+        src_implicit_cands = [
+            c for c in filtered if not mod_name.startswith("src.") and c.startswith("src/")
+        ]
+        for other in non_ancestors:
+            if not other.write_scope:
+                continue
+            matched = bool(direct_cands and scopes_overlap(direct_cands, other.write_scope))
+            if not matched and src_implicit_cands:
+                # Only match implicit `src/<mod>` imports against concrete subpaths under `src/`,
+                # avoiding false positives on third-party packages when a sibling owns bare `src/`.
+                deep_scopes = [
+                    s for s in other.write_scope if len(PurePosixPath(s).parts) >= 2
+                ]
+                matched = bool(deep_scopes and scopes_overlap(src_implicit_cands, deep_scopes))
+            if matched:
+                violations.append(
+                    f"Task {task.task_id} check {check_id} imports '{mod_name}' owned by "
+                    f"non-ancestor task {other.task_id}; add {other.task_id} to "
+                    f"{task.task_id}.depends_on or test cross-module wiring downstream."
+                )
+                break
+    return violations
+
+
+def _check_segment_file_refs(
+    *,
+    task: TaskNode,
+    check_id: str,
+    args: Sequence[str],
+    visible_scopes: list[str],
+    non_ancestors: Sequence[TaskNode],
+) -> list[str]:
+    violations: list[str] = []
+    for tok in args:
+        if tok.startswith("-") or tok.startswith("/"):
+            continue
+        file_part = tok.split("::", 1)[0]
+        if not file_part.endswith(".py"):
+            continue
+        with contextlib.suppress(ValueError):
+            norm_file = normalize_scope_path(file_part)
+            if scopes_overlap([norm_file], visible_scopes):
+                continue
+            for other in non_ancestors:
+                if other.write_scope and scopes_overlap([norm_file], other.write_scope):
+                    violations.append(
+                        f"Task {task.task_id} check {check_id} references '{file_part}' owned "
+                        f"by non-ancestor task {other.task_id}; add {other.task_id} to "
+                        "depends_on or move downstream."
+                    )
+                    break
+    return violations
+
+
+def _validate_single_command_check(
+    *,
+    task: TaskNode,
+    check_id: str,
+    command: str,
+    visible_scopes: list[str],
+    non_ancestors: Sequence[TaskNode],
+) -> list[str]:
+    segments, shell_err = _split_shell_segments(command)
+    if shell_err is not None:
+        return [f"Task {task.task_id} check {check_id} has {shell_err}."]
+
+    violations: list[str] = []
+    for seg in segments:
+        code, py_err, arg_start = _extract_segment_python_inline(seg)
+        if py_err is not None:
+            violations.append(f"Task {task.task_id} check {check_id}: {py_err}.")
+            continue
+        if code is not None:
+            try:
+                tree = ast.parse(code)
+            except SyntaxError as exc:
+                violations.append(
+                    f"Task {task.task_id} check {check_id} has invalid Python syntax "
+                    f"in '-c' script ({exc.msg}); avoid semicolon-separated compound blocks "
+                    "like '; try: ...; except ...'—use newlines or pytest."
+                )
+                continue
+            violations.extend(
+                _check_inline_python_imports(
+                    task=task,
+                    check_id=check_id,
+                    tree=tree,
+                    visible_scopes=visible_scopes,
+                    non_ancestors=non_ancestors,
+                )
+            )
+            continue
+        if non_ancestors:
+            violations.extend(
+                _check_segment_file_refs(
+                    task=task,
+                    check_id=check_id,
+                    args=seg[arg_start:],
+                    visible_scopes=visible_scopes,
+                    non_ancestors=non_ancestors,
+                )
+            )
+    return violations
+
+
+def _validate_command_syntax_and_deps(
+    tasks: Sequence[TaskNode],
+    ancestors: dict[str, set[str]] | None,
+) -> list[str]:
+    """Validate check shell syntax, `python -c` AST syntax, and sibling scope isolation."""
+    violations: list[str] = []
+    by_id = {t.task_id: t for t in tasks}
+
+    for task in tasks:
+        non_ancestors: list[TaskNode] = []
+        visible_scopes = list(task.write_scope)
+        if ancestors is not None:
+            anc_ids = ancestors.get(task.task_id, set())
+            for anc_id in anc_ids:
+                if anc_id in by_id:
+                    visible_scopes.extend(by_id[anc_id].write_scope)
+            non_ancestors = [
+                other
+                for other in tasks
+                if other.task_id != task.task_id and other.task_id not in anc_ids
+            ]
+
+        for check in task.acceptance_checks:
+            if check.kind != CheckKind.COMMAND or not check.command:
+                continue
+            violations.extend(
+                _validate_single_command_check(
+                    task=task,
+                    check_id=check.id,
+                    command=check.command,
+                    visible_scopes=visible_scopes,
+                    non_ancestors=non_ancestors,
+                )
+            )
+    return violations
+
+
 def validate_plan(
     plan: TaskPlan,
     spec: GoalSpec | None = None,
@@ -543,6 +831,7 @@ def validate_plan(
                     )
 
     # Independent sibling tasks must have disjoint write_scopes
+    ancestors: dict[str, set[str]] | None = None
     if visited == len(by_id):
         ancestors = _build_ancestors(plan.tasks)
         tasks_list = list(by_id.values())
@@ -562,6 +851,8 @@ def validate_plan(
                         f"Concurrent-eligible tasks {ta.task_id} and {tb.task_id} "
                         f"have overlapping write_scope: {pairs}"
                     )
+
+    violations.extend(_validate_command_syntax_and_deps(plan.tasks, ancestors))
 
     return violations
 

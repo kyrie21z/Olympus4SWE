@@ -61,7 +61,9 @@ Rules:
    kind='independent_review' instead.
 5. Acceptance check commands execute with cwd ALREADY set to an isolated sandbox copy of the repo.
    NEVER use 'cd <host_path>' or hardcoded host workspace paths inside check commands; use
-   repo-relative paths only.
+   repo-relative paths only. When writing inline 'python -c "..."' commands, NEVER chain
+   '; try:', '; except:', '; for ', '; if ', or '; def ' on a single line (Python raises
+   SyntaxError)—use real '\\n' newlines, simple expressions/asserts, or 'python -m pytest ...'.
 6. Honor all GoalSpec constraints and resolved open_ambiguities answers in task objectives/checks.
 7. Output ONLY a single JSON object matching TaskPlan (no $comment, $schema, or extra keys)."""
 
@@ -317,8 +319,10 @@ Modular product decomposition (topology={topology}):
   (kind='integrate', role='engineer') when more than one module exists.
 - Every design module id MUST appear in at least one task's design_refs; never invent ids.
 - Tasks in different modules MUST NOT share overlapping write_scope.
-- Command acceptance_checks MUST only reference test/file paths inside the task's own
-  write_scope or already-accepted upstream tasks, and MUST NOT silence failures with 2>/dev/null.
+- Command acceptance_checks MUST only reference modules or test paths inside the task's own
+  write_scope or its transitive depends_on ancestors (NEVER import a concurrent sibling task's
+  modules in a task check; put cross-module integration checks in a Wave 2 task that depends_on
+  all needed Wave 1 tasks), and MUST NOT silence failures with 2>/dev/null.
 """
 
 
@@ -466,7 +470,7 @@ class OrchestrateStage:
         plan: TaskPlan | None = None
         last_violations: list[str] = []
         prompt = base_prompt
-        for attempt in range(2):
+        for attempt in range(3):
             candidate = run_structured_loop(
                 loop=loop,
                 system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
@@ -483,7 +487,7 @@ class OrchestrateStage:
                 plan = candidate
                 break
             last_violations = violations
-            if attempt == 0:
+            if attempt < 2:
                 prompt = (
                     f"{base_prompt}\n\n"
                     f"[PLAN VALIDATION FAILED]\n"

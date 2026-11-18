@@ -436,3 +436,50 @@ def test_design_spec_v2_readonly_contract_hook_and_serial_handoff(tmp_path: Path
         e for e in store.list_events(run_id) if e.event_type == "run.status_changed"
     ]
     assert any(e.payload.get("serial_execution") is True for e in events)
+
+
+def test_propose_plan_repairs_broken_inline_python_check_via_validation_loop(
+    tmp_path: Path,
+) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    snap = store.get_run(run_id)
+    spec = snap["spec"]
+    assert spec is not None
+
+    bad_check = {
+        "id": "CHK-BAD",
+        "kind": CheckKind.COMMAND.value,
+        "description": "Frozen check",
+        "command": 'python -c "import feature; try: x = 1; except Exception: pass"',
+    }
+    good_check = {
+        "id": "CHK-GOOD",
+        "kind": CheckKind.COMMAND.value,
+        "description": "Frozen check",
+        "command": "python -m pytest -q",
+    }
+    calls: list[str] = []
+
+    def _repair_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        calls.append(messages[-1].content)
+        payload = _plan_payload(
+            spec_id=spec.spec_id,
+            spec_hash=spec.content_hash,
+            file_name="feature.py",
+            checks=[bad_check if len(calls) == 1 else good_check],
+        )
+        return LLMResponse(content=json.dumps(payload))
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_repair_responder),
+        workspace_root=tmp_path,
+    )
+    plan = orch.propose_plan(run_id=run_id)
+    assert len(calls) == 2
+    assert "[PLAN VALIDATION FAILED]" in calls[1]
+    assert "invalid Python syntax" in calls[1]
+    assert plan.tasks[0].acceptance_checks[0].command == "python -m pytest -q"

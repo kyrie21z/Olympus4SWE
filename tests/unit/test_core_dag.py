@@ -214,3 +214,133 @@ def test_validate_plan_rejects_hardcoded_host_workspace_path_in_command_check() 
         }
     )
     assert validate_plan(good_plan, spec=spec, workspace_root="/tmp/host_repo") == []
+
+
+def test_validate_plan_rejects_broken_inline_python_syntax_and_accepts_multiline() -> None:
+    spec = _spec()
+    bad_try_cmd = (
+        'python -c "from src.api.cfg import Config; c = Config(); '
+        "try: c.limit = 99; assert False; except AttributeError: pass\""
+    )
+    bad_plan = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1",
+                title="Contract",
+                objective="Verify config immutability",
+                requirement_refs=["R1", "R2"],
+                write_scope=["src/api/cfg.py"],
+                acceptance_checks=[
+                    _check("C-try", bad_try_cmd),
+                    _check("C-quote", 'python -c "unclosed'),
+                ],
+            )
+        ],
+    )
+    violations = validate_plan(bad_plan, spec=spec)
+    assert any("C-try" in v and "invalid Python syntax" in v for v in violations)
+    assert any("C-quote" in v and "invalid shell syntax" in v for v in violations)
+
+    good_multiline_cmd = (
+        'python -c "\nfrom src.api.cfg import Config\nc = Config()\n'
+        'try:\n    c.limit = 99\n    assert False\nexcept AttributeError:\n    pass\n"'
+    )
+    good_plan = bad_plan.model_copy(
+        update={
+            "tasks": [
+                bad_plan.tasks[0].model_copy(
+                    update={
+                        "acceptance_checks": [
+                            _check("C-multi", good_multiline_cmd),
+                            _check("C-pytest", "python -m pytest -c pyproject.toml -q"),
+                        ]
+                    }
+                )
+            ]
+        }
+    )
+    assert validate_plan(good_plan, spec=spec) == []
+
+
+def test_validate_plan_rejects_non_ancestor_sibling_import_and_accepts_dependency() -> None:
+    spec = _spec()
+    mw_cmd = (
+        "python -c 'from src.api.limiter import FixedWindowLimiter; "
+        "from src.api import server; assert FixedWindowLimiter'"
+    )
+    parallel_bad = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1-limiter",
+                title="Limiter",
+                objective="Limiter core",
+                requirement_refs=["R1"],
+                write_scope=["src/api/limiter.py"],
+                acceptance_checks=[_check("CL", "python -c 'import src.api.limiter'")],
+            ),
+            TaskNode(
+                task_id="T1-middleware",
+                title="Middleware",
+                objective="Rate limit middleware",
+                requirement_refs=["R2"],
+                depends_on=[],
+                write_scope=["src/api/middleware.py"],
+                acceptance_checks=[_check("CM", mw_cmd)],
+            ),
+            TaskNode(
+                task_id="T2-integrate",
+                title="Export",
+                objective="Export package symbol",
+                requirement_refs=["R2"],
+                depends_on=["T1-limiter", "T1-middleware"],
+                write_scope=["src/api/__init__.py"],
+                acceptance_checks=[_check("CI", "pytest -q")],
+            ),
+        ],
+    )
+    violations = validate_plan(parallel_bad, spec=spec)
+    assert len(violations) == 1
+    assert "T1-middleware" in violations[0]
+    assert "T1-limiter" in violations[0]
+
+    ordered_ok = parallel_bad.model_copy(
+        update={
+            "tasks": [
+                parallel_bad.tasks[0],
+                parallel_bad.tasks[1].model_copy(update={"depends_on": ["T1-limiter"]}),
+                parallel_bad.tasks[2],
+            ]
+        }
+    )
+    assert validate_plan(ordered_ok, spec=spec) == []
+
+    # Stdlib / third-party imports must never false-positive even when a sibling owns `src/`.
+    stdlib_plan = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1-src",
+                title="Core",
+                objective="Core src",
+                requirement_refs=["R1"],
+                write_scope=["src/"],
+                acceptance_checks=[_check("C1", "python -c 'pass'")],
+            ),
+            TaskNode(
+                task_id="T2-docs",
+                title="Docs",
+                objective="Verify docs with pathlib and pytest",
+                requirement_refs=["R2"],
+                write_scope=["docs/"],
+                acceptance_checks=[
+                    _check("C2", "python -c 'import pathlib, pytest; assert pathlib.Path'")
+                ],
+            ),
+        ],
+    )
+    assert validate_plan(stdlib_plan, spec=spec) == []

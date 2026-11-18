@@ -11,6 +11,9 @@ import httpx
 from olympus.core.contracts import (
     AcceptanceCheck,
     AmbiguityItem,
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalTarget,
     CheckKind,
     DataEntity,
     DeliverableKind,
@@ -1023,3 +1026,120 @@ def test_clarify_settles_gate_sync_and_409_returns_projection(tmp_path: Path) ->
         httpd.shutdown()
         httpd.server_close()
         app.supervisor.shutdown()
+
+
+def test_completed_blueprint_projection_and_task_diagnostics(tmp_path: Path) -> None:
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+    run_id = _seed_gated_run(store)
+
+    # Approve every gate and finish product_blueprint with historical gate.paused events.
+    snap = store.get_run(run_id)
+    assert snap["spec"] is not None
+    assert snap["design"] is not None
+    assert snap["plan"] is not None
+    for event_type, payload in (
+        ("graph.paused", {"node": "gate_spec", "reason": "human_gate"}),
+        ("graph.paused", {"node": "gate_design", "reason": "human_gate"}),
+        ("graph.paused", {"node": "gate_plan", "reason": "human_gate"}),
+        ("graph.finished", {"graph": "product_blueprint", "steps": 1}),
+    ):
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type=event_type,
+            actor="supervisor",
+            payload=payload,
+        )
+
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.GOAL_SPEC,
+            target_id=snap["spec"].spec_id,
+            target_hash=snap["spec"].content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=snap["design"].design_id,
+            target_hash=snap["design"].content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    # Reset tasks to initial WAITING state and include a dependent downstream task.
+    root_waiting = snap["plan"].tasks[0].model_copy(update={"status": TaskStatus.WAITING})
+    dep_waiting = TaskNode(
+        task_id="T02",
+        title="对外接口接入",
+        objective="在 API 层接入递补状态查询",
+        requirement_refs=["FR-100"],
+        design_refs=["MOD-API"],
+        depends_on=["T01"],
+        write_scope=["src/waitlist/api.py"],
+        acceptance_checks=[
+            AcceptanceCheck(
+                id="T02-C1",
+                kind=CheckKind.COMMAND,
+                description="pytest 验证接口查询",
+                command="pytest -q",
+            )
+        ],
+        role="backend",
+        kind=TaskKind.IMPLEMENT,
+        deliverables=["src/waitlist/api.py"],
+        status=TaskStatus.WAITING,
+    )
+    updated_plan = snap["plan"].model_copy(update={"tasks": [root_waiting, dep_waiting]})
+    store.save_plan(run_id, updated_plan, actor="orchestrate")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=updated_plan.plan_id,
+            target_hash=updated_plan.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    store.set_run_status(run_id, RunStatus.COMPLETED, actor="supervisor", stage="graph")
+
+    proj = build_run_projection(store, tmp_path, run_id)
+    assert proj["blueprint_completed"] is True
+    assert proj["workflow"]["paused"] is None
+    assert proj["workflow"]["node_statuses"]["gate_spec"] == "completed"
+    assert proj["workflow"]["node_statuses"]["gate_design"] == "completed"
+    assert proj["workflow"]["node_statuses"]["gate_plan"] == "completed"
+    assert [step["status"] for step in proj["stage_pipeline"]] == [
+        "done",
+        "done",
+        "done",
+        "skipped",
+        "skipped",
+    ]
+    assert proj["hitl_banner"] is not None
+    assert proj["hitl_banner"]["kind"] == "blueprint_completed"
+    assert proj["hitl_banner"]["actions"] == ["promote_to_execute"]
+    for node in proj["dag"]["nodes"]:
+        assert node["diagnostic_output"] == "已冻结（未启动代码执行）"
+        assert "等待前置产物解锁" not in node["diagnostic_attribution"]
+
+    # During active execution (full_sdlc_tdd), only tasks with unmet dependencies wait on upstream.
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="supervisor", stage="graph")
+    with store._tx() as conn:
+        conn.execute(
+            "UPDATE runs SET workflow_name = 'full_sdlc_tdd' WHERE run_id = ?",
+            (run_id,),
+        )
+    exec_proj = build_run_projection(store, tmp_path, run_id)
+    assert exec_proj["blueprint_completed"] is False
+    by_task = {n["task_id"]: n for n in exec_proj["dag"]["nodes"]}
+    root_task = next(n for n in by_task.values() if not n["depends_on"])
+    dep_task = next(n for n in by_task.values() if n["depends_on"])
+    assert root_task["diagnostic_output"] == "就绪待调度"
+    assert "等待前置产物解锁" in dep_task["diagnostic_attribution"]

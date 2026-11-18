@@ -502,6 +502,11 @@ button {
   color: var(--bad);
 }
 
+.stage-step[data-status="skipped"] {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
 .stage-step-arrow {
   font-family: var(--face-mono);
   font-size: var(--text-xs);
@@ -589,6 +594,11 @@ button {
 .hitl-banner[data-tone="info"] {
   border-color: var(--live);
   background: var(--live-soft);
+}
+
+.hitl-banner[data-tone="ok"] {
+  border-color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .hitl-headline {
@@ -908,6 +918,12 @@ button {
 .dag-node[data-status="paused"] .dag-node-box {
   fill: var(--warn-soft);
   stroke: var(--warn);
+}
+
+.dag-node[data-status="planned"] .dag-node-box {
+  fill: var(--surface-paper);
+  stroke: var(--ok);
+  stroke-dasharray: 4 3;
 }
 
 .dag-node[data-risk="true"] .dag-node-box {

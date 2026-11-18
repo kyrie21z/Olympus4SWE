@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from olympus.core.contracts import ApprovalDecision, ApprovalRecord, ApprovalTarget, TaskPlan
 from olympus.core.store import RunStore
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.web.server import AriadneApp, create_http_server
@@ -475,3 +476,175 @@ def test_supervisor_restart_recovery_and_env_file_provider_detection(tmp_path: P
         assert res["projection"]["design"] is not None
     finally:
         sup2.shutdown()
+
+
+def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+
+    def _exec_responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        system = messages[0].content
+        if "Execution Engineer (Hephaestus)" in system:
+            return LLMResponse(content="Implemented task changes cleanly.")
+        if "Independent Verifier (Argus)" in system:
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T0",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "All checks verified.",
+                        "findings": [],
+                    }
+                )
+            )
+        return _responder(messages, tools)
+
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(responder=_exec_responder),
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    httpd = create_http_server(app, host="127.0.0.1", port=0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with httpx.Client(base_url=base_url, timeout=60.0) as client:
+            created = client.post(
+                "/api/runs",
+                json={
+                    "title": "Blueprint Promote Flow",
+                    "raw_input": (
+                        "Build an inventory REST API so operators can create and read items"
+                    ),
+                    "workflow_name": "product_blueprint",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            ).json()
+            run_id = created["run_id"]
+            assert 'id="btn-promote-execute"' in client.get("/").text
+            client.post(
+                f"/api/runs/{run_id}/command", json={"action": "approve_spec", "sync": True}
+            )
+            client.post(
+                f"/api/runs/{run_id}/command", json={"action": "approve_design", "sync": True}
+            )
+            plan_res = client.post(
+                f"/api/runs/{run_id}/command", json={"action": "approve_plan", "sync": True}
+            ).json()["projection"]
+            assert plan_res["status"] == "completed"
+            assert plan_res["blueprint_completed"] is True
+            assert [s["status"] for s in plan_res["stage_pipeline"]] == [
+                "done",
+                "done",
+                "done",
+                "skipped",
+                "skipped",
+            ]
+            assert plan_res["hitl_banner"]["kind"] == "blueprint_completed"
+
+            # Promote completed blueprint directly into full_sdlc_tdd sandbox execution.
+            promoted = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "operation_id": "op-promote-1",
+                    "action": "promote_to_execute",
+                    "workflow_name": "full_sdlc_tdd",
+                    "expected_state_revision": plan_res["state_revision"],
+                    "sync": True,
+                },
+            )
+            assert promoted.status_code == 200, promoted.text
+            exec_proj = promoted.json()["projection"]
+            assert exec_proj["workflow_name"] == "full_sdlc_tdd"
+            assert exec_proj["status"] == "completed"
+            assert exec_proj["budget"]["max_calls"] >= 100
+            assert [s["status"] for s in exec_proj["stage_pipeline"]] == ["done"] * 5
+            assert all(n["status"] == "accepted" for n in exec_proj["dag"]["nodes"])
+
+            # Verify a failing execution preserves AWAITING_HUMAN instead of COMPLETED.
+            failing_plan_dict = json.loads(json.dumps(TASK_PLAN))
+            failing_plan_dict["tasks"] = [
+                {
+                    **failing_plan_dict["tasks"][0],
+                    "max_cycles": 1,
+                    "acceptance_checks": [
+                        {
+                            "id": "T0-fail",
+                            "kind": "command",
+                            "description": "always fail",
+                            "command": "python -c 'raise SystemExit(1)'",
+                        }
+                    ],
+                }
+            ]
+            failing_store_run = store.create_run(
+                title="Blocked Exec Preserve",
+                workflow_name="full_sdlc_tdd",
+                provider_config={"provider": "mock"},
+            )
+            snap_done = store.get_run(run_id)
+            assert snap_done["spec"] is not None
+            assert snap_done["design"] is not None
+
+            store.save_spec(failing_store_run, snap_done["spec"], actor="align")
+            store.record_approval(
+                ApprovalRecord(
+                    run_id=failing_store_run,
+                    target=ApprovalTarget.GOAL_SPEC,
+                    target_id=snap_done["spec"].spec_id,
+                    target_hash=snap_done["spec"].content_hash,
+                    approver="zeus",
+                    decision=ApprovalDecision.APPROVED,
+                )
+            )
+            store.save_design(failing_store_run, snap_done["design"], actor="design")
+            store.record_approval(
+                ApprovalRecord(
+                    run_id=failing_store_run,
+                    target=ApprovalTarget.DESIGN_SPEC,
+                    target_id=snap_done["design"].design_id,
+                    target_hash=snap_done["design"].content_hash,
+                    approver="zeus",
+                    decision=ApprovalDecision.APPROVED,
+                )
+            )
+            fail_plan = TaskPlan.model_validate(
+                {
+                    **failing_plan_dict,
+                    "spec_hash": snap_done["spec"].content_hash,
+                    "design_id": snap_done["design"].design_id,
+                    "design_hash": snap_done["design"].content_hash,
+                }
+            )
+            store.save_plan(failing_store_run, fail_plan, actor="orchestrate")
+            store.record_approval(
+                ApprovalRecord(
+                    run_id=failing_store_run,
+                    target=ApprovalTarget.TASK_PLAN,
+                    target_id=fail_plan.plan_id,
+                    target_hash=fail_plan.content_hash,
+                    approver="zeus",
+                    decision=ApprovalDecision.APPROVED,
+                )
+            )
+            store.append_event(
+                run_id=failing_store_run,
+                stage="graph",
+                event_type="graph.node_finished",
+                actor="supervisor",
+                payload={"node": "gate_plan"},
+            )
+            blocked_res = supervisor.resume_run(failing_store_run, sync=True)
+            assert blocked_res["status"] == "awaiting_human"
+            blocked_proj = app.get_run_payload(failing_store_run)["projection"]
+            assert blocked_proj["status"] == "awaiting_human"
+            assert blocked_proj["hitl_banner"]["kind"] == "task_blocked"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        supervisor.shutdown()

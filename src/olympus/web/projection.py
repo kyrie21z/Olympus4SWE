@@ -267,7 +267,13 @@ def _build_subagent_stream(task: TaskNode, art: dict[str, Any]) -> list[dict[str
     return _synthesize_tool_stream(task)
 
 
-def _build_terminal_lines(task: TaskNode, art: dict[str, Any]) -> list[str]:
+def _build_terminal_lines(
+    task: TaskNode,
+    art: dict[str, Any],
+    *,
+    blueprint_completed: bool = False,
+    unmet_deps: list[str] | None = None,
+) -> list[str]:
     """Up to four clean lines for the dock's mini terminal."""
     for log_text in (art.get("check_logs") or {}).values():
         lines = _tail_lines(str(log_text))
@@ -285,7 +291,15 @@ def _build_terminal_lines(task: TaskNode, art: dict[str, Any]) -> list[str]:
         return [f"$ {command}", "执行中，等待命令门禁输出…"]
     if task.accepted_risk_reason:
         return ["⚠ 未验证 · 人工接受风险放行", task.accepted_risk_reason]
-    return ["◷ 等待前置产物解锁"]
+    if task.status == TaskStatus.READY:
+        return ["◷ 任务已就绪，等待调度器认领"]
+    if task.status == TaskStatus.WAITING:
+        if blueprint_completed:
+            return ["✓ 已冻结于 TaskPlan", "当前工作流止步于计划阶段，未启动代码执行"]
+        if unmet_deps:
+            return [f"◷ 等待前置产物解锁：{', '.join(unmet_deps)}"]
+        return ["◷ 无前置依赖阻塞，等待调度器认领"]
+    return ["◷ 等待执行"]
 
 
 def _receipt_events(
@@ -388,12 +402,22 @@ def _build_stage_pipeline(
     spec_approved: bool,
     plan_approved: bool,
     design_approved: bool = False,
+    *,
+    stop_after: str | None = None,
 ) -> list[dict[str, str]]:
     spec: GoalSpec | None = snap["spec"]
     design: DesignSpec | None = snap.get("design")
     plan: TaskPlan | None = snap["plan"]
     status: RunStatus = snap["status"]
     tasks = plan.tasks if plan else []
+    workflow_stop = stop_after
+    if workflow_stop is None:
+        try:
+            workflow_stop = load_workflow(
+                str(snap.get("workflow_name") or "product_blueprint")
+            ).stop_after
+        except Exception:  # noqa: BLE001 - fallback for legacy/unknown workflows
+            workflow_stop = "execute"
 
     align_state = (
         "done"
@@ -423,6 +447,18 @@ def _build_stage_pipeline(
     if all_accepted and status == RunStatus.COMPLETED:
         exec_state = "done"
         verify_state = "done"
+    elif status == RunStatus.COMPLETED and workflow_stop == "plan" and plan_approved:
+        exec_state = "skipped"
+        verify_state = "skipped"
+    elif status == RunStatus.COMPLETED and workflow_stop == "design" and design_approved:
+        plan_state = "skipped"
+        exec_state = "skipped"
+        verify_state = "skipped"
+    elif status == RunStatus.COMPLETED and workflow_stop == "goal" and spec_approved:
+        design_state = "skipped"
+        plan_state = "skipped"
+        exec_state = "skipped"
+        verify_state = "skipped"
     elif plan_approved:
         exec_state = "blocked" if any_blocked else "active"
         verify_state = (
@@ -826,6 +862,10 @@ def _build_workflow_view(
     workflow_name: str,
     events: list[RunEvent],
     run_status: RunStatus,
+    *,
+    spec_approved: bool = False,
+    design_approved: bool = False,
+    plan_approved: bool = False,
 ) -> dict[str, Any]:
     """Describe the run's workflow topology plus live per-node statuses from graph.* events."""
     topology: str | None = None
@@ -851,6 +891,7 @@ def _build_workflow_view(
         payload = event.payload
         node = payload.get("node")
         if event.event_type == "graph.node_started" and isinstance(node, str):
+            paused = None
             failed_node = None
             last_error = None
             current_node = node
@@ -869,6 +910,7 @@ def _build_workflow_view(
                 statuses[node] = "paused"
         elif event.event_type == "graph.finished":
             current_node = None
+            paused = None
             finished = True
         elif event.event_type == "graph.node_error" and isinstance(node, str) and node in statuses:
             statuses[node] = "error"
@@ -881,6 +923,20 @@ def _build_workflow_view(
             if failed_node and failed_node in statuses:
                 statuses[failed_node] = "failed"
             current_node = None
+
+    # Reconcile gates that were approved before resuming directly downstream.
+    if spec_approved and statuses.get("gate_spec") == "paused":
+        statuses["gate_spec"] = "completed"
+    if design_approved and statuses.get("gate_design") == "paused":
+        statuses["gate_design"] = "completed"
+    if plan_approved and statuses.get("gate_plan") == "paused":
+        statuses["gate_plan"] = "completed"
+
+    if run_status == RunStatus.COMPLETED:
+        paused = None
+        for gate_name in ("gate_spec", "gate_design", "gate_plan"):
+            if statuses.get(gate_name) == "paused":
+                statuses[gate_name] = "completed"
 
     if run_status == RunStatus.FAILED:
         for name, st in list(statuses.items()):
@@ -967,6 +1023,26 @@ def build_run_projection(
             receipt_by_task.setdefault(recorded_task, payload)
         receipt_by_actor.setdefault(ev.actor, payload)
 
+    workflow_name = str(snap.get("workflow_name") or "product_blueprint")
+    workflow_view = _build_workflow_view(
+        workflow_name,
+        events,
+        snap["status"],
+        spec_approved=spec_approved,
+        design_approved=design_approved,
+        plan_approved=plan_approved,
+    )
+    all_terminal = bool(tasks) and all(
+        t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for t in tasks
+    )
+    blueprint_completed = bool(
+        plan is not None
+        and plan_approved
+        and snap["status"] == RunStatus.COMPLETED
+        and (workflow_view.get("stop_after") or "execute") != "execute"
+        and not all_terminal
+    )
+
     dag_nodes: list[dict[str, Any]] = []
     dag_edges: list[dict[str, Any]] = []
     for order, t in enumerate(tasks):
@@ -974,6 +1050,11 @@ def build_run_projection(
         stream = _build_subagent_stream(t, art)
         receipt = receipt_by_task.get(t.task_id) or _build_receipt(t, stream, art, order=order)
         manifest_md = str(art.get("manifest_md") or "") or _synthesize_manifest_md(t, art, receipt)
+        unmet_deps = [
+            dep
+            for dep in t.depends_on
+            if not (task_by_id.get(dep) and task_by_id[dep].status == TaskStatus.ACCEPTED)
+        ]
         # Extract structured diagnostic fields if present in last_error or events
         diag_tool = ""
         diag_output = ""
@@ -988,6 +1069,34 @@ def build_run_projection(
                 diag_attribution = "；".join(parts[1:])
         if not diag_attribution and t.accepted_risk_reason:
             diag_attribution = f"未验证 · 人工接受：{t.accepted_risk_reason}"
+
+        if not diag_output:
+            if t.status == TaskStatus.ACCEPTED:
+                diag_output = "全部检查通过"
+            elif blueprint_completed and t.status == TaskStatus.WAITING:
+                diag_output = "已冻结（未启动代码执行）"
+            elif t.status == TaskStatus.READY or (
+                t.status == TaskStatus.WAITING and not unmet_deps
+            ):
+                diag_output = "就绪待调度"
+            else:
+                diag_output = "等待执行"
+
+        if not diag_attribution:
+            if t.status == TaskStatus.ACCEPTED:
+                diag_attribution = "Argus 冷启动独立复核通过"
+            elif blueprint_completed and t.status == TaskStatus.WAITING:
+                diag_attribution = (
+                    f"{workflow_name} 止步于计划阶段，可点击上方「转入沙盒执行」开始写代码"
+                )
+            elif t.status == TaskStatus.READY or (
+                t.status == TaskStatus.WAITING and not unmet_deps
+            ):
+                diag_attribution = "无阻塞前置依赖，等待调度器认领执行"
+            elif unmet_deps:
+                diag_attribution = f"等待前置产物解锁（{', '.join(unmet_deps)}）"
+            else:
+                diag_attribution = "等待前置产物解锁"
 
         dag_nodes.append(
             {
@@ -1014,17 +1123,16 @@ def build_run_projection(
                 if t.task_id.endswith(("1", "2", "3"))
                 else "Hephaestus-2",
                 "diagnostic_tool": diag_tool or "pytest -q",
-                "diagnostic_output": diag_output
-                or ("全部检查通过" if t.status == TaskStatus.ACCEPTED else "等待执行"),
-                "diagnostic_attribution": diag_attribution
-                or (
-                    "Argus 冷启动独立复核通过"
-                    if t.status == TaskStatus.ACCEPTED
-                    else "等待前置产物解锁"
-                ),
+                "diagnostic_output": diag_output,
+                "diagnostic_attribution": diag_attribution,
                 "acceptance_checks": [c.model_dump(mode="json") for c in t.acceptance_checks],
                 "subagent_stream": stream,
-                "terminal_lines": _build_terminal_lines(t, art),
+                "terminal_lines": _build_terminal_lines(
+                    t,
+                    art,
+                    blueprint_completed=blueprint_completed,
+                    unmet_deps=unmet_deps,
+                ),
                 "receipt": receipt,
                 "manifest_md": manifest_md,
                 "artifacts": art,
@@ -1043,9 +1151,6 @@ def build_run_projection(
                     "blocked_edge": blocked_edge,
                 }
             )
-
-    workflow_name = str(snap.get("workflow_name") or "product_blueprint")
-    workflow_view = _build_workflow_view(workflow_name, events, snap["status"])
 
     blocked_tasks = [t for t in tasks if t.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     hitl_banner: dict[str, Any] | None = None
@@ -1119,6 +1224,19 @@ def build_run_projection(
             "detail": "点击右上角「恢复运行」继续调度就绪任务",
             "actions": ["resume"],
         }
+    elif blueprint_completed:
+        hitl_banner = {
+            "kind": "blueprint_completed",
+            "tone": "ok",
+            "task_id": None,
+            "headline": f"产品蓝图已冻结完成：共 {len(tasks)} 个模块任务（止步于计划阶段）",
+            "detail": (
+                f"工作流 {workflow_name} 不含代码执行阶段；"
+                "如需按此蓝图在隔离 git worktree 沙盒中编写代码并独立验收，"
+                "可一键转入 full_sdlc_tdd。"
+            ),
+            "actions": ["promote_to_execute"],
+        }
 
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
     ledger: BudgetLedger = snap["budget_ledger"]
@@ -1135,6 +1253,7 @@ def build_run_projection(
         "design.approved",
         "plan.generated",
         "plan.approved",
+        "run.workflow_promoted",
         "graph.failed",
     }
     for event in events:
@@ -1172,13 +1291,18 @@ def build_run_projection(
         "updated_at": snap["updated_at"],
         "workflow_name": workflow_name,
         "workflow": workflow_view,
+        "blueprint_completed": blueprint_completed,
         "triage": triage_payload,
         "stage_activity": stage_activity[-12:],
         "spec_approved": spec_approved,
         "design_approved": design_approved,
         "plan_approved": plan_approved,
         "stage_pipeline": _build_stage_pipeline(
-            snap, spec_approved, plan_approved, design_approved
+            snap,
+            spec_approved,
+            plan_approved,
+            design_approved,
+            stop_after=workflow_view.get("stop_after"),
         ),
         "budget": {
             "calls_used": ledger.llm_calls_used,

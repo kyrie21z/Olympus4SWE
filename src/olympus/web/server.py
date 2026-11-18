@@ -12,12 +12,16 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from olympus.core.contracts import (
+    ApprovalTarget,
+    BudgetLedger,
+    BudgetPolicy,
     RunStatus,
     TaskNode,
     TaskStatus,
     new_id,
 )
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
+from olympus.graph.loader import load_workflow
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
@@ -321,13 +325,103 @@ class AriadneApp:
             cmd_result = self.supervisor.resume_run(
                 run_id, sync=bool(body.get("sync", False))
             )
+        elif action == "promote_to_execute":
+            target_workflow = str(body.get("workflow_name") or "full_sdlc_tdd").strip()
+            target_def = load_workflow(target_workflow)
+            if target_def.stop_after != "execute" or target_def.node("execute") is None:
+                raise ValueError(
+                    f"Target workflow '{target_workflow}' must support stop_after='execute'"
+                )
+            cur_def = load_workflow(snap["workflow_name"])
+            if cur_def.stop_after == "execute" and snap["status"] == RunStatus.COMPLETED:
+                raise ValueError(f"Run {run_id} already completed execution")
+            if snap["status"] in (
+                RunStatus.RUNNING,
+                RunStatus.ALIGNING,
+                RunStatus.DESIGNING,
+                RunStatus.PLANNING,
+            ):
+                raise ValueError(f"Run {run_id} is currently active ({snap['status'].value})")
+            plan = snap["plan"]
+            if plan is None:
+                raise ValueError(f"Run {run_id} has no TaskPlan to execute")
+            if not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.TASK_PLAN,
+                target_id=plan.plan_id,
+                target_hash=plan.content_hash,
+            ):
+                raise ValueError(f"TaskPlan {plan.plan_id} must be approved before execution")
+            spec = snap["spec"]
+            if spec is None:
+                raise ValueError(f"Run {run_id} has no GoalSpec required for execution")
+            if not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            ):
+                raise ValueError(f"GoalSpec {spec.spec_id} must be approved before execution")
+
+            policy: BudgetPolicy = snap["budget_policy"]
+            ledger: BudgetLedger = snap["budget_ledger"]
+            min_calls = ledger.llm_calls_used + max(60, len(plan.tasks) * 25)
+            new_max_calls = max(policy.max_llm_calls, min_calls)
+            if body.get("max_llm_calls") is not None:
+                new_max_calls = max(new_max_calls, int(body["max_llm_calls"]))
+            min_tokens = ledger.total_tokens + max(500_000, len(plan.tasks) * 250_000)
+            updated_policy = policy.model_copy(
+                update={
+                    "max_llm_calls": new_max_calls,
+                    "max_total_tokens": max(policy.max_total_tokens, min_tokens),
+                }
+            )
+            auto_adv = bool(body.get("auto_advance", True))
+            target_status = RunStatus.RUNNING if auto_adv else RunStatus.AWAITING_HUMAN
+
+            def _promote_tx(conn: Any, cur_rev: int) -> dict[str, Any]:
+                new_rev = self.store.promote_workflow_in_tx(
+                    conn,
+                    run_id=run_id,
+                    cur_rev=cur_rev,
+                    workflow_name=target_workflow,
+                    status=target_status,
+                    budget_policy=updated_policy,
+                    actor=actor,
+                    payload={
+                        "from_workflow": snap["workflow_name"],
+                        "to_workflow": target_workflow,
+                        "budget_max_calls": updated_policy.max_llm_calls,
+                        "budget_max_tokens": updated_policy.max_total_tokens,
+                    },
+                )
+                return {
+                    "run_id": run_id,
+                    "from_workflow": snap["workflow_name"],
+                    "workflow": target_workflow,
+                    "status": target_status.value,
+                    "budget_max_calls": updated_policy.max_llm_calls,
+                    "state_revision": new_rev,
+                }
+
+            cmd_result = self.store.apply_idempotent_command(
+                operation_id=operation_id,
+                run_id=run_id,
+                actor=actor,
+                action="promote_to_execute",
+                expected_state_revision=expected_rev,
+                payload={"workflow_name": target_workflow},
+                handler=_promote_tx,
+            )
         else:
             raise ValueError(f"Unsupported HITL action: {action}")
 
         if (
-            action in ("clarify", "approve_spec", "approve_design", "approve_plan")
+            action
+            in ("clarify", "approve_spec", "approve_design", "approve_plan", "promote_to_execute")
             and bool(body.get("auto_advance", True))
-            and self.supervisor.is_supervised(run_id)
+            and not cmd_result.get("deduplicated")
+            and (action == "promote_to_execute" or self.supervisor.is_supervised(run_id))
         ):
             cmd_result = {
                 **cmd_result,

@@ -88,6 +88,7 @@
     approveSpec: document.getElementById("btn-approve-spec"),
     approveDesign: document.getElementById("btn-approve-design"),
     approvePlan: document.getElementById("btn-approve-plan"),
+    promoteExecute: document.getElementById("btn-promote-execute"),
     retryWorkflow: document.getElementById("btn-retry-workflow"),
     inspectFailure: document.getElementById("btn-inspect-failure"),
     intentCard: document.getElementById("intent-card"),
@@ -107,6 +108,21 @@
     product_blueprint: "产品蓝图",
     full_sdlc_tdd: "全流程 TDD",
     repo_fast_patch: "快速补丁",
+  };
+
+  const WORKFLOW_SELECT_LABELS = {
+    product_blueprint: "product_blueprint · 产品蓝图（仅规划，不写代码）",
+    full_sdlc_tdd: "full_sdlc_tdd · 全流程研发（含沙盒写代码 + 验收）",
+    repo_fast_patch: "repo_fast_patch · 快速补丁（跳过架构直改代码）",
+  };
+
+  const WORKFLOW_SUMMARY = {
+    product_blueprint:
+      "需求对齐 → 白盒架构 → Wave 0/1/2 任务拆解后结束；含 3 道人工关口，不写仓库代码。",
+    full_sdlc_tdd:
+      "需求对齐 → 白盒架构 → 任务拆解 → 隔离沙盒并发写代码与冷启动验收；含 3 道人工关口。",
+    repo_fast_patch:
+      "跳过白盒架构，基于 GoalSpec 拆解后直接改代码并验收；人工关口全自动放行。",
   };
 
   const NODE_LABELS = {
@@ -132,6 +148,7 @@
     "design.approved": "已批准并冻结 DesignSpec",
     "plan.generated": "已生成 TaskPlan 任务依赖图",
     "plan.approved": "已批准任务计划",
+    "run.workflow_promoted": "已升级为全流程执行（full_sdlc_tdd）",
   };
 
   function localizeTriageReason(text) {
@@ -219,9 +236,18 @@
         return { label: "就绪", variant: "muted", glyph: "◷" };
       case "cancelled":
         return { label: "已取消", variant: "muted", glyph: "◷" };
+      case "planned":
+        return { label: "蓝图已定稿", variant: "muted", glyph: "✓" };
       default:
         return { label: "等待", variant: "muted", glyph: "◷" };
     }
+  }
+
+  function taskDisplayStatus(task, projection) {
+    if (projection && projection.blueprint_completed && task && task.status === "waiting") {
+      return "planned";
+    }
+    return (task && task.status) || "waiting";
   }
 
   function setTheme(theme) {
@@ -273,7 +299,9 @@
               ? "▶"
               : stage.status === "blocked"
                 ? "✕"
-                : "◷";
+                : stage.status === "skipped"
+                  ? "—"
+                  : "◷";
         const arrow =
           index < all.length - 1 ? '<span class="stage-step-arrow">→</span>' : "";
         return `<span class="stage-step" data-status="${esc(stage.status)}">${glyph} ${esc(
@@ -313,14 +341,16 @@
     const specGate = Boolean(projection.spec && !projection.spec_approved);
     const designGate = Boolean(projection.design && !projection.design_approved);
     const planGate = Boolean(projection.plan && !projection.plan_approved);
+    const promoteGate = Boolean(banner && banner.kind === "blueprint_completed");
     const runFailed = Boolean(banner && banner.kind === "run_failed");
     el.approveSpec.hidden = !specGate;
     el.approveDesign.hidden = !designGate;
     el.approvePlan.hidden = !planGate;
+    if (el.promoteExecute) el.promoteExecute.hidden = !promoteGate;
     el.retryWorkflow.hidden = !runFailed;
     el.inspectFailure.hidden = !runFailed;
-    el.gateActions.hidden = !(specGate || designGate || planGate || runFailed);
-    return specGate || designGate || planGate || runFailed;
+    el.gateActions.hidden = !(specGate || designGate || planGate || promoteGate || runFailed);
+    return specGate || designGate || planGate || promoteGate || runFailed;
   }
 
   function renderBanner(projection) {
@@ -334,7 +364,8 @@
     el.banner.hidden = false;
     el.banner.dataset.tone = banner ? banner.tone || "danger" : "warn";
     const tone = el.banner.dataset.tone;
-    const glyph = tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
+    const glyph =
+      tone === "ok" ? "✓" : tone === "warn" ? "⚠" : tone === "info" ? "◷" : "✕";
     const headline = banner
       ? banner.headline
       : "关口待批准：当前产物已冻结，等待真人确认后继续推进";
@@ -925,11 +956,12 @@
       .map((node) => {
         const pos = coords.get(node.task_id);
         if (!pos) return "";
-        const meta = statusMeta(node.status, node.accepted_risk_reason);
+        const displayStatus = taskDisplayStatus(node, projection);
+        const meta = statusMeta(displayStatus, node.accepted_risk_reason);
         const selected = node.task_id === state.selectedTaskId ? "true" : "false";
         const centerX = pos.x + nodeWidth / 2;
         return `<g class="dag-node" data-task-id="${esc(node.task_id)}" data-status="${esc(
-          node.status
+          displayStatus
         )}" data-risk="${node.accepted_risk_reason ? "true" : "false"}" aria-selected="${selected}" tabindex="0" role="button" aria-label="任务 ${esc(
           node.task_id
         )} ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
@@ -956,11 +988,12 @@
           lane.actor
         )}</span><div class="lane-items">${(lane.items || [])
           .map((item) => {
-            const meta = statusMeta(item.status, null);
+            const displayStatus = taskDisplayStatus(item, projection);
+            const meta = statusMeta(displayStatus, null);
             const pressed = item.task_id && item.task_id === state.selectedTaskId ? "true" : "false";
             return `<button type="button" class="lane-chip" data-task-id="${esc(
               item.task_id || ""
-            )}" data-status="${esc(item.status)}" aria-pressed="${pressed}">${meta.glyph} ${esc(
+            )}" data-status="${esc(displayStatus)}" aria-pressed="${pressed}">${meta.glyph} ${esc(
               item.label
             )}</button>`;
           })
@@ -1234,7 +1267,7 @@
     }
 
     state.selectedTaskId = task.task_id;
-    const meta = statusMeta(task.status, task.accepted_risk_reason);
+    const meta = statusMeta(taskDisplayStatus(task, projection), task.accepted_risk_reason);
     el.dockTitle.textContent = `${task.task_id} · ${task.title}`;
     el.dockStages.innerHTML = [
       uiBadge(`${meta.glyph} ${meta.label}`, meta.variant),
@@ -1333,11 +1366,13 @@
     const selected = state.workflows.find(
       (workflow) => workflow.name === el.newRunWorkflow.value
     );
-    el.newRunWorkflowMeta.textContent = selected
-      ? `${selected.description || "无描述"} · topology: ${selected.topology || "-"} · stop_after: ${
-          selected.stop_after || "-"
-        }`
-      : "";
+    if (!selected) {
+      el.newRunWorkflowMeta.textContent = "";
+      return;
+    }
+    const summary = WORKFLOW_SUMMARY[selected.name] || selected.description || "无描述";
+    const runsCode = selected.stop_after === "execute" ? "是（沙盒执行 + 验收）" : `否（止步于 ${selected.stop_after || "plan"}）`;
+    el.newRunWorkflowMeta.textContent = `${summary} · 编写代码：${runsCode}`;
   }
 
   async function loadNewRunOptions() {
@@ -1354,8 +1389,9 @@
     el.newRunWorkflow.innerHTML = state.workflows
       .map(
         (workflow) =>
-          `<option value="${esc(workflow.name)}">${esc(workflow.name)} · ${esc(
-            workflow.topology || "topology"
+          `<option value="${esc(workflow.name)}">${esc(
+            WORKFLOW_SELECT_LABELS[workflow.name] ||
+              `${workflow.name} · ${workflow.topology || "topology"}`
           )}</option>`
       )
       .join("");
@@ -1752,6 +1788,15 @@
         stopAfter === "plan" ? "已批准任务计划，蓝图编排已完成" : "已批准任务计划，开始执行"
       );
     });
+
+    if (el.promoteExecute) {
+      el.promoteExecute.addEventListener("click", async () => {
+        await sendCommand(
+          { action: "promote_to_execute", workflow_name: "full_sdlc_tdd" },
+          "已升级为 full_sdlc_tdd，启动沙盒代码执行"
+        );
+      });
+    }
 
     el.retryWorkflow.addEventListener("click", async () => {
       await sendCommand({ action: "retry_workflow" }, "已从断点重新启动工作流");

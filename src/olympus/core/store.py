@@ -225,6 +225,47 @@ class RunStore:
             state_revision=state_revision,
         )
 
+    def promote_workflow_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        cur_rev: int,
+        workflow_name: str,
+        status: RunStatus,
+        budget_policy: BudgetPolicy,
+        actor: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Promote a run's bound workflow and budget policy inside a transaction."""
+        new_rev = cur_rev + 1
+        conn.execute(
+            """
+            UPDATE runs
+            SET workflow_name = ?, status = ?, budget_policy_json = ?,
+                state_revision = ?, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                workflow_name,
+                status.value,
+                budget_policy.model_dump_json(),
+                new_rev,
+                utc_now().isoformat(),
+                run_id,
+            ),
+        )
+        self.append_event_in_tx(
+            conn,
+            run_id=run_id,
+            stage="graph",
+            event_type="run.workflow_promoted",
+            actor=actor,
+            payload=payload,
+            state_revision=new_rev,
+        )
+        return new_rev
+
     def update_plan_in_tx(
         self,
         conn: sqlite3.Connection,

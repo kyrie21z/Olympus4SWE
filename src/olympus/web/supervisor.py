@@ -290,10 +290,17 @@ class RunSupervisor:
                             "pause_reason": result.get("_pause_reason"),
                         },
                     )
-            elif latest["status"] not in (
-                RunStatus.PAUSED,
-                RunStatus.CANCELLED,
-                RunStatus.COMPLETED,
+            elif (
+                not (
+                    latest["status"] == RunStatus.AWAITING_HUMAN
+                    and isinstance(result.get("execution"), dict)
+                )
+                and latest["status"]
+                not in (
+                    RunStatus.PAUSED,
+                    RunStatus.CANCELLED,
+                    RunStatus.COMPLETED,
+                )
             ):
                 self.store.set_run_status(
                     run_id,

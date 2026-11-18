@@ -16,6 +16,7 @@
     pendingAction: null,
     optionsLoaded: false,
     workflows: [],
+    clarifySig: "",
     sse: null,
   };
 
@@ -278,11 +279,19 @@
   function renderClarify(projection) {
     const pending = pendingAmbiguities(projection);
     if (!pending.length) {
+      state.clarifySig = "";
       el.clarifyPanel.hidden = true;
       el.clarifyItems.innerHTML = "";
       return;
     }
+    const sig = `${projection.run_id}:${pending
+      .map((amb) => `${amb.id}:${amb.question || ""}`)
+      .join("|")}`;
     el.clarifyPanel.hidden = false;
+    if (state.clarifySig === sig && el.clarifyItems.children.length > 0) {
+      return;
+    }
+    state.clarifySig = sig;
     el.clarifyItems.innerHTML = pending
       .map((amb) => {
         const chips = (amb.options || [])
@@ -1164,6 +1173,7 @@
     state.runId = runId;
     const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
     const data = await response.json();
+    if (state.runId !== runId) return;
     if (!data.ok) {
       toast(data.error || "加载运行实例失败");
       return;
@@ -1183,10 +1193,20 @@
     );
     source.addEventListener("state", async (event) => {
       try {
+        if (state.runId !== runId) return;
         const payload = JSON.parse(event.data);
-        if (state.projection && payload.state_revision !== state.projection.state_revision) {
+        const hasNewEvents =
+          Array.isArray(payload.events) &&
+          payload.events.some(
+            (ev) => (ev.event_seq || 0) > ((state.projection && state.projection.latest_event_seq) || 0)
+          );
+        if (
+          state.projection &&
+          (payload.state_revision !== state.projection.state_revision || hasNewEvents)
+        ) {
           const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
           const data = await response.json();
+          if (state.runId !== runId) return;
           if (data.ok) renderAll(data.projection);
         }
       } catch (error) {
@@ -1367,6 +1387,7 @@
         toast("请先回答至少一个澄清问题");
         return;
       }
+      state.clarifySig = "";
       await sendCommand(
         { action: "clarify", answers },
         "已提交澄清并生成新的 GoalSpec 版本"

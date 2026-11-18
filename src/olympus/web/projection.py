@@ -390,18 +390,29 @@ def _build_stage_pipeline(
     design_approved: bool = False,
 ) -> list[dict[str, str]]:
     spec: GoalSpec | None = snap["spec"]
+    design: DesignSpec | None = snap.get("design")
     plan: TaskPlan | None = snap["plan"]
     status: RunStatus = snap["status"]
     tasks = plan.tasks if plan else []
 
-    align_state = "done" if spec_approved else ("active" if spec is not None else "pending")
+    align_state = (
+        "done"
+        if spec_approved or (spec is None and design is not None)
+        else ("active" if spec is not None else "pending")
+    )
     design_state = (
         "done"
         if design_approved or plan_approved
-        else ("active" if spec_approved else "pending")
+        else ("active" if design is not None or spec_approved else "pending")
     )
     plan_state = (
-        "done" if plan_approved else ("active" if plan is not None and spec_approved else "pending")
+        "done"
+        if plan_approved
+        else (
+            "active"
+            if plan is not None and (spec_approved or design_approved)
+            else "pending"
+        )
     )
 
     all_accepted = bool(tasks) and all(
@@ -501,16 +512,44 @@ def _build_traceability_matrix(
     design: DesignSpec | None = None,
 ) -> list[dict[str, Any]]:
     """Build Requirement x DesignModule x Task x Verification Status rows."""
-    if spec is None:
+    if spec is None and design is None:
         return []
 
+    if spec is not None:
+        req_entries = [
+            (
+                req.id,
+                req.description,
+                req.source_ref or "REQ-Baseline",
+                req.acceptance_criteria,
+            )
+            for req in spec.requirements
+        ]
+    else:
+        assert design is not None
+        seen_reqs: list[str] = []
+        for module in design.modules:
+            for ref in module.requirement_refs:
+                if ref not in seen_reqs:
+                    seen_reqs.append(ref)
+        req_entries = [
+            (
+                req_id,
+                "直接输入 DesignSpec 关联模块："
+                + ", ".join(m.name for m in design.modules if req_id in m.requirement_refs),
+                "DesignSpec-Direct",
+                [],
+            )
+            for req_id in seen_reqs
+        ]
+
     rows: list[dict[str, Any]] = []
-    for req in spec.requirements:
-        covering = [t for t in tasks if req.id in t.requirement_refs]
+    for req_id, req_desc, req_source_ref, req_criteria in req_entries:
+        covering = [t for t in tasks if req_id in t.requirement_refs]
         design_modules = [
             {"id": module.id, "name": module.name}
             for module in (design.modules if design is not None else [])
-            if req.id in module.requirement_refs
+            if req_id in module.requirement_refs
         ]
         if not covering:
             v_status = "pending"
@@ -544,10 +583,10 @@ def _build_traceability_matrix(
 
         rows.append(
             {
-                "requirement_id": req.id,
-                "description": req.description,
-                "source_ref": req.source_ref or "REQ-Baseline",
-                "acceptance_criteria": req.acceptance_criteria,
+                "requirement_id": req_id,
+                "description": req_desc,
+                "source_ref": req_source_ref,
+                "acceptance_criteria": req_criteria,
                 "design_module_ids": [module["id"] for module in design_modules],
                 "design_modules": design_modules,
                 "task_ids": [t.task_id for t in covering],

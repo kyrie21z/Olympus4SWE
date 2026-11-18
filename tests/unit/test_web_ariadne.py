@@ -24,6 +24,8 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.providers.types import MockLLMProvider
+from olympus.stages.design import DesignStage
 from olympus.web.projection import build_run_projection, seed_demo_runs
 from olympus.web.server import AriadneApp, create_http_server
 
@@ -617,3 +619,127 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=2.0)
+
+
+def test_direct_design_spec_projection_pipeline_and_matrix(tmp_path: Path) -> None:
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(
+        title="直接上传 DesignSpec 投影测试",
+        workflow_name="product_blueprint",
+        provider_config={"provider": "mock"},
+    )
+    design = DesignSpec(
+        design_id="design-direct-1",
+        architecture_summary="核心域与 API 域隔离，直接由设计规格进入分解。",
+        modules=[
+            DesignModule(
+                id="MOD-CORE",
+                name="领域核心",
+                responsibility="核心规则与数据持久化",
+                requirement_refs=["REQ-1"],
+                target_paths=["src/core/domain.py"],
+            ),
+            DesignModule(
+                id="MOD-API",
+                name="HTTP 接口",
+                responsibility="对外暴露查询与命令端点",
+                requirement_refs=["REQ-1", "REQ-2"],
+                target_paths=["src/api/routes.py"],
+            ),
+        ],
+        data_models=[
+            DataEntity(
+                name="Record",
+                fields=["id", "status"],
+                owner_module_id="MOD-CORE",
+            )
+        ],
+        interfaces=[
+            InterfaceContract(
+                id="IF-DIRECT-1",
+                provider_module_id="MOD-CORE",
+                consumer_module_ids=["MOD-API"],
+                protocol="fn",
+                signature="get_record(record_id: str) -> Record",
+                error_cases=["RecordNotFound"],
+            )
+        ],
+    )
+    store.save_design(run_id, design, actor="design")
+    DesignStage(store, MockLLMProvider(), tmp_path).approve_design(
+        run_id=run_id,
+        approver="zeus",
+        reason="direct design approved",
+    )
+    snap = store.get_run(run_id)
+    confirmed_design = snap["design"]
+    assert confirmed_design is not None
+
+    plan = TaskPlan(
+        plan_id="plan-direct-1",
+        design_id=confirmed_design.design_id,
+        design_hash=confirmed_design.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T01",
+                title="实现核心领域服务",
+                objective="落地领域规则与存储",
+                requirement_refs=["REQ-1"],
+                write_scope=["src/core/domain.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="T01-C1",
+                        kind=CheckKind.COMMAND,
+                        description="core tests",
+                        command="pytest -q",
+                    )
+                ],
+                design_refs=["MOD-CORE"],
+                role="backend",
+                kind=TaskKind.IMPLEMENT,
+                deliverables=["src/core/domain.py"],
+                status=TaskStatus.READY,
+            ),
+            TaskNode(
+                task_id="T02",
+                title="实现 HTTP 路由",
+                objective="对接核心领域并暴露端点",
+                requirement_refs=["REQ-2"],
+                write_scope=["src/api/routes.py"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="T02-C1",
+                        kind=CheckKind.COMMAND,
+                        description="api tests",
+                        command="pytest -q",
+                    )
+                ],
+                design_refs=["MOD-API"],
+                role="backend",
+                kind=TaskKind.IMPLEMENT,
+                deliverables=["src/api/routes.py"],
+                status=TaskStatus.READY,
+            ),
+        ],
+    )
+    store.save_plan(run_id, plan, actor="orchestrate")
+
+    proj = build_run_projection(store, tmp_path, run_id)
+    assert proj["spec"] is None
+    assert proj["design_approved"] is True
+    assert [s["status"] for s in proj["stage_pipeline"]] == [
+        "done",
+        "done",
+        "active",
+        "pending",
+        "pending",
+    ]
+    assert proj["hitl_banner"] is not None
+    assert proj["hitl_banner"]["kind"] == "plan_gate"
+    assert [r["requirement_id"] for r in proj["traceability_matrix"]] == ["REQ-1", "REQ-2"]
+    assert proj["traceability_matrix"][0]["source_ref"] == "DesignSpec-Direct"
+    assert proj["traceability_matrix"][0]["design_module_ids"] == ["MOD-CORE", "MOD-API"]
+    assert proj["traceability_matrix"][0]["task_ids"] == ["T01"]
+    assert proj["traceability_matrix"][1]["design_module_ids"] == ["MOD-API"]
+    assert proj["traceability_matrix"][1]["task_ids"] == ["T02"]

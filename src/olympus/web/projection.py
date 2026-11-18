@@ -33,6 +33,7 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.graph import build_graph, load_workflow
 from olympus.harness.receipt import build_turn_receipt
 
 # Log rules such as "===== test session starts =====" or "____ test_x ____" carry no signal.
@@ -768,6 +769,65 @@ def _build_waterfall_turns(
     return turns
 
 
+def _build_workflow_view(
+    workflow_name: str,
+    events: list[RunEvent],
+    run_status: RunStatus,
+) -> dict[str, Any]:
+    """Describe the run's workflow topology plus live per-node statuses from graph.* events."""
+    topology: str | None = None
+    stop_after: str | None = None
+    description: dict[str, Any] | None = None
+    node_names: list[str] = []
+    try:
+        definition = load_workflow(workflow_name)
+        description = build_graph(definition).describe()
+        topology = definition.topology
+        stop_after = definition.stop_after
+        node_names = [str(n["name"]) for n in description.get("nodes", [])]
+    except Exception:  # noqa: BLE001 - a legacy/unknown workflow must not break the console
+        description = None
+
+    statuses: dict[str, str] = {name: "pending" for name in node_names}
+    current_node: str | None = None
+    paused: dict[str, Any] | None = None
+    finished = False
+    for event in events:
+        payload = event.payload
+        node = payload.get("node")
+        if event.event_type == "graph.node_started" and isinstance(node, str):
+            current_node = node
+            if node in statuses:
+                statuses[node] = "running"
+        elif event.event_type == "graph.node_finished" and isinstance(node, str):
+            if node in statuses:
+                statuses[node] = "completed"
+        elif event.event_type == "graph.paused":
+            paused = {
+                "node": node,
+                "reason": payload.get("reason"),
+            }
+            current_node = None
+            if isinstance(node, str) and node in statuses:
+                statuses[node] = "paused"
+        elif event.event_type == "graph.finished":
+            current_node = None
+            finished = True
+        elif event.event_type == "graph.node_error" and isinstance(node, str) and node in statuses:
+            statuses[node] = "error"
+
+    return {
+        "name": workflow_name,
+        "topology": topology,
+        "stop_after": stop_after,
+        "graph": description,
+        "nodes": [{"name": name, "status": status} for name, status in statuses.items()],
+        "current_node": current_node,
+        "paused": paused,
+        "finished": finished or run_status == RunStatus.COMPLETED,
+    }
+
+
 def build_run_projection(
     store: RunStore,
     workspace_root: Path,
@@ -779,6 +839,7 @@ def build_run_projection(
     snap = store.get_run(run_id)
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
+    design = snap.get("design")
     events = store.list_events(run_id, after_seq=0)
     run_dir = (
         artifacts_root
@@ -802,6 +863,15 @@ def build_run_projection(
             target=ApprovalTarget.TASK_PLAN,
             target_id=plan.plan_id,
             target_hash=plan.content_hash,
+        )
+    )
+    design_approved = bool(
+        design
+        and store.is_approved(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
         )
     )
 
@@ -854,6 +924,10 @@ def build_run_projection(
                 "review_cycle": t.review_cycle,
                 "max_cycles": t.max_cycles,
                 "requirement_refs": t.requirement_refs,
+                "design_refs": t.design_refs,
+                "role": t.role,
+                "kind": t.kind.value,
+                "deliverables": t.deliverables,
                 "depends_on": t.depends_on,
                 "write_scope": t.write_scope,
                 "read_scope": t.read_scope,
@@ -927,7 +1001,9 @@ def build_run_projection(
             "headline": (
                 f"关口 2 待批准：任务计划 {plan.plan_id}（共 {len(tasks)} 个任务）等待批准开工"
             ),
-            "detail": f"绑定需求指纹：{plan.spec_hash[:16]}…",
+            "detail": (
+                f"绑定需求指纹：{(plan.spec_hash or plan.design_hash or '')[:16]}…"
+            ),
             "actions": ["approve_plan"],
         }
     elif snap["status"] == RunStatus.PAUSED:
@@ -943,6 +1019,10 @@ def build_run_projection(
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
     ledger: BudgetLedger = snap["budget_ledger"]
     policy: BudgetPolicy = snap["budget_policy"]
+    triage_payload: dict[str, Any] | None = None
+    for event in events:
+        if event.event_type == "intake.triaged":
+            triage_payload = dict(event.payload)
 
     return {
         "run_id": snap["run_id"],
@@ -952,7 +1032,15 @@ def build_run_projection(
         "state_revision": snap["state_revision"],
         "created_at": snap["created_at"],
         "updated_at": snap["updated_at"],
+        "workflow_name": snap.get("workflow_name", "product_blueprint"),
+        "workflow": _build_workflow_view(
+            str(snap.get("workflow_name") or "product_blueprint"),
+            events,
+            snap["status"],
+        ),
+        "triage": triage_payload,
         "spec_approved": spec_approved,
+        "design_approved": design_approved,
         "plan_approved": plan_approved,
         "stage_pipeline": _build_stage_pipeline(snap, spec_approved, plan_approved),
         "budget": {
@@ -972,6 +1060,7 @@ def build_run_projection(
         },
         "hitl_banner": hitl_banner,
         "spec": spec.model_dump(mode="json") if spec else None,
+        "design": design.model_dump(mode="json") if design else None,
         "plan": plan.model_dump(mode="json") if plan else None,
         "dag": {
             "nodes": dag_nodes,

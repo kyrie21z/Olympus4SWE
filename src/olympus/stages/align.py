@@ -19,6 +19,7 @@ from olympus.core.contracts import (
     SpecStatus,
     StrictModel,
 )
+from olympus.core.dag import validate_goal_spec
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.providers.base import LLMProvider
@@ -98,8 +99,14 @@ class AlignStage:
         constraints: list[str] | None = None,
         enable_critique: bool = False,
         max_steps: int = 10,
+        strict_canonical: bool = False,
     ) -> GoalSpec:
-        """Probe repo context, draft GoalSpec, and optionally run cold-start critique."""
+        """Probe repo context, draft GoalSpec, and optionally run cold-start critique.
+
+        ``strict_canonical`` opts into the 5-element + EARS contract: the draft is checked
+        with the zero-token gate and repaired once when it fails without blocking
+        ambiguities. The default stays ``False`` for full backward compatibility.
+        """
         self.store.set_run_status(run_id, RunStatus.ALIGNING, actor="align", stage="align")
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
@@ -113,11 +120,24 @@ class AlignStage:
         )
         inventory = format_workspace_inventory(toolkit)
         schema_json = json.dumps(GoalSpec.model_json_schema(), ensure_ascii=False)
+        strict_block = (
+            "\nCanonical contract (required):\n"
+            "- deliverable_kind: one of web_app/rest_api/cli/library/desktop/multi_surface\n"
+            "- observable_surfaces: the externally visible surfaces that can be exercised\n"
+            "- actors: every human/system actor that triggers behavior\n"
+            "- every requirement sets actor plus ears_criteria with pattern="
+            "ubiquitous|event_driven|state_driven|unwanted_behavior|optional_feature\n"
+            "- acceptance_criteria stay plain strings and must carry measurable thresholds\n"
+            "- never leak internal implementation (CREATE TABLE, ALTER TABLE, src/*.py paths)\n"
+            if strict_canonical
+            else ""
+        )
         user_prompt = (
             f"Workspace root: {self.workspace_root}\n"
             f"{inventory}\n"
             f"Raw user goal:\n{raw_goal}\n\n"
-            f"Explicit constraints: {json.dumps(constraints or [], ensure_ascii=False)}\n\n"
+            f"Explicit constraints: {json.dumps(constraints or [], ensure_ascii=False)}\n"
+            f"{strict_block}\n"
             f"Return GoalSpec JSON matching schema:\n{schema_json}"
         )
         draft = run_structured_loop(
@@ -126,6 +146,31 @@ class AlignStage:
             user_prompt=user_prompt,
             model_cls=GoalSpec,
         )
+
+        if strict_canonical and not draft.unresolved_blockers():
+            violations = validate_goal_spec(draft)
+            if violations:
+                repair_prompt = (
+                    f"{user_prompt}\n\n"
+                    "[GOALSPEC VALIDATION FAILED]\n"
+                    f"Violations: {'; '.join(violations)}\n"
+                    "Apply the canonical contract and return a corrected GoalSpec JSON object."
+                )
+                draft = run_structured_loop(
+                    loop=loop,
+                    system_prompt=_ALIGN_SYSTEM_PROMPT,
+                    user_prompt=repair_prompt,
+                    model_cls=GoalSpec,
+                )
+                remaining = validate_goal_spec(draft)
+                if remaining:
+                    self.store.append_event(
+                        run_id=run_id,
+                        stage="align",
+                        event_type="spec.validation_failed",
+                        actor="align",
+                        payload={"violations": remaining},
+                    )
 
         notes: list[CritiqueNote] = list(draft.minority_notes)
         if enable_critique:
@@ -149,6 +194,19 @@ class AlignStage:
             },
         )
         return spec
+
+    def critique_spec(self, *, run_id: str) -> GoalSpec:
+        """Run the parallel cold-start critique and persist the merged notes."""
+        snap = self.store.get_run(run_id)
+        spec: GoalSpec | None = snap["spec"]
+        if spec is None:
+            raise ValueError(f"Run {run_id} has no GoalSpec to critique")
+        notes = [*spec.minority_notes, *self._run_parallel_critique(run_id=run_id, spec=spec)]
+        updated = spec.model_copy(
+            update={"minority_notes": notes, "status": SpecStatus.AWAITING_HUMAN}
+        )
+        self.store.save_spec(run_id, updated, actor="align")
+        return updated
 
     def _run_parallel_critique(self, *, run_id: str, spec: GoalSpec) -> list[CritiqueNote]:
         """Run isolated cold-start read-only critique perspectives in parallel."""

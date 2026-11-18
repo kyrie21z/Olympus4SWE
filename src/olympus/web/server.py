@@ -17,10 +17,11 @@ from olympus.core.contracts import (
     new_id,
 )
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
-from olympus.providers.base import MockLLMProvider
 from olympus.stages.align import AlignStage
+from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection, seed_demo_runs
+from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -42,6 +43,7 @@ class AriadneApp:
         store: RunStore,
         workspace_root: Path | str,
         artifacts_root: Path | None = None,
+        supervisor: RunSupervisor | None = None,
     ) -> None:
         self.store = store
         self.workspace_root = Path(workspace_root).resolve()
@@ -49,6 +51,15 @@ class AriadneApp:
             artifacts_root
             if artifacts_root is not None
             else self.workspace_root / ".olympus" / "runs"
+        )
+        self.supervisor = (
+            supervisor
+            if supervisor is not None
+            else RunSupervisor(
+                store=self.store,
+                workspace_root=self.workspace_root,
+                artifacts_root=self.artifacts_root,
+            )
         )
 
     def list_runs_payload(self, *, limit: int = 50) -> dict[str, Any]:
@@ -138,7 +149,7 @@ class AriadneApp:
                 )
             align = AlignStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 trace_dir=self.artifacts_root,
             )
@@ -154,6 +165,24 @@ class AriadneApp:
                 "spec_hash": spec.content_hash,
                 "status": spec.status.value,
             }
+        elif action == "approve_design":
+            if snap["state_revision"] != expected_rev:
+                raise ConcurrencyConflictError(
+                    f"State revision mismatch: expected {expected_rev}, "
+                    f"got {snap['state_revision']}"
+                )
+            design_stage = DesignStage(
+                self.store,
+                self.supervisor.resolve_provider(run_id),
+                self.workspace_root,
+                artifacts_root=self.artifacts_root,
+            )
+            record = design_stage.approve_design(
+                run_id=run_id,
+                approver=actor,
+                reason=str(body.get("reason", "")),
+            )
+            cmd_result = record.model_dump(mode="json")
         elif action == "approve_plan":
             if snap["state_revision"] != expected_rev:
                 raise ConcurrencyConflictError(
@@ -162,7 +191,7 @@ class AriadneApp:
                 )
             orch = OrchestrateStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 artifacts_root=self.artifacts_root,
             )
@@ -180,7 +209,7 @@ class AriadneApp:
                 )
             align = AlignStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 trace_dir=self.artifacts_root,
             )
@@ -202,7 +231,7 @@ class AriadneApp:
             hint = str(body.get("hint", "")).strip()
             orch = OrchestrateStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 artifacts_root=self.artifacts_root,
             )
@@ -223,7 +252,7 @@ class AriadneApp:
                 raise ValueError("accept_risk requires a non-empty 'reason'")
             orch = OrchestrateStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 artifacts_root=self.artifacts_root,
             )
@@ -245,7 +274,7 @@ class AriadneApp:
                 raise ValueError("reassign_human requires non-empty 'task_id'")
             orch = OrchestrateStage(
                 store=self.store,
-                provider=MockLLMProvider(),
+                provider=self.supervisor.resolve_provider(run_id),
                 workspace_root=self.workspace_root,
                 artifacts_root=self.artifacts_root,
             )
@@ -276,6 +305,18 @@ class AriadneApp:
             )
         else:
             raise ValueError(f"Unsupported HITL action: {action}")
+
+        if (
+            action in ("clarify", "approve_spec", "approve_design", "approve_plan")
+            and bool(body.get("auto_advance", True))
+            and self.supervisor.is_supervised(run_id)
+        ):
+            cmd_result = {
+                **cmd_result,
+                "workflow": self.supervisor.resume_run(
+                    run_id, sync=bool(body.get("sync", False))
+                ),
+            }
 
         projection = build_run_projection(
             self.store,
@@ -384,6 +425,20 @@ def create_http_server(
                     self._send_json(HTTPStatus.OK, app.list_runs_payload(limit=limit))
                     return
 
+                if path == "/api/providers":
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"ok": True, "providers": app.supervisor.list_providers_status()},
+                    )
+                    return
+
+                if path == "/api/workflows":
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"ok": True, "workflows": app.supervisor.list_workflows()},
+                    )
+                    return
+
                 if path.startswith("/api/runs/"):
                     parts = [p for p in path.split("/") if p]
                     # parts: ['api', 'runs', '<run_id>', ...]
@@ -479,6 +534,28 @@ def create_http_server(
                     return
 
                 parts = [p for p in path.split("/") if p]
+                if len(parts) == 2 and parts[0] == "api" and parts[1] == "runs":
+                    raw_input = str(body.get("raw_input") or body.get("goal") or "").strip()
+                    if not raw_input:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "ok": False,
+                                "error": "POST /api/runs requires a non-empty 'raw_input'",
+                            },
+                        )
+                        return
+                    started = app.supervisor.start_run(
+                        title=str(body.get("title") or raw_input[:60]),
+                        raw_input=raw_input,
+                        workflow_name=str(body.get("workflow_name") or "product_blueprint"),
+                        provider_config=dict(body.get("provider_config") or {}),
+                        auto_approve=bool(body.get("auto_approve", False)),
+                        sync=bool(body.get("sync", False)),
+                    )
+                    self._send_json(HTTPStatus.OK, {"ok": True, **started})
+                    return
+
                 if (
                     len(parts) == 4
                     and parts[0] == "api"
@@ -496,6 +573,8 @@ def create_http_server(
                 )
             except NotFoundError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+            except FileNotFoundError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             except ConcurrencyConflictError as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
             except ValueError as exc:

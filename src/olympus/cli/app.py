@@ -12,6 +12,7 @@ from olympus.core.contracts import RunMode, new_id
 from olympus.core.store import NotFoundError, RunStore
 from olympus.providers.factory import build_provider
 from olympus.stages.align import AlignStage
+from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
 
 app = typer.Typer(
@@ -182,6 +183,63 @@ def cmd_approve_spec(
             indent=2,
         )
     )
+
+
+@app.command("design")
+def cmd_design(
+    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    auto_approve: Annotated[bool, typer.Option("--auto-approve")] = False,
+    approver: Annotated[str, typer.Option("--approver")] = "zeus",
+    workspace: WorkspaceOpt = None,
+    db: DbOpt = None,
+    provider: ProviderOpt = "auto",
+    model: ModelOpt = None,
+    base_url: BaseUrlOpt = None,
+) -> None:
+    """Stage 1.5: Synthesize and validate a white-box DesignSpec for a frozen GoalSpec."""
+    ws = _resolve_workspace(workspace)
+    store = RunStore(_resolve_db(ws, db))
+    llm = build_provider(provider=provider, model=model, base_url=base_url)
+    stage = DesignStage(
+        store,
+        llm,
+        ws,
+        artifacts_root=ws / ".olympus" / "runs",
+    )
+    design = stage.propose_design(run_id, auto_approve=auto_approve, approver=approver)
+    typer.echo(json.dumps(design.model_dump(mode="json"), ensure_ascii=False, indent=2))
+
+
+@app.command("approve-design")
+def cmd_approve_design(
+    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    approver: Annotated[str, typer.Option("--approver")] = "zeus",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+    workspace: WorkspaceOpt = None,
+    db: DbOpt = None,
+) -> None:
+    """Gate 1.5: Freeze and approve the current DesignSpec."""
+    ws = _resolve_workspace(workspace)
+    store = RunStore(_resolve_db(ws, db))
+    from olympus.providers.base import MockLLMProvider
+
+    stage = DesignStage(store, MockLLMProvider(), ws)
+    record = stage.approve_design(run_id, approver=approver, reason=reason)
+    typer.echo(record.model_dump_json(indent=2))
+
+
+@app.command("workflows")
+def cmd_workflows(
+    workspace: WorkspaceOpt = None,
+) -> None:
+    """List builtin YAML workflows with their bound graph topology."""
+    from olympus.graph import describe_workflow, list_builtin_workflows, load_workflow
+
+    _resolve_workspace(workspace)
+    payload = [
+        describe_workflow(load_workflow(name)) for name in list_builtin_workflows()
+    ]
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 @app.command("plan")

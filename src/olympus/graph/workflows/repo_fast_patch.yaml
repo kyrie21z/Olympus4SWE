@@ -1,0 +1,59 @@
+name: repo_fast_patch
+description: >-
+  Minimal-patch loop for small repository fixes: triage, freeze a compact GoalSpec,
+  decompose a single-wave plan against the frozen spec, and execute immediately.
+  Human gates are auto-satisfied so CI and scripts can run headless.
+stop_after: execute
+topology: minimal_patch
+nodes:
+  - name: intake
+    type: intake_triage
+  - name: align
+    type: align_goal
+    params:
+      strict_canonical: false
+      auto_approve: true
+  - name: gate_spec
+    type: human_gate
+    params:
+      gate: spec
+  - name: plan
+    type: pm_decompose
+    params:
+      use_design: false
+      auto_approve: true
+  - name: validate_plan
+    type: validate_plan
+  - name: execute
+    type: execute_task_dag
+edges:
+  - source: START
+    target: intake
+  - source: align
+    target: gate_spec
+  - source: gate_spec
+    target: plan
+  - source: plan
+    target: validate_plan
+  - source: validate_plan
+    target: execute
+  - source: execute
+    target: END
+routers:
+  - at: intake
+    key: route
+    default: align
+    rules:
+      design_ready: align
+      goal_ready: gate_spec
+      raw: align
+  - at: align
+    key: route
+    default: gate_spec
+    rules:
+      blocked: END
+      ready: gate_spec
+gates:
+  approve_spec: false
+  approve_design: false
+  approve_plan: false

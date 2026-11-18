@@ -69,11 +69,70 @@ class CritiqueSeverity(StrEnum):
     WARNING = "warning"
 
 
+class DeliverableKind(StrEnum):
+    WEB_APP = "web_app"
+    REST_API = "rest_api"
+    CLI = "cli"
+    LIBRARY = "library"
+    DESKTOP = "desktop"
+    MULTI_SURFACE = "multi_surface"
+
+
+class EarsPattern(StrEnum):
+    UBIQUITOUS = "ubiquitous"
+    EVENT_DRIVEN = "event_driven"
+    STATE_DRIVEN = "state_driven"
+    UNWANTED_BEHAVIOR = "unwanted_behavior"
+    OPTIONAL_FEATURE = "optional_feature"
+
+
+class AcceptanceCriterion(StrictModel):
+    """One EARS-pattern acceptance criterion with a deterministic rendering."""
+
+    id: str = Field(min_length=1)
+    pattern: EarsPattern
+    condition: str = ""
+    outcome: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _require_condition_for_conditional_patterns(self) -> AcceptanceCriterion:
+        if self.pattern != EarsPattern.UBIQUITOUS and not self.condition.strip():
+            raise ValueError(f"EARS pattern '{self.pattern.value}' requires a non-empty condition")
+        return self
+
+    def to_ears_text(self) -> str:
+        outcome = self.outcome.strip()
+        condition = self.condition.strip()
+        if self.pattern == EarsPattern.UBIQUITOUS:
+            return f"THE SYSTEM SHALL {outcome}"
+        if self.pattern == EarsPattern.EVENT_DRIVEN:
+            return f"WHEN {condition} THE SYSTEM SHALL {outcome}"
+        if self.pattern == EarsPattern.STATE_DRIVEN:
+            return f"WHILE {condition} THE SYSTEM SHALL {outcome}"
+        if self.pattern == EarsPattern.UNWANTED_BEHAVIOR:
+            return f"IF {condition} THEN THE SYSTEM SHALL {outcome}"
+        return f"WHERE {condition} THE SYSTEM SHALL {outcome}"
+
+
 class RequirementItem(StrictModel):
     id: str
     description: str
-    acceptance_criteria: list[str] = Field(min_length=1)
+    # Always a list[str] so existing scorers/projection keep iterating plain strings.
+    acceptance_criteria: list[str] = Field(default_factory=list)
     source_ref: str | None = None
+    actor: str | None = None
+    ears_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _materialize_ears_text(self) -> RequirementItem:
+        if self.ears_criteria and not self.acceptance_criteria:
+            self.acceptance_criteria = [c.to_ears_text() for c in self.ears_criteria]
+        if not self.acceptance_criteria:
+            raise ValueError(
+                f"RequirementItem {self.id} requires at least one acceptance criterion "
+                "(acceptance_criteria or ears_criteria)"
+            )
+        return self
 
 
 class AmbiguityItem(StrictModel):
@@ -107,9 +166,51 @@ class GoalSpec(FingerprintedModel):
     open_ambiguities: list[AmbiguityItem] = Field(default_factory=list)
     minority_notes: list[CritiqueNote] = Field(default_factory=list)
     status: SpecStatus = SpecStatus.DRAFT
+    deliverable_kind: DeliverableKind | None = None
+    observable_surfaces: list[str] = Field(default_factory=list)
+    actors: list[str] = Field(default_factory=list)
 
     def _hash_payload(self) -> dict[str, Any]:
         return self.model_dump(exclude={"status", "content_hash"}, mode="python")
+
+    def to_markdown(self) -> str:
+        kind = self.deliverable_kind.value if self.deliverable_kind else "(unspecified)"
+        lines = [
+            f"# GoalSpec {self.spec_id} (v{self.version})",
+            "",
+            f"- Status: {self.status.value}",
+            f"- Deliverable: {kind}",
+            f"- Observable surfaces: {', '.join(self.observable_surfaces) or '(none)'}",
+            f"- Actors: {', '.join(self.actors) or '(none)'}",
+            "",
+            "## Goal",
+            "",
+            self.goal,
+            "",
+            "## Requirements",
+            "",
+        ]
+        for req in self.requirements:
+            actor = f" [{req.actor}]" if req.actor else ""
+            lines.append(f"### {req.id}{actor}")
+            lines.append("")
+            lines.append(req.description)
+            lines.append("")
+            for idx, criterion in enumerate(req.acceptance_criteria, start=1):
+                lines.append(f"{idx}. {criterion}")
+            lines.append("")
+        lines.extend(["## Out of scope", ""])
+        lines.extend(f"- {item}" for item in self.out_of_scope)
+        if not self.out_of_scope:
+            lines.append("- (none declared)")
+        lines.extend(["", "## Constraints", ""])
+        lines.extend(f"- {item}" for item in self.constraints)
+        if not self.constraints:
+            lines.append("- (none)")
+        if self.assumptions:
+            lines.extend(["", "## Assumptions", ""])
+            lines.extend(f"- {item}" for item in self.assumptions)
+        return "\n".join(lines).rstrip() + "\n"
 
     def unresolved_blockers(self) -> list[str]:
         blockers: list[str] = []
@@ -120,6 +221,115 @@ class GoalSpec(FingerprintedModel):
             if note.severity == CritiqueSeverity.BLOCKING and not note.resolved:
                 blockers.append(f"critique:{note.id}")
         return blockers
+
+
+class DesignModule(StrictModel):
+    """One white-box module boundary with an exclusive target path scope."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    responsibility: str = Field(min_length=1)
+    requirement_refs: list[str] = Field(min_length=1)
+    target_paths: list[str] = Field(min_length=1)
+
+
+class DataEntity(StrictModel):
+    name: str = Field(min_length=1)
+    fields: list[str] = Field(min_length=1)
+    owner_module_id: str = Field(min_length=1)
+    notes: str = ""
+
+
+class InterfaceContract(StrictModel):
+    """A named seam between a provider module and its consumers."""
+
+    id: str = Field(min_length=1)
+    provider_module_id: str = Field(min_length=1)
+    consumer_module_ids: list[str] = Field(default_factory=list)
+    protocol: str = "http_or_fn"
+    signature: str = Field(min_length=1)
+    error_cases: list[str] = Field(default_factory=list)
+
+
+class DesignSpec(FingerprintedModel):
+    """White-box design: modules, data ownership, and interface seams."""
+
+    design_id: str = Field(default_factory=lambda: new_id("design"))
+    version: int = Field(default=1, ge=1)
+    spec_id: str | None = None
+    spec_hash: str | None = None
+    architecture_summary: str = Field(min_length=1)
+    modules: list[DesignModule] = Field(min_length=1)
+    data_models: list[DataEntity] = Field(default_factory=list)
+    interfaces: list[InterfaceContract] = Field(default_factory=list)
+    risks_and_tradeoffs: list[str] = Field(default_factory=list)
+    status: SpecStatus = SpecStatus.DRAFT
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(exclude={"status", "content_hash"}, mode="python")
+
+    def to_markdown(self) -> str:
+        lines = [
+            f"# DesignSpec {self.design_id} (v{self.version})",
+            "",
+            f"- Status: {self.status.value}",
+            f"- Bound spec: {self.spec_id or '(none)'}",
+            f"- Spec hash: {self.spec_hash or '(none)'}",
+            "",
+            "## Architecture",
+            "",
+            self.architecture_summary,
+            "",
+            "## Modules",
+            "",
+        ]
+        for module in self.modules:
+            lines.extend(
+                [
+                    f"### {module.id} — {module.name}",
+                    "",
+                    module.responsibility,
+                    "",
+                    f"- Requirements: {', '.join(module.requirement_refs)}",
+                    f"- Target paths: {', '.join(module.target_paths)}",
+                    "",
+                ]
+            )
+        if self.data_models:
+            lines.extend(["## Data models", ""])
+            for entity in self.data_models:
+                lines.append(
+                    f"- {entity.name} (owner: {entity.owner_module_id}): "
+                    f"{', '.join(entity.fields)}"
+                )
+            lines.append("")
+        if self.interfaces:
+            lines.extend(["## Interfaces", ""])
+            for iface in self.interfaces:
+                consumers = ", ".join(iface.consumer_module_ids) or "(external)"
+                lines.append(
+                    f"- {iface.id} [{iface.protocol}] {iface.signature} "
+                    f"({iface.provider_module_id} -> {consumers})"
+                )
+            lines.append("")
+        if self.risks_and_tradeoffs:
+            lines.extend(["## Risks and tradeoffs", ""])
+            lines.extend(f"- {item}" for item in self.risks_and_tradeoffs)
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+
+class InputMaturity(StrEnum):
+    RAW_INTENT = "raw_intent"
+    GOAL_SPEC_READY = "goal_spec_ready"
+    DESIGN_SPEC_READY = "design_spec_ready"
+
+
+class TriageResult(StrictModel):
+    maturity: InputMaturity
+    reasons: list[str] = Field(default_factory=list)
+    extracted_goal: GoalSpec | None = None
+    extracted_design: DesignSpec | None = None
 
 
 class TaskStatus(StrEnum):
@@ -188,6 +398,13 @@ class ReviewVerdict(StrictModel):
         return self
 
 
+class TaskKind(StrEnum):
+    CONTRACT = "contract"
+    IMPLEMENT = "implement"
+    TEST = "test"
+    INTEGRATE = "integrate"
+
+
 class TaskNode(StrictModel):
     task_id: str = Field(min_length=1)
     title: str = Field(min_length=1)
@@ -206,14 +423,31 @@ class TaskNode(StrictModel):
     commit_sha: str | None = None
     last_error: str | None = None
     accepted_risk_reason: str | None = None
+    design_refs: list[str] = Field(default_factory=list)
+    role: str = "engineer"
+    kind: TaskKind = TaskKind.IMPLEMENT
+    deliverables: list[str] = Field(default_factory=list)
 
 
 class TaskPlan(FingerprintedModel):
     plan_id: str = Field(default_factory=lambda: new_id("plan"))
-    spec_id: str
-    spec_hash: str
+    spec_id: str | None = None
+    spec_hash: str | None = None
+    design_id: str | None = None
+    design_hash: str | None = None
     version: int = Field(default=1, ge=1)
     tasks: list[TaskNode] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _require_upstream_binding(self) -> TaskPlan:
+        spec_bound = bool(self.spec_id and self.spec_hash)
+        design_bound = bool(self.design_id and self.design_hash)
+        if not (spec_bound or design_bound):
+            raise ValueError(
+                "TaskPlan must bind to an approved GoalSpec (spec_id+spec_hash) "
+                "or an approved DesignSpec (design_id+design_hash)"
+            )
+        return self
 
     def _hash_payload(self) -> dict[str, Any]:
         # Hash structural plan definition (not mutable runtime execution counters)
@@ -228,6 +462,10 @@ class TaskPlan(FingerprintedModel):
                     "write_scope",
                     "read_scope",
                     "max_cycles",
+                    "design_refs",
+                    "role",
+                    "kind",
+                    "deliverables",
                 },
                 mode="python",
             )
@@ -243,6 +481,8 @@ class TaskPlan(FingerprintedModel):
             "plan_id": self.plan_id,
             "spec_id": self.spec_id,
             "spec_hash": self.spec_hash,
+            "design_id": self.design_id,
+            "design_hash": self.design_hash,
             "version": self.version,
             "tasks": structural_tasks,
         }
@@ -256,6 +496,8 @@ class RunMode(StrEnum):
 class RunStatus(StrEnum):
     CREATED = "created"
     ALIGNING = "aligning"
+    DESIGNING = "designing"
+    PLANNING = "planning"
     AWAITING_HUMAN = "awaiting_human"
     RUNNING = "running"
     PAUSED = "paused"
@@ -314,6 +556,7 @@ class BudgetLedger(StrictModel):
 
 class ApprovalTarget(StrEnum):
     GOAL_SPEC = "goal_spec"
+    DESIGN_SPEC = "design_spec"
     TASK_PLAN = "task_plan"
     HIGH_RISK_ACTION = "high_risk_action"
     FINAL_ACCEPTANCE = "final_acceptance"

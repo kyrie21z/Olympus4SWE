@@ -6,7 +6,7 @@ import re
 from collections import deque
 from pathlib import Path, PurePosixPath
 
-from olympus.core.contracts import CheckKind, GoalSpec, TaskNode, TaskPlan, TaskStatus
+from olympus.core.contracts import CheckKind, DesignSpec, GoalSpec, TaskNode, TaskPlan, TaskStatus
 
 
 class PlanValidationError(ValueError):
@@ -15,6 +15,66 @@ class PlanValidationError(ValueError):
     def __init__(self, violations: list[str]) -> None:
         self.violations = violations
         super().__init__("; ".join(violations))
+
+
+# Buzzwords that describe an intention rather than a verifiable behavior.
+_VAGUE_TERMS: tuple[str, ...] = (
+    "美观",
+    "体验流畅",
+    "界面友好",
+    "合理处理",
+    "等等",
+    "及相关功能",
+    "user-friendly",
+    "user friendly",
+    "seamlessly",
+    "handle appropriately",
+    "etc.",
+)
+
+# A vague term is tolerated only when the same sentence carries a measurable detail.
+_CONCRETE_DETAIL_RE = re.compile(
+    r"(?:\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min|h|%|percent|px|kb|mb|gb|"
+    r"qps|rps|req/s|requests|items|records|rows|lines|bytes|次|条|个|行|秒|毫秒|分钟)\b)"
+    r"|(?:\b(?:HTTP\s*)?[1-5]\d{2}\b)"
+    r"|(?:`[^`]+`)"
+    r"|(?:\b[\w./-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|toml|html|css)\b)"
+    r"|(?:\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s]*)",
+    re.IGNORECASE,
+)
+
+_IMPLEMENTATION_LEAK_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bCREATE\s+TABLE\b", re.IGNORECASE),
+    re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE),
+    re.compile(r"\bsrc/[A-Za-z0-9_./-]+\.py\b"),
+)
+
+
+def _vague_terms(text: str) -> list[str]:
+    if not text:
+        return []
+    lowered = text.lower()
+    hits = [term for term in _VAGUE_TERMS if term.lower() in lowered]
+    if not hits:
+        return []
+    if _CONCRETE_DETAIL_RE.search(text):
+        return []
+    return hits
+
+
+def _implementation_leaks(text: str, constraints: list[str]) -> list[str]:
+    if not text:
+        return []
+    allowed = " | ".join(constraints).lower()
+    leaks: list[str] = []
+    for pattern in _IMPLEMENTATION_LEAK_RES:
+        for match in pattern.finditer(text):
+            token = match.group(0)
+            if token.lower() in allowed:
+                continue
+            if token not in leaks:
+                leaks.append(token)
+    return leaks
 
 
 def normalize_scope_path(raw: str) -> str:
@@ -79,10 +139,175 @@ def _build_ancestors(tasks: list[TaskNode]) -> dict[str, set[str]]:
     return ancestors
 
 
+def validate_goal_spec(
+    spec: GoalSpec,
+    *,
+    strict_ears: bool = True,
+    require_out_of_scope: bool = True,
+) -> list[str]:
+    """Zero-token gate for the 5-element + EARS GoalSpec contract.
+
+    Covers deliverable kind, observable surfaces, actors, per-requirement EARS criteria,
+    anti-vague lexical hygiene, premature implementation leaks, out-of-scope boundaries,
+    and unresolved blocking ambiguities.
+    """
+    violations: list[str] = []
+    actor_pool = {actor.strip().lower() for actor in spec.actors if actor.strip()}
+
+    if strict_ears:
+        if spec.deliverable_kind is None:
+            violations.append("GoalSpec is missing deliverable_kind (web_app/rest_api/cli/...)")
+        if not [s for s in spec.observable_surfaces if s.strip()]:
+            violations.append("GoalSpec is missing observable_surfaces")
+        if not actor_pool:
+            violations.append("GoalSpec is missing actors")
+
+    for req in spec.requirements:
+        if strict_ears:
+            if not req.actor or not req.actor.strip():
+                violations.append(f"Requirement {req.id} is missing actor")
+            elif req.actor.strip().lower() not in actor_pool:
+                violations.append(
+                    f"Requirement {req.id} actor '{req.actor}' is not declared in GoalSpec.actors"
+                )
+            if not req.ears_criteria:
+                violations.append(f"Requirement {req.id} has no ears_criteria")
+
+        scanned: list[tuple[str, str]] = [
+            (f"description of {req.id}", req.description),
+            *[
+                (f"acceptance criterion {idx} of {req.id}", text)
+                for idx, text in enumerate(req.acceptance_criteria, start=1)
+            ],
+            *[
+                (f"EARS outcome {crit.id} of {req.id}", crit.outcome)
+                for crit in req.ears_criteria
+            ],
+        ]
+        for label, text in scanned:
+            vague = _vague_terms(text)
+            if vague:
+                violations.append(
+                    f"Vague unquantified wording in {label}: "
+                    f"{', '.join(vague)} (add a measurable threshold or concrete artifact)"
+                )
+            leaks = _implementation_leaks(text, spec.constraints)
+            if leaks:
+                violations.append(
+                    f"Premature internal implementation leak in {label}: {', '.join(leaks)}"
+                )
+
+    if require_out_of_scope and not [item for item in spec.out_of_scope if item.strip()]:
+        violations.append("GoalSpec is missing out_of_scope boundaries")
+
+    blockers = spec.unresolved_blockers()
+    if blockers:
+        violations.append(f"GoalSpec still has unresolved blockers: {', '.join(blockers)}")
+    return violations
+
+
+def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> list[str]:
+    """Zero-token gate for module boundaries, data ownership, interface seams, and coverage."""
+    violations: list[str] = []
+
+    module_ids: set[str] = set()
+    for module in design.modules:
+        if module.id in module_ids:
+            violations.append(f"Duplicate design module id: {module.id}")
+        module_ids.add(module.id)
+
+    normalized: dict[str, list[str]] = {}
+    for module in design.modules:
+        paths: list[str] = []
+        for raw in module.target_paths:
+            try:
+                paths.append(normalize_scope_path(raw))
+            except ValueError as exc:
+                violations.append(f"Design module {module.id} invalid target_path ({raw}): {exc}")
+        normalized[module.id] = paths
+
+    ordered_ids = list(module_ids)
+    for i in range(len(ordered_ids)):
+        for j in range(i + 1, len(ordered_ids)):
+            left, right = ordered_ids[i], ordered_ids[j]
+            try:
+                conflicts = scopes_overlap(normalized.get(left, []), normalized.get(right, []))
+            except ValueError:
+                conflicts = []
+            if conflicts:
+                pairs = ", ".join(f"{a}<->{b}" for a, b in conflicts)
+                violations.append(
+                    f"Design modules {left} and {right} have overlapping target_paths: {pairs}"
+                )
+
+    for entity in design.data_models:
+        if entity.owner_module_id not in module_ids:
+            violations.append(
+                f"DataEntity {entity.name} owner_module_id '{entity.owner_module_id}' "
+                "is not a declared design module"
+            )
+
+    interface_ids: set[str] = set()
+    for iface in design.interfaces:
+        if iface.id in interface_ids:
+            violations.append(f"Duplicate interface contract id: {iface.id}")
+        interface_ids.add(iface.id)
+        if iface.provider_module_id not in module_ids:
+            violations.append(
+                f"Interface {iface.id} provider_module_id '{iface.provider_module_id}' "
+                "is not a declared design module"
+            )
+        for consumer in iface.consumer_module_ids:
+            if consumer not in module_ids:
+                violations.append(
+                    f"Interface {iface.id} consumer_module_id '{consumer}' "
+                    "is not a declared design module"
+                )
+
+    if len(design.modules) > 1 and not design.interfaces:
+        violations.append(
+            "Multi-module design requires at least one interface contract (seam closure)"
+        )
+
+    if spec is not None:
+        if design.spec_id is None:
+            violations.append("DesignSpec is not bound to a GoalSpec (spec_id is empty)")
+        elif design.spec_id != spec.spec_id:
+            violations.append(
+                f"DesignSpec spec_id ({design.spec_id}) does not match GoalSpec ({spec.spec_id})"
+            )
+        if design.spec_hash is None:
+            violations.append("DesignSpec is not bound to a GoalSpec hash (spec_hash is empty)")
+        elif design.spec_hash != spec.content_hash:
+            violations.append(
+                f"DesignSpec spec_hash ({design.spec_hash}) does not match GoalSpec "
+                f"({spec.content_hash})"
+            )
+
+        valid_reqs = {req.id for req in spec.requirements}
+        covered: set[str] = set()
+        for module in design.modules:
+            for ref in module.requirement_refs:
+                if ref not in valid_reqs:
+                    violations.append(
+                        f"Design module {module.id} references unknown requirement: {ref}"
+                    )
+                else:
+                    covered.add(ref)
+        missing = sorted(valid_reqs - covered)
+        if missing:
+            violations.append(
+                f"Requirements not covered by any design module: {', '.join(missing)}"
+            )
+
+    return violations
+
+
 def validate_plan(
     plan: TaskPlan,
     spec: GoalSpec | None = None,
     *,
+    design: DesignSpec | None = None,
     workspace_root: Path | str | None = None,
 ) -> list[str]:
     """Validate structural DAG properties, spec coverage, and concurrent write_scope isolation."""
@@ -158,6 +383,34 @@ def validate_plan(
         if missing_reqs:
             violations.append(f"Requirements not covered by any task: {', '.join(missing_reqs)}")
 
+    # Design traceability coverage
+    if design is not None:
+        if plan.design_id != design.design_id:
+            violations.append(
+                f"TaskPlan design_id ({plan.design_id}) does not match DesignSpec "
+                f"({design.design_id})"
+            )
+        if plan.design_hash != design.content_hash:
+            violations.append(
+                f"TaskPlan design_hash ({plan.design_hash}) does not match DesignSpec "
+                f"({design.content_hash})"
+            )
+        known_design_refs = {m.id for m in design.modules} | {i.id for i in design.interfaces}
+        referenced: set[str] = set()
+        for task in plan.tasks:
+            for ref in task.design_refs:
+                if ref not in known_design_refs:
+                    violations.append(
+                        f"Task {task.task_id} references unknown design element: {ref}"
+                    )
+                else:
+                    referenced.add(ref)
+        orphan_modules = sorted({m.id for m in design.modules} - referenced)
+        if orphan_modules:
+            violations.append(
+                "Design modules not referenced by any task: " + ", ".join(orphan_modules)
+            )
+
     # Independent sibling tasks must have disjoint write_scopes
     if visited == len(by_id):
         ancestors = _build_ancestors(plan.tasks)
@@ -186,9 +439,10 @@ def assert_valid_plan(
     plan: TaskPlan,
     spec: GoalSpec | None = None,
     *,
+    design: DesignSpec | None = None,
     workspace_root: Path | str | None = None,
 ) -> None:
-    violations = validate_plan(plan, spec=spec, workspace_root=workspace_root)
+    violations = validate_plan(plan, spec=spec, design=design, workspace_root=workspace_root)
     if violations:
         raise PlanValidationError(violations)
 

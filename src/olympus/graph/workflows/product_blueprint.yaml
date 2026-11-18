@@ -1,0 +1,92 @@
+name: product_blueprint
+description: >-
+  Product-grade blueprint pipeline: triage input, freeze an EARS GoalSpec, derive a
+  white-box DesignSpec with exclusive module paths and interface seams, then decompose a
+  modular Wave 0/1/2 TaskPlan. Every gate stays human-controlled and the run stops after
+  the plan is approved.
+stop_after: plan
+topology: modular_product
+nodes:
+  - name: intake
+    type: intake_triage
+  - name: align
+    type: align_goal
+    params:
+      strict_canonical: true
+  - name: critic
+    type: critic_parallel
+  - name: gate_spec
+    type: human_gate
+    params:
+      gate: spec
+  - name: design
+    type: design_spec
+  - name: validate_design
+    type: validate_design
+  - name: gate_design
+    type: human_gate
+    params:
+      gate: design
+  - name: plan
+    type: pm_decompose
+    params:
+      use_design: true
+  - name: validate_plan
+    type: validate_plan
+  - name: gate_plan
+    type: human_gate
+    params:
+      gate: plan
+edges:
+  - source: START
+    target: intake
+  - source: align
+    target: critic
+  - source: critic
+    target: gate_spec
+  - source: gate_spec
+    target: design
+  - source: design
+    target: validate_design
+  - source: gate_design
+    target: plan
+  - source: plan
+    target: validate_plan
+  - source: gate_plan
+    target: END
+routers:
+  - at: intake
+    key: route
+    default: align
+    rules:
+      design_ready: validate_design
+      goal_ready: gate_spec
+      raw: align
+  - at: align
+    key: route
+    default: critic
+    rules:
+      blocked: END
+      ready: critic
+  - at: critic
+    key: route
+    default: gate_spec
+    rules:
+      blocked: END
+      ready: gate_spec
+  - at: validate_design
+    key: route
+    default: gate_design
+    rules:
+      ok: gate_design
+      fail: END
+  - at: validate_plan
+    key: route
+    default: gate_plan
+    rules:
+      ok: gate_plan
+      fail: END
+gates:
+  approve_spec: true
+  approve_design: true
+  approve_plan: true

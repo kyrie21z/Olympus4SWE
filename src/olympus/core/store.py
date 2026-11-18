@@ -15,6 +15,7 @@ from olympus.core.contracts import (
     ApprovalTarget,
     BudgetLedger,
     BudgetPolicy,
+    DesignSpec,
     GoalSpec,
     RunEvent,
     RunMode,
@@ -54,6 +55,9 @@ CREATE TABLE IF NOT EXISTS runs (
     budget_ledger_json TEXT NOT NULL,
     spec_json TEXT,
     plan_json TEXT,
+    design_json TEXT,
+    workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch',
+    provider_config_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -119,8 +123,24 @@ class RunStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA_SQL)
+            self._migrate_runs_columns(conn)
         finally:
             conn.close()
+
+    def _migrate_runs_columns(self, conn: sqlite3.Connection) -> None:
+        """Idempotently add columns introduced after the initial schema shipped."""
+        existing = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        additions: dict[str, str] = {
+            "design_json": "design_json TEXT",
+            "workflow_name": "workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch'",
+            "provider_config_json": "provider_config_json TEXT",
+        }
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -281,19 +301,28 @@ class RunStore:
         budget_policy: BudgetPolicy | None = None,
         run_id: str | None = None,
         actor: str = "system",
+        workflow_name: str = "product_blueprint",
+        provider_config: dict[str, Any] | None = None,
     ) -> str:
         rid = run_id or new_id("run")
         policy = budget_policy or BudgetPolicy()
         ledger = BudgetLedger()
         now = utc_now().isoformat()
+        provider_json = (
+            json.dumps(provider_config, ensure_ascii=False, sort_keys=True)
+            if provider_config is not None
+            else None
+        )
         with self._tx() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (
                     run_id, title, mode, status, state_revision,
                     budget_policy_json, budget_ledger_json,
-                    spec_json, plan_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    spec_json, plan_json, design_json,
+                    workflow_name, provider_config_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     rid,
@@ -303,6 +332,8 @@ class RunStore:
                     1,
                     policy.model_dump_json(),
                     ledger.model_dump_json(),
+                    workflow_name,
+                    provider_json,
                     now,
                     now,
                 ),
@@ -313,7 +344,11 @@ class RunStore:
                 stage="system",
                 event_type="run.created",
                 actor=actor,
-                payload={"title": title, "mode": mode.value},
+                payload={
+                    "title": title,
+                    "mode": mode.value,
+                    "workflow_name": workflow_name,
+                },
                 state_revision=1,
             )
         return rid
@@ -327,7 +362,7 @@ class RunStore:
         value: str,
         cur_rev: int,
     ) -> int:
-        allowed = {"status", "spec_json", "plan_json", "budget_ledger_json"}
+        allowed = {"status", "spec_json", "plan_json", "design_json", "budget_ledger_json"}
         if column not in allowed:
             raise ValueError(f"Unsupported run column update: {column}")
         new_rev = cur_rev + 1
@@ -343,6 +378,11 @@ class RunStore:
             row = self._get_run_row(conn, run_id)
             spec = GoalSpec.model_validate_json(row["spec_json"]) if row["spec_json"] else None
             plan = TaskPlan.model_validate_json(row["plan_json"]) if row["plan_json"] else None
+            design = (
+                DesignSpec.model_validate_json(row["design_json"])
+                if row["design_json"]
+                else None
+            )
             return {
                 "run_id": row["run_id"],
                 "title": row["title"],
@@ -352,7 +392,14 @@ class RunStore:
                 "budget_policy": BudgetPolicy.model_validate_json(row["budget_policy_json"]),
                 "budget_ledger": BudgetLedger.model_validate_json(row["budget_ledger_json"]),
                 "spec": spec,
+                "design": design,
                 "plan": plan,
+                "workflow_name": row["workflow_name"],
+                "provider_config": (
+                    json.loads(row["provider_config_json"])
+                    if row["provider_config_json"]
+                    else None
+                ),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
@@ -415,6 +462,33 @@ class RunStore:
                     "version": spec.version,
                     "content_hash": spec.content_hash,
                     "status": spec.status.value,
+                },
+                state_revision=new_rev,
+            )
+            return new_rev
+
+    def save_design(self, run_id: str, design: DesignSpec, *, actor: str = "design") -> int:
+        with self._tx() as conn:
+            row = self._get_run_row(conn, run_id)
+            new_rev = self._bump_run_field(
+                conn,
+                run_id=run_id,
+                column="design_json",
+                value=design.model_dump_json(),
+                cur_rev=int(row["state_revision"]),
+            )
+            self._insert_event(
+                conn,
+                run_id=run_id,
+                stage="design",
+                event_type="design.saved",
+                actor=actor,
+                payload={
+                    "design_id": design.design_id,
+                    "version": design.version,
+                    "content_hash": design.content_hash,
+                    "module_count": len(design.modules),
+                    "status": design.status.value,
                 },
                 state_revision=new_rev,
             )
@@ -703,7 +777,8 @@ class RunStore:
         try:
             rows = conn.execute(
                 """
-                SELECT run_id, title, mode, status, state_revision, created_at, updated_at
+                SELECT run_id, title, mode, status, state_revision, workflow_name,
+                       created_at, updated_at
                 FROM runs ORDER BY rowid DESC LIMIT ?
                 """,
                 (limit,),

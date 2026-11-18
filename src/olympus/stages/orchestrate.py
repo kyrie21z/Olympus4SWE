@@ -16,6 +16,7 @@ from olympus.core.contracts import (
     ApprovalRecord,
     ApprovalTarget,
     CheckKind,
+    DesignSpec,
     GoalSpec,
     ReviewSeverity,
     ReviewVerdict,
@@ -81,6 +82,26 @@ Rules:
 3. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
    genuinely satisfies the task and no 'important' defects remain.
 4. Output ONLY a single JSON object conforming to ReviewVerdict."""
+
+
+def _plan_binding(
+    *,
+    design: DesignSpec | None,
+    spec: GoalSpec | None,
+) -> dict[str, Any]:
+    """Force the plan binding to the exact upstream fingerprints the run froze."""
+    update: dict[str, Any] = {}
+    if design is not None:
+        update["design_id"] = design.design_id
+        update["design_hash"] = design.content_hash
+    if spec is not None:
+        update["spec_id"] = spec.spec_id
+        update["spec_hash"] = spec.content_hash
+    else:
+        # Never let the model invent a spec binding the run does not own.
+        update["spec_id"] = None
+        update["spec_hash"] = None
+    return update
 
 
 def _copy_matching_scope(
@@ -210,6 +231,19 @@ def _write_manifest_md(
     return manifest_path
 
 
+_MODULAR_PLANNER_GUIDANCE = """
+Modular product decomposition (topology={topology}):
+- Emit Wave 0 contract tasks (kind='contract', role='architect') that pin interface
+  signatures and shared data models before any implementation.
+- Emit Wave 1 implementation tasks (kind='implement', role='engineer'), one per design
+  module, each with design_refs naming the module id it realizes.
+- Emit Wave 2 verification tasks (kind='test', role='qa') plus one integration task
+  (kind='integrate', role='engineer') when more than one module exists.
+- Every design module id MUST appear in at least one task's design_refs; never invent ids.
+- Tasks in different modules MUST NOT share overlapping write_scope.
+"""
+
+
 class OrchestrateStage:
     """Deterministic Chronos scheduler driving isolated Hephaestus execution & cold-start review."""
 
@@ -249,6 +283,22 @@ class OrchestrateStage:
             )
         return spec
 
+    def _require_approved_design(self, run_id: str) -> DesignSpec:
+        snap = self.store.get_run(run_id)
+        design: DesignSpec | None = snap["design"]
+        if design is None:
+            raise ValueError(f"Run {run_id} has no DesignSpec; run Stage 1.5 (Design) first.")
+        if not self.store.is_approved(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
+        ):
+            raise ValueError(
+                f"DesignSpec {design.design_id} ({design.content_hash}) is not human-approved."
+            )
+        return design
+
     def propose_plan(
         self,
         *,
@@ -256,9 +306,32 @@ class OrchestrateStage:
         auto_approve: bool = False,
         approver: str = "zeus",
         max_steps: int = 10,
+        topology: str = "minimal_patch",
+        use_design: bool = True,
     ) -> TaskPlan:
-        """Generate and deterministically validate a TaskPlan for an approved GoalSpec."""
-        spec = self._require_confirmed_spec(run_id)
+        """Generate and deterministically validate a TaskPlan.
+
+        Accepts an approved DesignSpec (with or without a GoalSpec) or, for backward
+        compatibility, an approved GoalSpec alone. ``modular_product``/``tdd_first``
+        topologies decompose the design's modules into Wave 0/1/2 tasks.
+        """
+        snap = self.store.get_run(run_id)
+        design: DesignSpec | None = snap["design"] if use_design else None
+        spec: GoalSpec | None = snap["spec"]
+        if design is not None:
+            design = self._require_approved_design(run_id)
+            if spec is not None and not self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            ):
+                # A design-only run may carry an unapproved draft spec; ignore its binding.
+                spec = None
+        else:
+            spec = self._require_confirmed_spec(run_id)
+
+        modular = topology in ("modular_product", "tdd_first") and design is not None
         toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         loop = AgentLoop(
             provider=self.provider,
@@ -272,6 +345,32 @@ class OrchestrateStage:
         planner_toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
         inventory = format_workspace_inventory(planner_toolkit)
         schema_json = json.dumps(TaskPlan.model_json_schema(), ensure_ascii=False)
+
+        binding_lines: list[str] = []
+        if design is not None:
+            binding_lines.append(
+                f"Set design_id='{design.design_id}' and design_hash='{design.content_hash}'."
+            )
+        if spec is not None:
+            binding_lines.append(
+                f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'."
+            )
+        if modular:
+            assert design is not None
+            context_block = (
+                f"Approved GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
+                if spec is not None
+                else ""
+            ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
+            modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+        else:
+            context_block = (
+                f"Confirmed GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
+                if spec is not None
+                else ""
+            )
+            modular_block = ""
+
         base_prompt = (
             f"Workspace root: {self.workspace_root}\n"
             f"{inventory}\n"
@@ -280,22 +379,28 @@ class OrchestrateStage:
             f"Remember: acceptance_checks[*].kind MUST be one of "
             f"'command', 'independent_review', or 'human' (never 'review'), and every "
             f"kind='command' check MUST include a non-empty 'command' string.\n"
-            f"Confirmed GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
-            f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'.\n"
+            f"{context_block}"
+            f"{modular_block}"
+            f"{chr(10).join(binding_lines)}\n"
             f"Return TaskPlan JSON matching schema:\n{schema_json}"
         )
 
-        prompt = base_prompt
         plan: TaskPlan | None = None
         last_violations: list[str] = []
+        prompt = base_prompt
         for attempt in range(2):
             candidate = run_structured_loop(
                 loop=loop,
-                system_prompt=_PLANNER_SYSTEM_PROMPT,
+                system_prompt=_PLANNER_SYSTEM_PROMPT + modular_block,
                 user_prompt=prompt,
                 model_cls=TaskPlan,
-            ).model_copy(update={"spec_id": spec.spec_id, "spec_hash": spec.content_hash})
-            violations = validate_plan(candidate, spec=spec, workspace_root=self.workspace_root)
+            ).model_copy(update=_plan_binding(design=design, spec=spec))
+            violations = validate_plan(
+                candidate,
+                spec=spec,
+                design=design if modular else None,
+                workspace_root=self.workspace_root,
+            )
             if not violations:
                 plan = candidate
                 break
@@ -331,15 +436,44 @@ class OrchestrateStage:
         reason: str = "",
     ) -> ApprovalRecord:
         """Record human approval bound to the current TaskPlan content_hash."""
-        spec = self._require_confirmed_spec(run_id)
         snap = self.store.get_run(run_id)
         plan: TaskPlan | None = snap["plan"]
         if plan is None:
             raise ValueError(f"Run {run_id} has no TaskPlan to approve.")
-        if plan.spec_hash != spec.content_hash:
+        spec: GoalSpec | None = snap["spec"]
+        design: DesignSpec | None = snap["design"]
+
+        spec_bound = bool(
+            spec
+            and plan.spec_hash
+            and plan.spec_hash == spec.content_hash
+            and self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.GOAL_SPEC,
+                target_id=spec.spec_id,
+                target_hash=spec.content_hash,
+            )
+        )
+        design_bound = bool(
+            design
+            and plan.design_hash
+            and plan.design_hash == design.content_hash
+            and self.store.is_approved(
+                run_id=run_id,
+                target=ApprovalTarget.DESIGN_SPEC,
+                target_id=design.design_id,
+                target_hash=design.content_hash,
+            )
+        )
+        if not (spec_bound or design_bound):
+            if spec is None and design is None:
+                raise ValueError(
+                    f"Run {run_id} has no GoalSpec or DesignSpec; complete Stage 1 first."
+                )
             raise ValueError(
-                f"TaskPlan spec_hash ({plan.spec_hash}) does not match confirmed spec "
-                f"({spec.content_hash}); regenerate plan first."
+                "TaskPlan does not match any approved upstream artifact "
+                f"(spec_hash={plan.spec_hash}, design_hash={plan.design_hash}); "
+                "regenerate the plan first."
             )
         record = ApprovalRecord(
             run_id=run_id,

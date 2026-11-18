@@ -468,9 +468,9 @@ class ReviewSeverity(StrEnum):
 
 
 class ReviewFinding(StrictModel):
-    id: str = Field(default_factory=lambda: new_id("finding"))
+    id: str
     severity: ReviewSeverity
-    file_path: str = ""
+    file_path: str
     line: int | None = Field(default=None, ge=1)
     message: str = Field(min_length=1)
     suggestion: str | None = None
@@ -478,8 +478,8 @@ class ReviewFinding(StrictModel):
 
 class ReviewVerdict(StrictModel):
     verdict_id: str = Field(default_factory=lambda: new_id("verdict"))
-    task_id: str = ""
-    attempt: int = Field(default=1, ge=1)
+    task_id: str
+    attempt: int = Field(ge=1)
     passed: bool
     summary: str = Field(min_length=1)
     findings: list[ReviewFinding] = Field(default_factory=list)

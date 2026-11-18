@@ -84,15 +84,12 @@ Rules:
    (`SchemaField` list), non-empty `output_schema`, `data_entity_refs`, and non-empty
    `error_cases`. Module dependencies (`consumer -> provider`) MUST be acyclic (no cycles).
 6. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
-7. Explicit execution strategy: prefer `'serial_handoff'` with 1-2 cohesive modules for small
-   or tightly coupled tasks (e.g. <= 6 workspace files or single-package features) so execution
-   finishes cleanly in fewer sequential steps; reserve `'contract_first_parallel'` (2-6
-   orthogonal modules with shared_contract_paths) for larger multi-subsystem changes where
-   parallel sandboxes give real speedup. Always provide a concrete `strategy_rationale`
-   (>= 10 chars).
-8. Stay white-box & cohesive: name real files/directories, keep module count 1-2 for small
-   repos and 2-6 orthogonal modules for larger systems, and set `spec_id` and `spec_hash` to
-   the frozen prompt values.
+7. Explicit execution strategy: set `execution_strategy` to `'contract_first_parallel'`
+   (when modules can implement orthogonally after Wave 0 contracts) or `'serial_handoff'`
+   (when tightly coupled / single write-lock / sequential refactor is safer), plus a
+   concrete `strategy_rationale` (>= 10 chars).
+8. Stay white-box & cohesive: name real files/directories, keep module count 2-6
+   orthogonal modules, and set `spec_id` and `spec_hash` to the frozen prompt values.
 9. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
    human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
    `strategy_rationale`, `risks_and_tradeoffs`); for greenfield products unrelated to the

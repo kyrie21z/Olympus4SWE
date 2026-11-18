@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
-
-from pydantic import ValidationError
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -23,7 +19,6 @@ from olympus.core.contracts import (
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
-    ReviewFinding,
     ReviewSeverity,
     ReviewVerdict,
     RunMode,
@@ -46,18 +41,11 @@ from olympus.harness.worktree import (
     SandboxHandle,
     build_sandbox_env,
     capture_sandbox_diff,
-    commit_sandbox_baseline,
     create_sandbox,
     remove_sandbox,
 )
-from olympus.providers.base import LLMProvider, ToolSpec
-from olympus.stages.common import (
-    extract_json_payload,
-    format_workspace_inventory,
-    parse_model_json,
-    run_structured_loop,
-    strip_schema_meta_keys,
-)
+from olympus.providers.base import LLMProvider
+from olympus.stages.common import format_workspace_inventory, run_structured_loop
 from olympus.tools.aci import _IGNORED_DIR_NAMES, WorkspaceToolkit
 
 _PLANNER_SYSTEM_PROMPT = """You are the Stage 2 Task Planner of Olympus4SWE.
@@ -91,190 +79,13 @@ Rules:
 _REVIEWER_SYSTEM_PROMPT = """You are the cold-start Independent Verifier (Argus) of Olympus4SWE.
 You have ZERO prior conversation history with the implementer.
 Inspect the GoalSpec requirements, out_of_scope boundaries, TaskNode objective, git diff, and actual
-command check outputs (plus read-only workspace inspection only if diff is truncated).
+command check outputs (plus read-only workspace inspection if needed).
 Rules:
-1. Check for genuine spec drift, out_of_scope additions, stub code, edge-case bugs, security risks,
-   or actual writes outside write_scope. Do NOT reject for stylistic preferences, harmless helper
-   classes (e.g. default monotonic clock), or pre-existing / baseline files unchanged in git diff.
+1. Check for spec drift, out_of_scope additions, stub code, edge-case bugs, and security risks.
 2. Classify each finding strictly as 'important' (blocks pass), 'nit', or 'pre_existing'.
-3. Set passed=false whenever any 'important' finding exists; set passed=true when the implementation
-   genuinely satisfies the task with passing tests and no 'important' defects remain.
-4. Call the `submit_review` tool (strongly preferred) OR reply with concise JSON/Markdown stating
-   passed, summary, and any important/nit findings."""
-
-_SUBMIT_REVIEW_TOOL = ToolSpec(
-    name="submit_review",
-    description=(
-        "Submit the final independent code review verdict for this task. Prefer calling this "
-        "tool directly instead of hand-formatting raw JSON in text."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "passed": {"type": "boolean"},
-            "summary": {"type": "string"},
-            "findings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "severity": {
-                            "type": "string",
-                            "enum": ["important", "nit", "pre_existing"],
-                        },
-                        "file_path": {"type": "string"},
-                        "line": {"type": ["integer", "null"]},
-                        "message": {"type": "string"},
-                        "suggestion": {"type": ["string", "null"]},
-                    },
-                    "required": ["severity", "message"],
-                },
-            },
-        },
-        "required": ["passed", "summary"],
-    },
-)
-
-_NEGATIVE_PROSE_RE = re.compile(
-    r"\b(fail|failed|reject|rejected|important|critical|bug|broken|violation|must fix)\b"
-    r"|不通过|阻塞|严重问题",
-    re.IGNORECASE,
-)
-_POSITIVE_PROSE_RE = re.compile(
-    r"\b(pass|passed|lgtm|approved|looks good|no important|all checks pass|no defects)\b"
-    r"|全部通过|审核通过",
-    re.IGNORECASE,
-)
-
-
-def _normalize_review_payload(
-    raw: dict[str, Any],
-    *,
-    task_id: str,
-    attempt: int,
-    incremental: bool,
-) -> dict[str, Any]:
-    raw_findings = raw.get("findings") or []
-    cleaned: list[dict[str, Any]] = []
-    if isinstance(raw_findings, list):
-        for idx, item in enumerate(raw_findings, start=1):
-            if not isinstance(item, dict):
-                continue
-            sev = str(item.get("severity") or "important").strip().lower()
-            if sev not in ("important", "nit", "pre_existing"):
-                sev = "important"
-            msg = str(item.get("message") or item.get("summary") or "").strip()
-            if not msg:
-                continue
-            line_raw = item.get("line")
-            line_val = int(line_raw) if isinstance(line_raw, int) and line_raw >= 1 else None
-            cleaned.append(
-                {
-                    "id": str(item.get("id") or f"F{idx}"),
-                    "severity": sev,
-                    "file_path": str(item.get("file_path") or ""),
-                    "line": line_val,
-                    "message": msg,
-                    "suggestion": (
-                        str(item["suggestion"]) if item.get("suggestion") is not None else None
-                    ),
-                }
-            )
-    passed_val = bool(raw.get("passed", False))
-    summary_val = str(raw.get("summary") or "").strip() or (
-        "Verified cleanly." if passed_val else "Independent review identified defects."
-    )
-    return {
-        "task_id": task_id,
-        "attempt": attempt,
-        "passed": passed_val,
-        "summary": summary_val,
-        "findings": cleaned,
-        "checked_commit": (
-            str(raw["checked_commit"]) if raw.get("checked_commit") is not None else None
-        ),
-        "incremental_only": incremental,
-    }
-
-
-def _try_parse_review_verdict(
-    raw_text: str,
-    *,
-    task_id: str,
-    attempt: int,
-    incremental: bool,
-) -> ReviewVerdict | None:
-    text = raw_text.strip()
-    if not text:
-        return None
-    with suppress(json.JSONDecodeError, ValidationError):
-        return parse_model_json(text, ReviewVerdict).model_copy(
-            update={"task_id": task_id, "attempt": attempt, "incremental_only": incremental}
-        )
-    candidate = extract_json_payload(text)
-    with suppress(json.JSONDecodeError, ValidationError, ValueError):
-        data = strip_schema_meta_keys(json.loads(candidate))
-        if isinstance(data, dict) and "passed" in data:
-            normalized = _normalize_review_payload(
-                data,
-                task_id=task_id,
-                attempt=attempt,
-                incremental=incremental,
-            )
-            return ReviewVerdict.model_validate(normalized)
-    return None
-
-
-def _coerce_prose_verdict(
-    raw_text: str,
-    *,
-    task_id: str,
-    attempt: int,
-    incremental: bool,
-) -> ReviewVerdict:
-    """Convert freeform Markdown/prose review output cleanly without crashing the DAG."""
-    text = raw_text.strip()
-    if not text:
-        return ReviewVerdict(
-            task_id=task_id,
-            attempt=attempt,
-            passed=False,
-            summary="Independent verifier stopped without producing a final verdict.",
-            findings=[
-                ReviewFinding(
-                    id="F1",
-                    severity=ReviewSeverity.IMPORTANT,
-                    file_path="",
-                    message="Reviewer returned empty output; requeuing for verification.",
-                )
-            ],
-            incremental_only=incremental,
-        )
-    has_positive = bool(_POSITIVE_PROSE_RE.search(text))
-    has_negative = bool(_NEGATIVE_PROSE_RE.search(text))
-    approved = has_positive and not has_negative
-    summary = text if len(text) <= 1500 else text[:1497] + "..."
-    findings = (
-        []
-        if approved
-        else [
-            ReviewFinding(
-                id="F1",
-                severity=ReviewSeverity.IMPORTANT,
-                file_path="",
-                message=summary[:600],
-            )
-        ]
-    )
-    return ReviewVerdict(
-        task_id=task_id,
-        attempt=attempt,
-        passed=approved,
-        summary=summary,
-        findings=findings,
-        incremental_only=incremental,
-    )
+3. Set passed=false whenever any 'important' finding exists; set passed=true only if implementation
+   genuinely satisfies the task and no 'important' defects remain.
+4. Output ONLY a single JSON object conforming to ReviewVerdict."""
 
 
 def _plan_binding(
@@ -514,19 +325,6 @@ Modular product decomposition (topology={topology}):
   all needed Wave 1 tasks), and MUST NOT silence failures with 2>/dev/null.
 """
 
-_SERIAL_PLANNER_GUIDANCE = """
-Cohesive sequential decomposition (topology={topology}, strategy=serial_handoff):
-- Prefer 1-2 cohesive sequential TaskNodes (`depends_on` chaining them cleanly) rather than
-  splitting every single file into micro-tasks. A single cohesive implement+test task or a
-  2-step (`core+contract -> integration+tests`) chain is ideal for small repositories.
-- Every design module id MUST appear in at least one task's design_refs; multiple design_refs
-  may share the same cohesive task when running serially. If `design.shared_contract_paths`
-  is non-empty, put those paths in a leading `kind='contract'` task's `write_scope`.
-- Prefer `python -m pytest ...` checks against test files over fragile multi-line inline scripts.
-- Command acceptance_checks MUST only reference modules or test paths inside the task's own
-  write_scope or its transitive depends_on ancestors, and NEVER silence failures with 2>/dev/null.
-"""
-
 
 class OrchestrateStage:
     """Deterministic Chronos scheduler driving isolated Hephaestus execution & cold-start review."""
@@ -646,14 +444,7 @@ class OrchestrateStage:
                 if spec is not None
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
-            use_serial_guidance = (
-                design.execution_strategy == ExecutionStrategy.SERIAL_HANDOFF
-                or len(design.modules) <= 1
-            )
-            guidance = (
-                _SERIAL_PLANNER_GUIDANCE if use_serial_guidance else _MODULAR_PLANNER_GUIDANCE
-            )
-            modular_block = guidance.format(topology=topology)
+            modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
         else:
             context_block = (
                 f"Confirmed GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
@@ -858,9 +649,9 @@ class OrchestrateStage:
             actor=f"argus:{task.task_id}",
             max_steps=8,
             trace_path=art_dir / f"review-cycle-{task.review_cycle + 1}.jsonl",
-            synthesize_on_max_steps=True,
         )
         relevant_reqs = [r for r in spec.requirements if r.id in task.requirement_refs]
+        schema_json = json.dumps(ReviewVerdict.model_json_schema(), ensure_ascii=False)
         incremental = task.review_cycle > 0
         prior_ctx = (
             f"\nPrevious cycle rejection feedback:\n{task.last_error}\n"
@@ -887,96 +678,22 @@ class OrchestrateStage:
             f"{prior_ctx}\n"
             f"Command check outputs:\n{check_summary}\n\n"
             f"Git diff / changes:\n{diff_text}\n\n"
-            "Submit your verdict by calling the `submit_review` tool (preferred), "
-            'or reply concisely with `{ "passed": bool, "summary": str, "findings": [...] }` '
-            "or a brief Markdown review summary."
+            f"Set task_id='{task.task_id}', attempt={task.attempt}, "
+            f"incremental_only={str(incremental).lower()}.\n"
+            f"Return ReviewVerdict JSON matching schema:\n{schema_json}"
         )
-
-        submitted: list[ReviewVerdict] = []
-
-        def _handle_submit_review(args: dict[str, Any]) -> str:
-            try:
-                normalized = _normalize_review_payload(
-                    args,
-                    task_id=task.task_id,
-                    attempt=task.attempt,
-                    incremental=incremental,
-                )
-                verdict_obj = ReviewVerdict.model_validate(normalized)
-            except (ValidationError, ValueError) as exc:
-                return f"Error: invalid review verdict ({exc}); fix arguments and resubmit."
-            submitted.append(verdict_obj)
-            return verdict_obj.model_dump_json()
-
-        res = review_loop.run(
+        verdict = run_structured_loop(
+            loop=review_loop,
             system_prompt=_REVIEWER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            extra_tools=(_SUBMIT_REVIEW_TOOL,),
-            extra_tool_handlers={"submit_review": _handle_submit_review},
-            terminal_tools={"submit_review"},
+            model_cls=ReviewVerdict,
+        ).model_copy(
+            update={
+                "task_id": task.task_id,
+                "attempt": task.attempt,
+                "incremental_only": incremental,
+            }
         )
-        if not res.completed and res.stop_reason.startswith("budget_exhausted"):
-            raise RuntimeError(
-                f"AgentLoop stopped before producing final output: {res.stop_reason}"
-            )
-
-        verdict: ReviewVerdict | None = submitted[-1] if submitted else None
-        if verdict is None and res.completed:
-            verdict = _try_parse_review_verdict(
-                res.final_content,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                incremental=incremental,
-            )
-        if (
-            verdict is None
-            and res.completed
-            and not res.final_content.strip().startswith("{")
-            and (
-                _POSITIVE_PROSE_RE.search(res.final_content)
-                or _NEGATIVE_PROSE_RE.search(res.final_content)
-            )
-        ):
-            # Freeform Markdown/prose review from subagent: accept directly without nagging.
-            verdict = _coerce_prose_verdict(
-                res.final_content,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                incremental=incremental,
-            )
-        if verdict is None and res.messages:
-            repair_res = review_loop.complete_repair(
-                prior_messages=res.messages,
-                correction=(
-                    "Please reply with a concise valid JSON object containing only "
-                    '`{"passed": bool, "summary": str, "findings": [...]}` (or plain text '
-                    "stating PASSED or listing blocking defects)."
-                ),
-                step=1,
-            )
-            if not repair_res.completed and repair_res.stop_reason.startswith("budget_exhausted"):
-                raise RuntimeError(
-                    f"AgentLoop stopped before producing final output: {repair_res.stop_reason}"
-                )
-            verdict = _try_parse_review_verdict(
-                repair_res.final_content,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                incremental=incremental,
-            ) or _coerce_prose_verdict(
-                repair_res.final_content,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                incremental=incremental,
-            )
-        if verdict is None:
-            verdict = _coerce_prose_verdict(
-                res.final_content,
-                task_id=task.task_id,
-                attempt=task.attempt,
-                incremental=incremental,
-            )
-
         (art_dir / f"verdict-cycle-{task.review_cycle + 1}.json").write_text(
             verdict.model_dump_json(indent=2), encoding="utf-8"
         )
@@ -1020,7 +737,6 @@ class OrchestrateStage:
             label=f"{run_id}-{leased.task_id}-a{leased.attempt}",
         )
         _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
-        commit_sandbox_baseline(sandbox)
 
         try:
             toolkit = WorkspaceToolkit(

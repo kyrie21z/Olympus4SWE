@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -198,8 +198,6 @@ class AgentLoop:
         system_prompt: str,
         user_prompt: str,
         extra_tools: Sequence[ToolSpec] = (),
-        extra_tool_handlers: Mapping[str, Callable[[dict[str, Any]], str]] | None = None,
-        terminal_tools: Collection[str] = (),
         temperature: float = 0.0,
     ) -> LoopResult:
         tool_list: list[ToolSpec] = []
@@ -342,7 +340,6 @@ class AgentLoop:
             )
 
             tool_outputs: list[dict[str, str]] = []
-            terminal_result: tuple[str, str] | None = None
             if resp.tool_calls:
                 for tc in resp.tool_calls:
                     denied_reason: str | None = None
@@ -373,9 +370,7 @@ class AgentLoop:
                             },
                         )
                         started = time.monotonic()
-                        if extra_tool_handlers is not None and tc.name in extra_tool_handlers:
-                            out = extra_tool_handlers[tc.name](dict(tc.arguments))
-                        elif self.toolkit is None:
+                        if self.toolkit is None:
                             out = f"Error: no toolkit attached to execute tool '{tc.name}'."
                         else:
                             out = self.toolkit.execute(tc.name, tc.arguments)
@@ -391,8 +386,6 @@ class AgentLoop:
                                 "duration_ms": elapsed_ms,
                             },
                         )
-                        if tc.name in terminal_tools and not out.startswith("Error:"):
-                            terminal_result = (tc.name, out)
                     tool_outputs.append({"id": tc.id, "name": tc.name, "output": out})
                     messages.append(
                         ChatMessage(
@@ -422,17 +415,6 @@ class AgentLoop:
                     },
                 }
             )
-
-            if terminal_result is not None:
-                return _finalize_result(
-                    completed=True,
-                    stop_reason=f"tool:{terminal_result[0]}",
-                    final_content=terminal_result[1],
-                    steps_taken=step,
-                    final_messages=messages,
-                    total_input_tokens=total_in,
-                    total_output_tokens=total_out,
-                )
 
             if not resp.tool_calls:
                 return _finalize_result(

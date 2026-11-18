@@ -121,32 +121,6 @@ def create_sandbox(repo_root: Path | str, *, label: str) -> SandboxHandle:
     )
 
 
-def commit_sandbox_baseline(
-    handle: SandboxHandle,
-    *,
-    message: str = "olympus: seed upstream overlay",
-) -> None:
-    """Snapshot copied upstream overlay onto the detached sandbox HEAD so diffs stay local."""
-    ws = handle.workspace_path
-    if not handle.is_git_worktree or not is_git_repo(ws):
-        return
-    status = _run_git(ws, "status", "--porcelain")
-    if not status.stdout.strip():
-        return
-    _run_git(ws, "add", "-A")
-    _run_git(
-        ws,
-        "-c",
-        "user.email=olympus@example.invalid",
-        "-c",
-        "user.name=Olympus",
-        "commit",
-        "--no-verify",
-        "-m",
-        message,
-    )
-
-
 def capture_sandbox_diff(handle: SandboxHandle) -> str:
     """Return tracked diff plus untracked file list/contents for cold-start review."""
     ws = handle.workspace_path

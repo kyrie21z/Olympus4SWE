@@ -857,7 +857,8 @@ button {
   stroke-width: 2;
 }
 
-.dag-node[data-status="accepted"] .dag-node-box {
+.dag-node[data-status="accepted"] .dag-node-box,
+.dag-node[data-status="completed"] .dag-node-box {
   fill: var(--ok-soft);
   stroke: var(--ok);
 }
@@ -869,9 +870,15 @@ button {
 }
 
 .dag-node[data-status="blocked"] .dag-node-box,
-.dag-node[data-status="failed"] .dag-node-box {
+.dag-node[data-status="failed"] .dag-node-box,
+.dag-node[data-status="error"] .dag-node-box {
   fill: var(--bad-soft);
   stroke: var(--bad);
+}
+
+.dag-node[data-status="paused"] .dag-node-box {
+  fill: var(--warn-soft);
+  stroke: var(--warn);
 }
 
 .dag-node[data-risk="true"] .dag-node-box {
@@ -1042,8 +1049,9 @@ table.matrix-table {
   border-collapse: collapse;
   font-size: var(--text-sm);
   --label-2: "来源与需求描述";
-  --label-3: "承接任务";
-  --label-4: "验收状态与证据";
+  --label-3: "设计模块";
+  --label-4: "承接任务";
+  --label-5: "验收状态与证据";
 }
 
 table.matrix-table caption {
@@ -1147,6 +1155,14 @@ table.matrix-table tbody tr:hover {
 
   table.matrix-table td:nth-child(4)::before {
     content: var(--label-4) "：";
+    display: block;
+    font-size: var(--text-xs);
+    letter-spacing: var(--tracking-label);
+    color: var(--text-muted);
+  }
+
+  table.matrix-table td:nth-child(5)::before {
+    content: var(--label-5) "：";
     display: block;
     font-size: var(--text-xs);
     letter-spacing: var(--tracking-label);
@@ -1699,6 +1715,281 @@ dialog::backdrop {
 }
 
 /* ---------------------------------------------------------------------------
+ * Ariadne v3 workbench — threads, new-run dialog, triage, clarify, design
+ * ------------------------------------------------------------------------ */
+
+.rail-new-run {
+  justify-content: flex-start;
+  inline-size: 100%;
+}
+
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-inline-size: 0;
+  max-block-size: 34vh;
+  overflow-y: auto;
+}
+
+.thread-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-inline-size: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--rule);
+  border-inline-start: 2px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  text-align: start;
+  cursor: pointer;
+  transition: background-color var(--motion-fast), border-color var(--motion-fast);
+}
+
+.thread-item:hover {
+  background: var(--surface-sunk);
+  color: var(--text-ink);
+}
+
+.thread-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.thread-item[aria-pressed="true"] {
+  border-inline-start-color: var(--accent);
+  background: var(--surface-raised);
+  color: var(--text-ink);
+}
+
+.thread-item-title {
+  font-weight: var(--font-weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-item-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+  min-inline-size: 0;
+}
+
+.thread-empty {
+  padding-inline-start: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+body[data-rail="collapsed"] .rail-new-run,
+body[data-rail="collapsed"] .thread-list,
+.rail.collapsed .rail-new-run,
+.rail.collapsed .thread-list {
+  display: none;
+}
+
+.stage-inline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-6) 0;
+}
+
+.triage-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--rule);
+  border-inline-start: 3px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface-paper);
+}
+
+.triage-banner[data-maturity="goal_spec_ready"] {
+  border-inline-start-color: var(--live);
+}
+
+.triage-banner[data-maturity="design_spec_ready"] {
+  border-inline-start-color: var(--ok);
+}
+
+.triage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.triage-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.triage-reasons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-inline-start: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.clarify-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-lg);
+  background: var(--surface-paper);
+}
+
+.clarify-items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.clarify-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-block-end: var(--space-3);
+  border-block-end: 1px solid var(--rule);
+}
+
+.clarify-item:last-child {
+  padding-block-end: 0;
+  border-block-end: 0;
+}
+
+.clarify-question {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-base);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-ink);
+}
+
+.clarify-options {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.clarify-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.workflow-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+  padding-block-start: var(--space-2);
+}
+
+.dag-svg .dag-node-kind {
+  font-family: var(--face-mono);
+  font-size: var(--text-xs);
+  fill: var(--text-muted);
+}
+
+.dag-edge[data-conditional="true"] {
+  stroke-dasharray: 5 4;
+}
+
+.wf-node {
+  cursor: pointer;
+}
+
+.design-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-inline-size: 0;
+}
+
+.spec-requirements {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.spec-requirement {
+  padding-block-end: var(--space-2);
+  border-block-end: 1px solid var(--rule);
+}
+
+.spec-requirement:last-child {
+  padding-block-end: 0;
+  border-block-end: 0;
+}
+
+.spec-requirement-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  color: var(--text-ink);
+}
+
+.spec-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.mono {
+  font-family: var(--face-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-inline-size: 0;
+}
+
+.dialog-file-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-block-end: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.legend-dash {
+  display: inline-block;
+  inline-size: 16px;
+  border-block-start: 1px dashed var(--rule-hard);
+  vertical-align: middle;
+}
+
+
+/* ---------------------------------------------------------------------------
  * Responsive — one column, compact horizontal rail, no sideways scroll
  * ------------------------------------------------------------------------ */
 
@@ -1735,6 +2026,18 @@ dialog::backdrop {
   .rail-section-title,
   .rail-foot-label {
     display: none;
+  }
+
+  .rail-new-run {
+    inline-size: auto;
+  }
+
+  .thread-list {
+    display: none;
+  }
+
+  .stage-inline {
+    padding: var(--space-3) var(--space-4) 0;
   }
 
   .rail-nav {
@@ -1832,6 +2135,10 @@ dialog::backdrop {
 @media (max-width: 640px) {
   .stat-band {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .form-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .stat-cell {

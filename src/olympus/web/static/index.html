@@ -29,11 +29,16 @@
         </div>
         <button type="button" class="btn btn-quiet" id="btn-rail-collapse" aria-expanded="true" aria-label="折叠导航">⇤</button>
       </div>
+      <button type="button" class="btn btn-primary rail-new-run" id="btn-new-run">+ 新建编排</button>
       <p class="rail-section-title">视图</p>
       <div class="rail-nav">
         <a class="rail-link" href="#topology" data-view="topology" aria-current="page">
           <span class="rail-glyph" aria-hidden="true">◇</span>
           <span class="rail-label">拓扑</span>
+        </a>
+        <a class="rail-link" href="#design" data-view="design">
+          <span class="rail-glyph" aria-hidden="true">◫</span>
+          <span class="rail-label">架构规格</span>
         </a>
         <a class="rail-link" href="#matrix" data-view="matrix">
           <span class="rail-glyph" aria-hidden="true">▦</span>
@@ -44,6 +49,8 @@
           <span class="rail-label">瀑布</span>
         </a>
       </div>
+      <p class="rail-section-title">编排线程</p>
+      <div class="thread-list" id="thread-list" aria-label="编排线程列表"></div>
       <div class="rail-foot">
         <label class="rail-foot-label" for="run-selector">运行实例</label>
         <div class="rail-foot-controls">
@@ -69,15 +76,41 @@
         <div class="stat-band" id="stat-band" aria-label="运行指标"></div>
         <section class="hitl-banner" id="hitl-banner" data-tone="danger" aria-live="polite" hidden>
           <p class="hitl-headline" id="hitl-headline">正在加载编排状态…</p>
-          <div class="hitl-actions">
+          <div class="hitl-actions" id="hitl-task-actions">
             <button type="button" class="btn btn-primary" id="btn-banner-hint">注入提示</button>
             <button type="button" class="btn" id="btn-banner-inspect">查看定位</button>
             <button type="button" class="btn" id="btn-banner-retry">重试</button>
             <button type="button" class="btn" id="btn-banner-reassign">改派给人</button>
             <button type="button" class="btn btn-danger hitl-risk-sep" id="btn-banner-accept-risk">接受风险</button>
           </div>
+          <div class="hitl-actions" id="hitl-gate-actions">
+            <button type="button" class="btn btn-primary" id="btn-approve-spec" hidden>批准 GoalSpec 进入架构设计</button>
+            <button type="button" class="btn btn-primary" id="btn-approve-design" hidden>批准 DesignSpec 启动任务分解</button>
+            <button type="button" class="btn btn-primary" id="btn-approve-plan" hidden>批准任务计划</button>
+          </div>
         </section>
       </header>
+
+      <div class="stage-inline">
+        <section class="triage-banner" id="triage-banner" data-maturity="raw_intent" hidden aria-live="polite">
+          <div class="triage-head">
+            <span class="triage-title">输入分级</span>
+            <span class="badge" data-variant="muted" id="triage-maturity">raw_intent</span>
+          </div>
+          <ul class="triage-reasons" id="triage-reasons"></ul>
+        </section>
+
+        <section class="clarify-panel" id="clarify-panel" hidden aria-labelledby="clarify-title">
+          <div class="card-head">
+            <h2 class="card-title" id="clarify-title">待澄清问题</h2>
+            <span class="card-note">回答后生成新的 GoalSpec 版本，旧批准指纹随之失效</span>
+          </div>
+          <div class="clarify-items" id="clarify-items"></div>
+          <div class="clarify-actions">
+            <button type="button" class="btn btn-primary" id="btn-clarify-submit">提交澄清并推进</button>
+          </div>
+        </section>
+      </div>
 
       <section class="view" data-pane="topology" id="view-topology" aria-labelledby="topology-title">
         <header class="view-head">
@@ -90,8 +123,18 @@
             <span class="legend-item">◷ 等待</span>
             <span class="legend-item"><span class="legend-swatch" data-tone="critical" aria-hidden="true"></span> 关键路径</span>
             <span class="legend-item"><span class="legend-swatch" data-tone="blocked" aria-hidden="true"></span> 阻塞传递</span>
+            <span class="legend-item"><span class="legend-dash" aria-hidden="true"></span> 条件跳转</span>
           </div>
         </header>
+        <section class="workflow-section" aria-labelledby="workflow-title">
+          <div class="card-head">
+            <h3 class="card-title" id="workflow-title">编排工作流</h3>
+            <span class="card-note" id="workflow-badge">拓扑加载中…</span>
+          </div>
+          <div class="dag-frame scroller">
+            <svg class="dag-svg workflow-svg" id="workflow-svg" role="img" aria-label="工作流拓扑有向图" viewBox="0 0 760 120"></svg>
+          </div>
+        </section>
         <div class="dag-frame scroller">
           <svg class="dag-svg" id="dag-svg" role="img" aria-label="任务依赖有向无环图" viewBox="0 0 760 216"></svg>
         </div>
@@ -104,6 +147,14 @@
         </section>
       </section>
 
+      <section class="view" data-pane="design" id="view-design" aria-labelledby="design-title" hidden>
+        <header class="view-head">
+          <h2 class="view-title" id="design-title">架构规格</h2>
+          <span class="badge" data-variant="muted" id="design-badge">等待规格</span>
+        </header>
+        <div class="design-grid" id="design-body"></div>
+      </section>
+
       <section class="view" data-pane="matrix" id="view-matrix" aria-labelledby="matrix-title" hidden>
         <header class="view-head">
           <h2 class="view-title" id="matrix-title">需求追踪矩阵</h2>
@@ -111,11 +162,12 @@
         </header>
         <div class="table-wrapper scroller" tabindex="0" role="region" aria-labelledby="matrix-caption">
           <table class="matrix-table">
-            <caption id="matrix-caption">需求与任务双向追踪及验收结果表</caption>
+            <caption id="matrix-caption">需求、设计模块、任务与验收结果四级追踪表</caption>
             <thead>
               <tr>
                 <th scope="col">需求编号</th>
                 <th scope="col">来源与需求描述</th>
+                <th scope="col">设计模块</th>
                 <th scope="col">承接任务</th>
                 <th scope="col">验收状态与证据</th>
               </tr>
@@ -162,6 +214,43 @@
       <div id="dock-receipt"></div>
     </aside>
   </div>
+
+  <dialog id="new-run-dialog" closedby="any" aria-labelledby="new-run-dialog-title">
+    <form method="dialog" id="new-run-form">
+      <h2 class="dialog-title" id="new-run-dialog-title">新建编排</h2>
+      <p class="dialog-desc">从一句话需求或既有文档启动一条受控编排线程。每个关口都会停下等待真人批准，不会自动越过。</p>
+      <div class="form-grid">
+        <div class="form-field">
+          <label class="dialog-label" for="new-run-title">标题（可选）</label>
+          <input id="new-run-title" class="field" type="text" placeholder="例如：校园候补递补加固">
+        </div>
+        <div class="form-field">
+          <label class="dialog-label" for="new-run-workflow">工作流</label>
+          <select id="new-run-workflow" class="field"></select>
+        </div>
+        <div class="form-field">
+          <label class="dialog-label" for="new-run-provider">模型提供方</label>
+          <select id="new-run-provider" class="field"></select>
+        </div>
+        <div class="form-field">
+          <label class="dialog-label" for="new-run-model">模型（可选）</label>
+          <input id="new-run-model" class="field" type="text" placeholder="留空使用提供方默认模型">
+        </div>
+      </div>
+      <p class="dialog-desc" id="new-run-workflow-meta"></p>
+      <label class="dialog-label" for="new-run-input">需求原文</label>
+      <textarea id="new-run-input" class="field" rows="8" placeholder="描述目标、可观察面、范围与约束…"></textarea>
+      <div class="dialog-file-row">
+        <button type="button" class="btn" id="btn-new-run-file">导入本地文件</button>
+        <input type="file" id="new-run-file" accept=".md,.txt,.json,.yaml,.yml" hidden>
+        <span class="card-note" id="new-run-file-note">支持 .md / .txt / .json / .yaml / .yml</span>
+      </div>
+      <div class="dialog-actions">
+        <button type="submit" class="btn btn-quiet" value="cancel">取消</button>
+        <button type="submit" class="btn btn-primary" id="new-run-submit" value="create">创建并启动</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="hitl-dialog" closedby="any" aria-labelledby="hitl-dialog-title">
     <form method="dialog" id="hitl-dialog-form">

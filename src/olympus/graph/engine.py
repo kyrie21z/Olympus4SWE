@@ -126,7 +126,12 @@ class Graph:
                 for node in self.nodes.values()
             ],
             "edges": [
-                {"source": source, "target": target}
+                {
+                    "source": source,
+                    "target": target,
+                    # Router fan-out is a runtime decision; the console draws it dashed.
+                    "conditional": source in self.routers,
+                }
                 for source, targets in self.edges.items()
                 for target in targets
                 if source != START

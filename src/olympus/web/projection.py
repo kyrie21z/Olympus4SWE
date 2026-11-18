@@ -19,6 +19,7 @@ from olympus.core.contracts import (
     CritiqueNote,
     CritiquePerspective,
     CritiqueSeverity,
+    DesignSpec,
     GoalSpec,
     RequirementItem,
     ReviewFinding,
@@ -386,6 +387,7 @@ def _build_stage_pipeline(
     snap: dict[str, Any],
     spec_approved: bool,
     plan_approved: bool,
+    design_approved: bool = False,
 ) -> list[dict[str, str]]:
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
@@ -393,7 +395,11 @@ def _build_stage_pipeline(
     tasks = plan.tasks if plan else []
 
     align_state = "done" if spec_approved else ("active" if spec is not None else "pending")
-    design_state = "done" if spec_approved else "pending"
+    design_state = (
+        "done"
+        if design_approved or plan_approved
+        else ("active" if spec_approved else "pending")
+    )
     plan_state = (
         "done" if plan_approved else ("active" if plan is not None and spec_approved else "pending")
     )
@@ -492,14 +498,20 @@ def _build_swimlanes(
 def _build_traceability_matrix(
     spec: GoalSpec | None,
     tasks: list[TaskNode],
+    design: DesignSpec | None = None,
 ) -> list[dict[str, Any]]:
-    """Build Requirement x Design/Source x Task x Verification Status rows."""
+    """Build Requirement x DesignModule x Task x Verification Status rows."""
     if spec is None:
         return []
 
     rows: list[dict[str, Any]] = []
     for req in spec.requirements:
         covering = [t for t in tasks if req.id in t.requirement_refs]
+        design_modules = [
+            {"id": module.id, "name": module.name}
+            for module in (design.modules if design is not None else [])
+            if req.id in module.requirement_refs
+        ]
         if not covering:
             v_status = "pending"
             v_label = "待验证"
@@ -536,6 +548,8 @@ def _build_traceability_matrix(
                 "description": req.description,
                 "source_ref": req.source_ref or "REQ-Baseline",
                 "acceptance_criteria": req.acceptance_criteria,
+                "design_module_ids": [module["id"] for module in design_modules],
+                "design_modules": design_modules,
                 "task_ids": [t.task_id for t in covering],
                 "verification_status": v_status,
                 "verification_label": v_label,
@@ -822,6 +836,7 @@ def _build_workflow_view(
         "stop_after": stop_after,
         "graph": description,
         "nodes": [{"name": name, "status": status} for name, status in statuses.items()],
+        "node_statuses": dict(statuses),
         "current_node": current_node,
         "paused": paused,
         "finished": finished or run_status == RunStatus.COMPLETED,
@@ -839,7 +854,7 @@ def build_run_projection(
     snap = store.get_run(run_id)
     spec: GoalSpec | None = snap["spec"]
     plan: TaskPlan | None = snap["plan"]
-    design = snap.get("design")
+    design: DesignSpec | None = snap.get("design")
     events = store.list_events(run_id, after_seq=0)
     run_dir = (
         artifacts_root
@@ -993,13 +1008,25 @@ def build_run_projection(
             "detail": spec.goal,
             "actions": ["approve_spec"],
         }
+    elif design is not None and not design_approved:
+        hitl_banner = {
+            "kind": "design_gate",
+            "tone": "warn",
+            "task_id": None,
+            "headline": (
+                f"关口 2 待批准：DesignSpec {design.design_id} "
+                f"（{len(design.modules)} 个模块）等待确认后再分解任务"
+            ),
+            "detail": design.architecture_summary,
+            "actions": ["approve_design"],
+        }
     elif plan is not None and not plan_approved:
         hitl_banner = {
             "kind": "plan_gate",
             "tone": "warn",
             "task_id": None,
             "headline": (
-                f"关口 2 待批准：任务计划 {plan.plan_id}（共 {len(tasks)} 个任务）等待批准开工"
+                f"关口 3 待批准：任务计划 {plan.plan_id}（共 {len(tasks)} 个任务）等待批准开工"
             ),
             "detail": (
                 f"绑定需求指纹：{(plan.spec_hash or plan.design_hash or '')[:16]}…"
@@ -1042,7 +1069,9 @@ def build_run_projection(
         "spec_approved": spec_approved,
         "design_approved": design_approved,
         "plan_approved": plan_approved,
-        "stage_pipeline": _build_stage_pipeline(snap, spec_approved, plan_approved),
+        "stage_pipeline": _build_stage_pipeline(
+            snap, spec_approved, plan_approved, design_approved
+        ),
         "budget": {
             "calls_used": ledger.llm_calls_used,
             "calls_reserved": ledger.llm_calls_reserved,
@@ -1074,7 +1103,7 @@ def build_run_projection(
             receipt_by_actor,
             spec_approved=spec_approved,
         ),
-        "traceability_matrix": _build_traceability_matrix(spec, tasks),
+        "traceability_matrix": _build_traceability_matrix(spec, tasks, design),
         "events": [e.model_dump(mode="json") for e in events[-80:]],
         "latest_event_seq": events[-1].event_seq if events else 0,
     }

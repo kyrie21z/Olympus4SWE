@@ -17,11 +17,13 @@ from olympus.core.contracts import (
     ApprovalTarget,
     CheckKind,
     DesignSpec,
+    ExecutionStrategy,
     GoalSpec,
     ReviewSeverity,
     ReviewVerdict,
     RunMode,
     RunStatus,
+    TaskKind,
     TaskNode,
     TaskPlan,
     TaskStatus,
@@ -231,16 +233,92 @@ def _write_manifest_md(
     return manifest_path
 
 
+def _format_design_context(design: DesignSpec | None, *, task: TaskNode) -> str:
+    """Render relevant invariants, readonly contract paths, and typed interface seams."""
+    if design is None:
+        return ""
+    lines: list[str] = ["DesignSpec Constraints & Seams:"]
+    if design.execution_strategy is not None:
+        lines.append(
+            f"- Execution strategy: {design.execution_strategy.value} ({design.strategy_rationale})"
+        )
+    if design.shared_contract_paths:
+        mode_note = (
+            "Wave 0 owner (editable)"
+            if task.kind == TaskKind.CONTRACT
+            else "READ-ONLY shared contracts (DO NOT MODIFY; import only)"
+        )
+        lines.append(
+            f"- Shared contract paths [{mode_note}]: {json.dumps(design.shared_contract_paths)}"
+        )
+    task_refs = set(task.design_refs)
+    matched_invariants = [
+        inv
+        for inv in design.shared_invariants
+        if not inv.applies_to or any(mod in task_refs for mod in inv.applies_to)
+    ]
+    if matched_invariants:
+        lines.append("- Global invariants (MUST obey):")
+        for inv in matched_invariants:
+            hint = f" [hint: {inv.enforcement_hint}]" if inv.enforcement_hint else ""
+            lines.append(f"  * {inv.id} [{inv.category}]: {inv.rule}{hint}")
+    matched_interfaces = [
+        iface
+        for iface in design.interfaces
+        if task.kind == TaskKind.CONTRACT
+        or iface.id in task_refs
+        or iface.provider_module_id in task_refs
+        or any(cid in task_refs for cid in iface.consumer_module_ids)
+    ]
+    if matched_interfaces:
+        lines.append("- Relevant interface contracts:")
+        for iface in matched_interfaces:
+            inputs = ", ".join(
+                f"{f.name}:{f.type_expr}{'?' if not f.required else ''}"
+                for f in iface.input_schema
+            )
+            outputs = ", ".join(
+                f"{f.name}:{f.type_expr}{'?' if not f.required else ''}"
+                for f in iface.output_schema
+            )
+            lines.append(
+                f"  * {iface.id} [{iface.protocol}] {iface.signature} "
+                f"({iface.provider_module_id} -> {iface.consumer_module_ids}) | "
+                f"in=[{inputs}] out=[{outputs}] errors={iface.error_cases}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _format_handoff_context(plan: TaskPlan, *, current_task_id: str) -> str:
+    """Build a compact handoff summary of already-accepted upstream steps for serial_handoff."""
+    done = [
+        t
+        for t in plan.tasks
+        if t.task_id != current_task_id and t.status == TaskStatus.ACCEPTED
+    ]
+    if not done:
+        return ""
+    lines = ["Prior Accepted Handoff Summary (serial_handoff):"]
+    for t in done[-6:]:
+        delivs = ", ".join(t.deliverables) if t.deliverables else ", ".join(t.write_scope)
+        lines.append(f"- {t.task_id} ({t.title}): accepted; deliverables=[{delivs}]")
+    return "\n".join(lines) + "\n"
+
+
 _MODULAR_PLANNER_GUIDANCE = """
 Modular product decomposition (topology={topology}):
-- Emit Wave 0 contract tasks (kind='contract', role='architect') that pin interface
-  signatures and shared data models before any implementation.
+- Emit Wave 0 contract tasks (kind='contract', role='architect') that exclusively own
+  design.shared_contract_paths (plus any Wave 0 contract self-tests in that task's
+  write_scope) and pin interface signatures/data models before any implementation.
 - Emit Wave 1 implementation tasks (kind='implement', role='engineer'), one per design
-  module, each with design_refs naming the module id it realizes.
+  module, each with design_refs naming the module id it realizes. Wave 1/2 tasks MUST
+  NOT list shared_contract_paths in write_scope (they are read-only during Wave 1+).
 - Emit Wave 2 verification tasks (kind='test', role='qa') plus one integration task
   (kind='integrate', role='engineer') when more than one module exists.
 - Every design module id MUST appear in at least one task's design_refs; never invent ids.
 - Tasks in different modules MUST NOT share overlapping write_scope.
+- Command acceptance_checks MUST only reference test/file paths inside the task's own
+  write_scope or already-accepted upstream tasks, and MUST NOT silence failures with 2>/dev/null.
 """
 
 
@@ -556,6 +634,7 @@ class OrchestrateStage:
         diff_text: str,
         check_summary: str,
         art_dir: Path,
+        design: DesignSpec | None = None,
     ) -> ReviewVerdict:
         ro_toolkit = WorkspaceToolkit(sandbox.workspace_path, read_only=True)
         review_loop = AgentLoop(
@@ -583,11 +662,13 @@ class OrchestrateStage:
         )
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
         spec_ctx = _format_spec_context(spec)
+        design_ctx = _format_design_context(design, task=task)
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
             f"TaskNode: {task_summary}\n"
             f"Relevant requirements: {reqs_json}\n"
             f"{spec_ctx}\n"
+            f"{design_ctx}"
             f"Out of scope (MUST NOT be added): {oos_json}\n"
             f"Incremental review cycle={task.review_cycle + 1} (incremental_only={incremental})\n"
             f"{prior_ctx}\n"
@@ -640,6 +721,8 @@ class OrchestrateStage:
         mode: RunMode,
         apply_to_workspace: bool,
         worker_max_steps: int,
+        design: DesignSpec | None = None,
+        handoff_context: str = "",
     ) -> TaskNode:
         leased = self.store.acquire_task_lease(run_id, task_id, actor="chronos")
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
@@ -658,6 +741,11 @@ class OrchestrateStage:
                 read_only=False,
                 env_root=self.workspace_root,
             )
+            forbidden_contracts = (
+                design.shared_contract_paths
+                if design is not None and leased.kind != TaskKind.CONTRACT
+                else ()
+            )
             worker_loop = AgentLoop(
                 provider=self.provider,
                 toolkit=toolkit,
@@ -669,7 +757,9 @@ class OrchestrateStage:
                 synthesize_on_max_steps=True,
                 task_id=leased.task_id,
                 pre_tool_hook=default_write_scope_hook(
-                    leased.write_scope, workspace_root=sandbox.workspace_path
+                    leased.write_scope,
+                    forbidden_globs=forbidden_contracts,
+                    workspace_root=sandbox.workspace_path,
                 ),
             )
             rework_ctx = (
@@ -685,6 +775,8 @@ class OrchestrateStage:
                 ensure_ascii=False,
             )
             spec_ctx = _format_spec_context(spec)
+            design_ctx = _format_design_context(design, task=leased)
+            handoff_block = f"{handoff_context}\n" if handoff_context else ""
             worker_prompt = (
                 f"Sandbox workspace root: {sandbox.workspace_path}\n"
                 f"Task {leased.task_id}: {leased.title}\n"
@@ -693,6 +785,8 @@ class OrchestrateStage:
                 f"implement edits early, verify with targeted commands, and stop once passing).\n"
                 f"Allowed write_scope (relative): {json.dumps(leased.write_scope)}\n"
                 f"{spec_ctx}\n"
+                f"{design_ctx}"
+                f"{handoff_block}"
                 f"Out of scope: {json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
                 f"Acceptance checks: {checks_json}"
                 f"{rework_ctx}"
@@ -771,6 +865,7 @@ class OrchestrateStage:
                 diff_text=diff_text,
                 check_summary=check_summary,
                 art_dir=art_dir,
+                design=design,
             )
             if not verdict.passed:
                 important_lines = [
@@ -876,6 +971,7 @@ class OrchestrateStage:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
         snap = self.store.get_run(run_id)
+        design: DesignSpec | None = snap.get("design")
         plan: TaskPlan | None = snap["plan"]
         if plan is None:
             raise ValueError(f"Run {run_id} has no TaskPlan; propose plan first.")
@@ -889,19 +985,29 @@ class OrchestrateStage:
                 f"TaskPlan {plan.plan_id} ({plan.content_hash}) is not human-approved."
             )
 
-        self.store.set_run_status(run_id, RunStatus.RUNNING, actor="chronos", stage="orchestrate")
+        effective_serial = serial_execution or (
+            design is not None and design.execution_strategy == ExecutionStrategy.SERIAL_HANDOFF
+        )
+        self.store.set_run_status(
+            run_id,
+            RunStatus.RUNNING,
+            actor="chronos",
+            stage="orchestrate",
+            detail={"serial_execution": effective_serial},
+        )
 
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 return snap
+            design = snap.get("design")
             plan = snap["plan"]
             assert plan is not None
             policy = snap["budget_policy"]
 
             ready = compute_dispatchable_tasks(
                 plan,
-                max_concurrent=1 if serial_execution else policy.max_concurrent_tasks,
+                max_concurrent=1 if effective_serial else policy.max_concurrent_tasks,
             )
             if not ready:
                 all_done = all(
@@ -923,6 +1029,11 @@ class OrchestrateStage:
                 return self.store.get_run(run_id)
 
             if len(ready) == 1:
+                handoff = (
+                    _format_handoff_context(plan, current_task_id=ready[0].task_id)
+                    if effective_serial
+                    else ""
+                )
                 self._execute_single_task(
                     run_id=run_id,
                     spec=spec,
@@ -930,6 +1041,8 @@ class OrchestrateStage:
                     mode=snap["mode"],
                     apply_to_workspace=apply_to_workspace,
                     worker_max_steps=worker_max_steps,
+                    design=design,
+                    handoff_context=handoff,
                 )
             else:
                 with ThreadPoolExecutor(max_workers=len(ready)) as pool:
@@ -942,6 +1055,7 @@ class OrchestrateStage:
                             mode=snap["mode"],
                             apply_to_workspace=apply_to_workspace,
                             worker_max_steps=worker_max_steps,
+                            design=design,
                         )
                         for t in ready
                     ]

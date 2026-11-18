@@ -268,3 +268,171 @@ def test_orchestrate_writes_manifest_when_command_checks_fail(tmp_path: Path) ->
         assert "Checks: 0/1 passed" in text
         assert "CHK-1 (command): not passed — Always fails" in text
         assert (attempts_dir / f"attempt-{attempt}" / "check-1-CHK-1.log").is_file()
+
+
+def test_design_spec_v2_readonly_contract_hook_and_serial_handoff(tmp_path: Path) -> None:
+    from olympus.core.contracts import (
+        ApprovalDecision,
+        ApprovalRecord,
+        ApprovalTarget,
+        DesignSpec,
+        ExecutionStrategy,
+        SpecStatus,
+        TaskKind,
+        TaskPlan,
+    )
+    from olympus.harness.hooks import default_write_scope_hook
+
+    # 1. Wave 1 hook rejects edits to shared_contract_paths even if write_scope is broad.
+    hook = default_write_scope_hook(
+        ["src/"],
+        forbidden_globs=["src/contracts/"],
+        workspace_root=tmp_path,
+    )
+    allowed, _ = hook("write_file", {"path": str(tmp_path / "src" / "api" / "app.py")})
+    assert allowed is True
+    denied, reason = hook("write_file", {"path": str(tmp_path / "src" / "contracts" / "dto.py")})
+    assert denied is False
+    assert "read-only shared contract path" in reason
+
+    # 2. ExecutionStrategy.SERIAL_HANDOFF forces sequential execution and injects invariants.
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    design = DesignSpec.model_validate(
+        {
+            "design_id": "design-serial-1",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "Tightly coupled flag engine sharing single config table.",
+            "shared_invariants": [
+                {
+                    "id": "INV-FLAG-01",
+                    "category": "naming_convention",
+                    "rule": "Prefix every feature flag key with 'ff_'.",
+                    "enforcement_hint": "FlagKey validator",
+                }
+            ],
+            "shared_contract_paths": ["contracts/"],
+            "execution_strategy": ExecutionStrategy.SERIAL_HANDOFF.value,
+            "strategy_rationale": "Single config ledger mutates shared schema sequentially.",
+            "modules": [
+                {
+                    "id": "M1",
+                    "name": "Core",
+                    "responsibility": "Flag core",
+                    "requirement_refs": ["R1"],
+                    "target_paths": ["src/flags/"],
+                }
+            ],
+            "interfaces": [],
+            "status": SpecStatus.CONFIRMED.value,
+        }
+    )
+    store.save_design(run_id, design, actor="design")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.DESIGN_SPEC,
+            target_id=design.design_id,
+            target_hash=design.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-serial-1",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "design_id": design.design_id,
+            "design_hash": design.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T0",
+                    "title": "Pin contracts",
+                    "objective": "Create contract file",
+                    "requirement_refs": ["R1"],
+                    "design_refs": ["M1"],
+                    "kind": TaskKind.CONTRACT.value,
+                    "write_scope": ["contracts/"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T0-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "ok",
+                            "command": "python -c 'pass'",
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T1",
+                    "title": "Implement core",
+                    "objective": "Implement flags",
+                    "requirement_refs": ["R1"],
+                    "design_refs": ["M1"],
+                    "depends_on": ["T0"],
+                    "kind": TaskKind.IMPLEMENT.value,
+                    "write_scope": ["src/flags/"],
+                    "acceptance_checks": [
+                        {
+                            "id": "T1-C1",
+                            "kind": CheckKind.COMMAND.value,
+                            "description": "ok",
+                            "command": "python -c 'pass'",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    store.save_plan(run_id, plan, actor="orchestrate")
+    store.record_approval(
+        ApprovalRecord(
+            run_id=run_id,
+            target=ApprovalTarget.TASK_PLAN,
+            target_id=plan.plan_id,
+            target_hash=plan.content_hash,
+            approver="zeus",
+            decision=ApprovalDecision.APPROVED,
+        )
+    )
+
+    seen_prompts: list[str] = []
+
+    def _capture_responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        system = messages[0].content
+        user_msg = messages[-1].content
+        seen_prompts.append(user_msg)
+        if "Independent Verifier (Argus)" in system:
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T0",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "Verified invariants and seams.",
+                        "findings": [],
+                    }
+                )
+            )
+        return LLMResponse(content="Done.")
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_capture_responder),
+        workspace_root=tmp_path,
+    )
+    snap = orch.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.COMPLETED
+    assert any("INV-FLAG-01" in p for p in seen_prompts)
+    assert any("READ-ONLY shared contracts" in p for p in seen_prompts)
+    assert any("Prior Accepted Handoff Summary (serial_handoff)" in p for p in seen_prompts)
+    events = [
+        e for e in store.list_events(run_id) if e.event_type == "run.status_changed"
+    ]
+    assert any(e.payload.get("serial_execution") is True for e in events)

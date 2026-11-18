@@ -59,6 +59,19 @@ DESIGN_SPEC: dict[str, object] = {
     "architecture_summary": "Thin HTTP edge over a storage core",
     "spec_id": "spec-inventory",
     "spec_hash": "sha256:placeholder",
+    "shared_invariants": [
+        {
+            "id": "INV-ERR-1",
+            "category": "error_envelope",
+            "rule": "Return JSON {'error': {'code': str, 'message': str}} on every 4xx/5xx",
+            "enforcement_hint": "shared error handler",
+        }
+    ],
+    "shared_contract_paths": ["src/contracts.py"],
+    "execution_strategy": "contract_first_parallel",
+    "strategy_rationale": (
+        "API and Store share only src/contracts.py pinned in Wave 0, enabling safe parallel Wave 1."
+    ),
     "modules": [
         {
             "id": "M1",
@@ -82,6 +95,14 @@ DESIGN_SPEC: dict[str, object] = {
             "provider_module_id": "M2",
             "consumer_module_ids": ["M1"],
             "signature": "create_item(name: str) -> Item",
+            "input_schema": [
+                {"name": "name", "type_expr": "str", "required": True, "constraints": "non-empty"}
+            ],
+            "output_schema": [
+                {"name": "id", "type_expr": "str", "required": True},
+                {"name": "name", "type_expr": "str", "required": True},
+            ],
+            "data_entity_refs": ["Item"],
             "error_cases": ["duplicate name"],
         }
     ],

@@ -514,3 +514,133 @@ def test_triage_downgrades_incomplete_design_payloads() -> None:
         ],
     }
     assert triage_input(overlapping).maturity == InputMaturity.RAW_INTENT
+
+
+def test_design_spec_v2_invariants_cycles_contracts_and_strategy() -> None:
+    from olympus.core.contracts import ExecutionStrategy, TaskKind
+
+    spec = _canonical_spec()
+    v1_design = _design(spec)
+    assert validate_design_spec(v1_design, spec, strict_v2=False) == []
+    # Reloading a stripped v1 JSON row preserves exact v1 content_hash.
+    v1_raw = json.dumps(
+        {
+            "design_id": v1_design.design_id,
+            "version": 1,
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "architecture_summary": "HTTP edge over a storage core",
+            "modules": [m.model_dump(mode="json") for m in v1_design.modules],
+            "data_models": [d.model_dump(mode="json") for d in v1_design.data_models],
+            "interfaces": [
+                {
+                    "id": i.id,
+                    "provider_module_id": i.provider_module_id,
+                    "consumer_module_ids": i.consumer_module_ids,
+                    "protocol": i.protocol,
+                    "signature": i.signature,
+                    "error_cases": i.error_cases,
+                }
+                for i in v1_design.interfaces
+            ],
+        }
+    )
+    assert DesignSpec.model_validate_json(v1_raw).content_hash == v1_design.content_hash
+    # Strict v2 gate rejects missing invariants/strategy/typed schemas.
+    strict_v1_errors = validate_design_spec(v1_design, spec, strict_v2=True)
+    assert any("shared_invariants" in e for e in strict_v1_errors)
+    assert any("execution_strategy" in e for e in strict_v1_errors)
+    assert any("input_schema" in e for e in strict_v1_errors)
+
+    v2_design = _design(
+        spec,
+        shared_invariants=[
+            {
+                "id": "INV-ERR-01",
+                "category": "error_envelope",
+                "rule": "Return JSON {error: {code, message}} on every non-2xx path.",
+                "enforcement_hint": "shared exception mapper",
+                "applies_to": ["M1", "M2"],
+            }
+        ],
+        shared_contract_paths=["src/contracts/"],
+        execution_strategy=ExecutionStrategy.CONTRACT_FIRST_PARALLEL.value,
+        strategy_rationale="M1 and M2 communicate strictly via src/contracts/ pinned in Wave 0.",
+        interfaces=[
+            {
+                "id": "IF1",
+                "provider_module_id": "M2",
+                "consumer_module_ids": ["M1"],
+                "protocol": "python_fn",
+                "signature": "create_item(name: str) -> Item",
+                "input_schema": [
+                    {"name": "name", "type_expr": "str", "required": True, "constraints": "1..80"}
+                ],
+                "output_schema": [
+                    {"name": "id", "type_expr": "str", "required": True},
+                    {"name": "name", "type_expr": "str", "required": True},
+                ],
+                "data_entity_refs": ["Item"],
+                "error_cases": ["duplicate name"],
+            }
+        ],
+    )
+    assert validate_design_spec(v2_design, spec, strict_v2=True) == []
+    md = v2_design.to_markdown()
+    assert "INV-ERR-01" in md
+    assert "contract_first_parallel" in md
+    assert "src/contracts/" in md
+
+    # Shared contract path overlapping module target_paths is rejected.
+    bad_overlap = _design(spec, shared_contract_paths=["src/core/contracts.py"])
+    assert any("shared_contract_paths overlaps" in e for e in validate_design_spec(bad_overlap))
+
+    # Cyclic module dependency graph (M1 -> M2 -> M1) is caught via Kahn check.
+    cyclic = _design(
+        spec,
+        interfaces=[
+            {
+                "id": "IF1",
+                "provider_module_id": "M2",
+                "consumer_module_ids": ["M1"],
+                "signature": "a() -> None",
+                "error_cases": ["err"],
+            },
+            {
+                "id": "IF2",
+                "provider_module_id": "M1",
+                "consumer_module_ids": ["M2"],
+                "signature": "b() -> None",
+                "error_cases": ["err"],
+            },
+        ],
+    )
+    assert any("cycle" in e for e in validate_design_spec(cyclic, spec))
+
+    # Non-contract TaskNode cannot declare shared_contract_paths in write_scope.
+    bad_plan = TaskPlan(
+        plan_id="plan-bad-contract-scope",
+        design_id=v2_design.design_id,
+        design_hash=v2_design.content_hash,
+        tasks=[
+            _task(
+                "T0",
+                requirement_refs=["R1"],
+                design_refs=["IF1"],
+                write_scope=["src/contracts/models.py"],
+                kind=TaskKind.CONTRACT,
+            ),
+            _task(
+                "T1",
+                requirement_refs=["R1", "R2"],
+                design_refs=["M1", "M2"],
+                depends_on=["T0"],
+                write_scope=["src/api/", "src/core/", "src/contracts/models.py"],
+                kind=TaskKind.IMPLEMENT,
+            ),
+        ],
+    )
+    assert any(
+        "only kind='contract' tasks may write shared contracts" in v
+        for v in validate_plan(bad_plan, spec, design=v2_design)
+    )

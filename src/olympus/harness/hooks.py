@@ -43,10 +43,20 @@ def _relative_target(raw: str, workspace_root: Path | None) -> str:
 def default_write_scope_hook(
     allowed_globs: Sequence[str],
     *,
+    forbidden_globs: Sequence[str] = (),
     workspace_root: Path | None = None,
 ) -> PreToolUseHook:
-    """Build a hook that denies write tools targeting paths outside ``allowed_globs``."""
+    """Build a hook that denies writes outside ``allowed_globs`` or inside ``forbidden_globs``."""
     patterns = _normalize_patterns(allowed_globs)
+    forbidden_patterns = _normalize_patterns(forbidden_globs)
+
+    def _matches(rel: str, pats: list[str]) -> bool:
+        for pattern in pats:
+            if fnmatch.fnmatch(rel, pattern):
+                return True
+            if not pattern.endswith("*") and rel.startswith(f"{pattern.rstrip('/')}/"):
+                return True
+        return False
 
     def hook(tool_name: str, arguments: dict[str, Any]) -> tuple[bool, str]:
         if tool_name in _READ_ONLY_TOOLS:
@@ -58,7 +68,13 @@ def default_write_scope_hook(
 
         raw_path = arguments.get("path") or arguments.get("file_path") or ""
         rel = _relative_target(str(raw_path), workspace_root)
-        if any(fnmatch.fnmatch(rel, pattern) for pattern in patterns):
+        if forbidden_patterns and _matches(rel, forbidden_patterns):
+            return (
+                False,
+                f"Target path '{rel}' is a read-only shared contract path "
+                f"({list(forbidden_globs)}): only contract tasks may modify it.",
+            )
+        if _matches(rel, patterns):
             return True, ""
         return (
             False,

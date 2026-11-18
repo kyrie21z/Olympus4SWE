@@ -64,29 +64,37 @@ class ExtractionProbe(StrictModel):
 
 
 _DESIGN_SYSTEM_PROMPT = """You are the Stage 1.5 White-Box Solution Architect (Metis) of
-Olympus4SWE. Turn the frozen GoalSpec into a DesignSpec JSON object that a modular
-planner can decompose without guessing.
+Olympus4SWE. Turn the frozen GoalSpec into a DesignSpec v2 JSON object that prevents
+implicit decision drift and module boundary conflicts.
 Rules:
-1. Module boundaries: each module owns an exclusive `target_paths` list (repo-relative
+1. Global invariants (`shared_invariants`): lock at least 1 cross-cutting rule BEFORE
+   module slicing (error envelope format, ID scheme, UTC ISO-8601 time encoding, config,
+   validation). Categories: `error_envelope`, `id_format`, `time_encoding`, `concurrency`,
+   `naming_convention`, `config`, `validation`, `security`.
+2. Shared contract paths (`shared_contract_paths`): declare repo-relative paths/dirs
+   for Wave 0 contract code/schemas (owned exclusively by `kind='contract'` tasks in Wave 0,
+   strictly read-only for Wave 1+ workers). `shared_contract_paths` MUST NOT overlap any
+   module's `target_paths`.
+3. Module boundaries: each module owns an exclusive `target_paths` list (repo-relative
    files or directory prefixes). Paths of any two modules MUST NOT overlap.
-2. Full coverage: every GoalSpec requirement id appears in at least one module's
+4. Full coverage: every GoalSpec requirement id appears in at least one module's
    `requirement_refs`; never invent requirement ids.
-3. Interface seams: whenever two or more modules exist, declare at least one
-   InterfaceContract naming the provider module, its consumers, the signature, and the
-   error cases.
-4. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
-5. Stay white-box: name real files/directories, never a single monolith, never `src/` as
-   a whole, and never leave `target_paths` empty.
-6. State-first & cohesion discipline: derive DataEntity structures before slicing modules,
-   keep module count cohesive (typically 3-6 orthogonal modules for product apps instead of
-   micro-module sprawl), and pin concrete request/response fields + error cases on every
-   InterfaceContract.
-7. Set spec_id and spec_hash to the frozen values supplied in the prompt.
-8. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
+5. Typed acyclic interface seams: whenever two or more modules exist, declare at least
+   one InterfaceContract with provider, consumers, signature, non-empty `input_schema`
+   (`SchemaField` list), non-empty `output_schema`, `data_entity_refs`, and non-empty
+   `error_cases`. Module dependencies (`consumer -> provider`) MUST be acyclic (no cycles).
+6. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
+7. Explicit execution strategy: set `execution_strategy` to `'contract_first_parallel'`
+   (when modules can implement orthogonally after Wave 0 contracts) or `'serial_handoff'`
+   (when tightly coupled / single write-lock / sequential refactor is safer), plus a
+   concrete `strategy_rationale` (>= 10 chars).
+8. Stay white-box & cohesive: name real files/directories, keep module count 2-6
+   orthogonal modules, and set `spec_id` and `spec_hash` to the frozen prompt values.
+9. Language Mirroring & Greenfield Paths: Match the natural language of the GoalSpec for
    human-facing text (`architecture_summary`, `name`, `responsibility`, `notes`,
-   `risks_and_tradeoffs`); for greenfield products unrelated to the host workspace, choose
-   clean standalone repo-relative `target_paths` (e.g. `backend/...`, `frontend/...`).
-9. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+   `strategy_rationale`, `risks_and_tradeoffs`); for greenfield products unrelated to the
+   host workspace, choose clean standalone repo-relative `target_paths`.
+10. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:
@@ -418,7 +426,7 @@ class DesignStage:
                     "status": SpecStatus.AWAITING_HUMAN,
                 }
             )
-            violations = validate_design_spec(candidate, spec)
+            violations = validate_design_spec(candidate, spec, strict_v2=True)
             if not violations:
                 design = candidate
                 break

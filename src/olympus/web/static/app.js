@@ -702,7 +702,37 @@
     });
   }
 
+  function formatSchemaFields(fields) {
+    return (fields || [])
+      .map(
+        (field) =>
+          `${field.name}: ${field.type_expr}${field.required === false ? "?" : ""}${
+            field.constraints ? ` (${field.constraints})` : ""
+          }`
+      )
+      .join(", ");
+  }
+
   function renderDesignSpecCard(design, projection) {
+    const invariants = design.shared_invariants || [];
+    const invariantBlock = invariants.length
+      ? uiTable({
+          className: "matrix-table",
+          caption: "全局不变量（防跨模块隐性漂移）",
+          columns: ["编号", "类别", "全局规则", "适用范围 / 提示"],
+          rows: invariants.map((inv) => [
+            `<span class="mono">${esc(inv.id)}</span>`,
+            uiBadge(inv.category || "rule", "muted"),
+            esc(inv.rule),
+            `${esc((inv.applies_to || []).join(", ") || "全局")}${
+              inv.enforcement_hint ? ` · <span class="card-note">${esc(inv.enforcement_hint)}</span>` : ""
+            }`,
+          ]),
+        })
+      : uiCard(
+          "全局不变量",
+          '<p class="view-note">v1 规格未声明结构化全局不变量（DesignSpec v2 新建架构将强制校验）。</p>'
+        );
     const moduleTable = uiTable({
       className: "matrix-table",
       caption: "模块边界与独占写入路径",
@@ -726,24 +756,46 @@
       )
       .join("");
     const interfaces = (design.interfaces || [])
-      .map(
-        (iface) =>
-          `<li><strong class="mono">${esc(iface.id)}</strong> ${uiBadge(
-            iface.protocol || "http_or_fn",
-            "muted"
-          )} <span class="mono">${esc(iface.signature)}</span><br><span class="card-note">${esc(
-            iface.provider_module_id
-          )} → ${esc((iface.consumer_module_ids || []).join(", ") || "external")}</span>${
-            (iface.error_cases || []).length
-              ? `<br><span class="card-note">错误：${esc((iface.error_cases || []).join("；"))}</span>`
-              : ""
-          }</li>`
-      )
+      .map((iface) => {
+        const inText = formatSchemaFields(iface.input_schema);
+        const outText = formatSchemaFields(iface.output_schema);
+        const refsText = (iface.data_entity_refs || []).join(", ");
+        return `<li><strong class="mono">${esc(iface.id)}</strong> ${uiBadge(
+          iface.protocol || "http_or_fn",
+          "muted"
+        )} <span class="mono">${esc(iface.signature)}</span><br><span class="card-note">${esc(
+          iface.provider_module_id
+        )} → ${esc((iface.consumer_module_ids || []).join(", ") || "external")}</span>${
+          inText
+            ? `<br><span class="card-note">入参：<span class="mono">${esc(inText)}</span></span>`
+            : ""
+        }${
+          outText
+            ? `<br><span class="card-note">出参：<span class="mono">${esc(outText)}</span></span>`
+            : ""
+        }${
+          refsText
+            ? `<br><span class="card-note">实体：<span class="mono">${esc(refsText)}</span></span>`
+            : ""
+        }${
+          (iface.error_cases || []).length
+            ? `<br><span class="card-note">错误：${esc((iface.error_cases || []).join("；"))}</span>`
+            : ""
+        }</li>`;
+      })
       .join("");
     const risks = (design.risks_and_tradeoffs || [])
       .map((risk) => `<li>${esc(risk)}</li>`)
       .join("");
-    const body = [
+    const strategy = design.execution_strategy;
+    const strategyMeta =
+      strategy === "contract_first_parallel"
+        ? uiBadge("契约先行并发", "ok")
+        : strategy === "serial_handoff"
+          ? uiBadge("串行顺序接力", "warn")
+          : "";
+    const contractPaths = (design.shared_contract_paths || []).join(", ");
+    const bodyRows = [
       uiRow(
         "架构摘要",
         `${esc(design.architecture_summary)} ${uiBadge(
@@ -751,16 +803,40 @@
           projection.design_approved ? "ok" : "warn"
         )}`
       ),
+    ];
+    if (strategyMeta) {
+      bodyRows.push(
+        uiRow(
+          "执行策略",
+          `${strategyMeta}${
+            design.strategy_rationale
+              ? ` <span class="card-note">${esc(design.strategy_rationale)}</span>`
+              : ""
+          }`
+        )
+      );
+    }
+    if (contractPaths) {
+      bodyRows.push(
+        uiRow(
+          "共享契约域",
+          `${esc(contractPaths)} ${uiBadge("W0 写 · W1 只读", "muted")}`,
+          { mono: true }
+        )
+      );
+    }
+    bodyRows.push(
       uiRow("绑定需求", esc(design.spec_id || "（未绑定）"), { mono: true }),
       uiRow(
         "指纹",
         `${esc(String(design.content_hash || "").slice(0, 16))}… · v${esc(design.version || 1)}`,
         { mono: true }
-      ),
-    ].join("");
+      )
+    );
+    const body = bodyRows.join("");
     return uiCard(
       "DesignSpec · 白盒设计",
-      `<div class="kv">${body}</div>${moduleTable}${uiCard(
+      `<div class="kv">${body}</div>${invariantBlock}${moduleTable}${uiCard(
         "数据模型",
         `<ul class="spec-list">${dataModels || "<li>（无）</li>"}</ul>`
       )}${uiCard(

@@ -6,7 +6,16 @@ import re
 from collections import deque
 from pathlib import Path, PurePosixPath
 
-from olympus.core.contracts import CheckKind, DesignSpec, GoalSpec, TaskNode, TaskPlan, TaskStatus
+from olympus.core.contracts import (
+    CheckKind,
+    DesignSpec,
+    ExecutionStrategy,
+    GoalSpec,
+    TaskKind,
+    TaskNode,
+    TaskPlan,
+    TaskStatus,
+)
 
 
 class PlanValidationError(ValueError):
@@ -206,8 +215,13 @@ def validate_goal_spec(
     return violations
 
 
-def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> list[str]:
-    """Zero-token gate for module boundaries, data ownership, interface seams, and coverage."""
+def validate_design_spec(
+    design: DesignSpec,
+    spec: GoalSpec | None = None,
+    *,
+    strict_v2: bool = False,
+) -> list[str]:
+    """Zero-token gate for invariants, shared contract seams, module cycles, and coverage."""
     violations: list[str] = []
 
     module_ids: set[str] = set()
@@ -226,6 +240,13 @@ def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> li
                 violations.append(f"Design module {module.id} invalid target_path ({raw}): {exc}")
         normalized[module.id] = paths
 
+    shared_norm: list[str] = []
+    for raw in design.shared_contract_paths:
+        try:
+            shared_norm.append(normalize_scope_path(raw))
+        except ValueError as exc:
+            violations.append(f"DesignSpec invalid shared_contract_path ({raw}): {exc}")
+
     ordered_ids = list(module_ids)
     for i in range(len(ordered_ids)):
         for j in range(i + 1, len(ordered_ids)):
@@ -240,6 +261,30 @@ def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> li
                     f"Design modules {left} and {right} have overlapping target_paths: {pairs}"
                 )
 
+    if shared_norm:
+        for mod_id in ordered_ids:
+            try:
+                shared_conflicts = scopes_overlap(shared_norm, normalized.get(mod_id, []))
+            except ValueError:
+                shared_conflicts = []
+            if shared_conflicts:
+                pairs = ", ".join(f"{a}<->{b}" for a, b in shared_conflicts)
+                violations.append(
+                    f"shared_contract_paths overlaps module {mod_id} target_paths: {pairs}"
+                )
+
+    invariant_ids: set[str] = set()
+    for inv in design.shared_invariants:
+        if inv.id in invariant_ids:
+            violations.append(f"Duplicate global invariant id: {inv.id}")
+        invariant_ids.add(inv.id)
+        for mod_id in inv.applies_to:
+            if mod_id not in module_ids:
+                violations.append(
+                    f"GlobalInvariant {inv.id} applies_to unknown module '{mod_id}'"
+                )
+
+    entity_names = {entity.name for entity in design.data_models}
     for entity in design.data_models:
         if entity.owner_module_id not in module_ids:
             violations.append(
@@ -248,6 +293,8 @@ def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> li
             )
 
     interface_ids: set[str] = set()
+    mod_edges: dict[str, set[str]] = {mid: set() for mid in module_ids}
+    mod_in_degree: dict[str, int] = {mid: 0 for mid in module_ids}
     for iface in design.interfaces:
         if iface.id in interface_ids:
             violations.append(f"Duplicate interface contract id: {iface.id}")
@@ -263,11 +310,80 @@ def validate_design_spec(design: DesignSpec, spec: GoalSpec | None = None) -> li
                     f"Interface {iface.id} consumer_module_id '{consumer}' "
                     "is not a declared design module"
                 )
+            elif consumer == iface.provider_module_id:
+                violations.append(
+                    f"Interface {iface.id} introduces a self-dependency cycle on {consumer}"
+                )
+            elif (
+                iface.provider_module_id in module_ids
+                and iface.provider_module_id not in mod_edges[consumer]
+            ):
+                mod_edges[consumer].add(iface.provider_module_id)
+                mod_in_degree[iface.provider_module_id] += 1
+        for ref in iface.data_entity_refs:
+            if ref not in entity_names:
+                violations.append(
+                    f"Interface {iface.id} references unknown DataEntity '{ref}'"
+                )
+
+    # Kahn topological sort on consumer -> provider dependencies to forbid module cycles
+    mod_queue = deque(mid for mid, deg in mod_in_degree.items() if deg == 0)
+    visited_mods = 0
+    while mod_queue:
+        cur = mod_queue.popleft()
+        visited_mods += 1
+        for dep_provider in mod_edges[cur]:
+            mod_in_degree[dep_provider] -= 1
+            if mod_in_degree[dep_provider] == 0:
+                mod_queue.append(dep_provider)
+    if visited_mods < len(module_ids):
+        cyclic = sorted(mid for mid, deg in mod_in_degree.items() if deg > 0)
+        violations.append(
+            f"DesignSpec module dependency graph contains a cycle involving: {', '.join(cyclic)}"
+        )
 
     if len(design.modules) > 1 and not design.interfaces:
         violations.append(
             "Multi-module design requires at least one interface contract (seam closure)"
         )
+
+    if strict_v2:
+        if not design.shared_invariants:
+            violations.append(
+                "DesignSpec v2 requires at least one shared_invariants rule "
+                "(e.g. error_envelope, id_format, time_encoding)"
+            )
+        if design.execution_strategy is None:
+            violations.append(
+                "DesignSpec v2 requires execution_strategy "
+                "('contract_first_parallel' or 'serial_handoff')"
+            )
+        elif len(design.strategy_rationale.strip()) < 10:
+            violations.append(
+                "DesignSpec v2 requires a non-trivial strategy_rationale (>= 10 characters)"
+            )
+        if len(design.modules) > 1:
+            for iface in design.interfaces:
+                if not iface.input_schema:
+                    violations.append(
+                        f"Interface {iface.id} is missing typed input_schema fields"
+                    )
+                if not iface.output_schema:
+                    violations.append(
+                        f"Interface {iface.id} is missing typed output_schema fields"
+                    )
+                if not iface.error_cases:
+                    violations.append(
+                        f"Interface {iface.id} is missing explicit error_cases"
+                    )
+            if (
+                design.execution_strategy == ExecutionStrategy.CONTRACT_FIRST_PARALLEL
+                and not shared_norm
+            ):
+                violations.append(
+                    "execution_strategy='contract_first_parallel' with multiple modules "
+                    "requires non-empty shared_contract_paths for Wave 0 contract lock"
+                )
 
     if spec is not None:
         if design.spec_id is None:
@@ -410,6 +526,21 @@ def validate_plan(
             violations.append(
                 "Design modules not referenced by any task: " + ", ".join(orphan_modules)
             )
+        if design.shared_contract_paths:
+            for task in plan.tasks:
+                if task.kind == TaskKind.CONTRACT:
+                    continue
+                try:
+                    c_hits = scopes_overlap(task.write_scope, design.shared_contract_paths)
+                except ValueError:
+                    c_hits = []
+                if c_hits:
+                    pairs = ", ".join(f"{a}<->{b}" for a, b in c_hits)
+                    violations.append(
+                        f"Task {task.task_id} ({task.kind.value}) write_scope overlaps "
+                        f"shared_contract_paths ({pairs}); only kind='contract' tasks "
+                        "may write shared contracts."
+                    )
 
     # Independent sibling tasks must have disjoint write_scopes
     if visited == len(by_id):

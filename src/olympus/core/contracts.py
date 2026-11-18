@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, Literal, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -223,6 +223,41 @@ class GoalSpec(FingerprintedModel):
         return blockers
 
 
+class GlobalInvariant(StrictModel):
+    """Cross-cutting rule locked before parallel or sequential module implementation."""
+
+    id: str = Field(min_length=1)
+    category: Literal[
+        "error_envelope",
+        "id_format",
+        "time_encoding",
+        "concurrency",
+        "naming_convention",
+        "config",
+        "validation",
+        "security",
+    ]
+    rule: str = Field(min_length=1)
+    enforcement_hint: str = ""
+    applies_to: list[str] = Field(default_factory=list)
+
+
+class SchemaField(StrictModel):
+    """Typed parameter or payload field on a module interface seam."""
+
+    name: str = Field(min_length=1)
+    type_expr: str = Field(min_length=1)
+    required: bool = True
+    constraints: str = ""
+
+
+class ExecutionStrategy(StrEnum):
+    """Explicit concurrency vs. sequential-handoff verdict for Stage 2 execution."""
+
+    SERIAL_HANDOFF = "serial_handoff"
+    CONTRACT_FIRST_PARALLEL = "contract_first_parallel"
+
+
 class DesignModule(StrictModel):
     """One white-box module boundary with an exclusive target path scope."""
 
@@ -248,25 +283,51 @@ class InterfaceContract(StrictModel):
     consumer_module_ids: list[str] = Field(default_factory=list)
     protocol: str = "http_or_fn"
     signature: str = Field(min_length=1)
+    input_schema: list[SchemaField] = Field(default_factory=list)
+    output_schema: list[SchemaField] = Field(default_factory=list)
+    data_entity_refs: list[str] = Field(default_factory=list)
     error_cases: list[str] = Field(default_factory=list)
 
 
 class DesignSpec(FingerprintedModel):
-    """White-box design: modules, data ownership, and interface seams."""
+    """White-box design: invariants, contract seams, modules, data ownership, and strategy."""
 
     design_id: str = Field(default_factory=lambda: new_id("design"))
     version: int = Field(default=1, ge=1)
     spec_id: str | None = None
     spec_hash: str | None = None
     architecture_summary: str = Field(min_length=1)
+    shared_invariants: list[GlobalInvariant] = Field(default_factory=list)
+    shared_contract_paths: list[str] = Field(default_factory=list)
     modules: list[DesignModule] = Field(min_length=1)
     data_models: list[DataEntity] = Field(default_factory=list)
     interfaces: list[InterfaceContract] = Field(default_factory=list)
+    execution_strategy: ExecutionStrategy | None = None
+    strategy_rationale: str = ""
     risks_and_tradeoffs: list[str] = Field(default_factory=list)
     status: SpecStatus = SpecStatus.DRAFT
 
     def _hash_payload(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        payload = self.model_dump(exclude={"status", "content_hash"}, mode="python")
+        # Preserve exact v1 content_hash when v2-only fields are empty defaults.
+        if not payload.get("shared_invariants"):
+            payload.pop("shared_invariants", None)
+        if not payload.get("shared_contract_paths"):
+            payload.pop("shared_contract_paths", None)
+        if payload.get("execution_strategy") is None:
+            payload.pop("execution_strategy", None)
+        elif isinstance(self.execution_strategy, ExecutionStrategy):
+            payload["execution_strategy"] = self.execution_strategy.value
+        if not payload.get("strategy_rationale"):
+            payload.pop("strategy_rationale", None)
+        for iface in payload.get("interfaces", []):
+            if not iface.get("input_schema"):
+                iface.pop("input_schema", None)
+            if not iface.get("output_schema"):
+                iface.pop("output_schema", None)
+            if not iface.get("data_entity_refs"):
+                iface.pop("data_entity_refs", None)
+        return payload
 
     def to_markdown(self) -> str:
         lines = [
@@ -275,14 +336,33 @@ class DesignSpec(FingerprintedModel):
             f"- Status: {self.status.value}",
             f"- Bound spec: {self.spec_id or '(none)'}",
             f"- Spec hash: {self.spec_hash or '(none)'}",
-            "",
-            "## Architecture",
-            "",
-            self.architecture_summary,
-            "",
-            "## Modules",
-            "",
         ]
+        if self.execution_strategy is not None:
+            lines.append(f"- Execution strategy: {self.execution_strategy.value}")
+        if self.strategy_rationale:
+            lines.append(f"- Strategy rationale: {self.strategy_rationale}")
+        if self.shared_contract_paths:
+            lines.append(
+                f"- Shared contract paths (W0 write / W1 read-only): "
+                f"{', '.join(self.shared_contract_paths)}"
+            )
+        lines.extend(
+            [
+                "",
+                "## Architecture",
+                "",
+                self.architecture_summary,
+                "",
+            ]
+        )
+        if self.shared_invariants:
+            lines.extend(["## Global invariants", ""])
+            for inv in self.shared_invariants:
+                scope = ", ".join(inv.applies_to) if inv.applies_to else "global"
+                hint = f" — hint: {inv.enforcement_hint}" if inv.enforcement_hint else ""
+                lines.append(f"- {inv.id} [{inv.category}] ({scope}): {inv.rule}{hint}")
+            lines.append("")
+        lines.extend(["## Modules", ""])
         for module in self.modules:
             lines.extend(
                 [
@@ -311,6 +391,22 @@ class DesignSpec(FingerprintedModel):
                     f"- {iface.id} [{iface.protocol}] {iface.signature} "
                     f"({iface.provider_module_id} -> {consumers})"
                 )
+                if iface.input_schema:
+                    inputs = ", ".join(
+                        f"{f.name}: {f.type_expr}{'?' if not f.required else ''}"
+                        for f in iface.input_schema
+                    )
+                    lines.append(f"  - Input: {inputs}")
+                if iface.output_schema:
+                    outputs = ", ".join(
+                        f"{f.name}: {f.type_expr}{'?' if not f.required else ''}"
+                        for f in iface.output_schema
+                    )
+                    lines.append(f"  - Output: {outputs}")
+                if iface.data_entity_refs:
+                    lines.append(f"  - Data entities: {', '.join(iface.data_entity_refs)}")
+                if iface.error_cases:
+                    lines.append(f"  - Errors: {', '.join(iface.error_cases)}")
             lines.append("")
         if self.risks_and_tradeoffs:
             lines.extend(["## Risks and tradeoffs", ""])

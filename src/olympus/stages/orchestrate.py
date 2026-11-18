@@ -871,6 +871,7 @@ class OrchestrateStage:
         run_id: str,
         apply_to_workspace: bool = False,
         worker_max_steps: int = 20,
+        serial_execution: bool = False,
     ) -> dict[str, Any]:
         """Execute ready tasks respecting DAG dependencies, write_scope, and convergence rules."""
         spec = self._require_confirmed_spec(run_id)
@@ -900,7 +901,7 @@ class OrchestrateStage:
 
             ready = compute_dispatchable_tasks(
                 plan,
-                max_concurrent=policy.max_concurrent_tasks,
+                max_concurrent=1 if serial_execution else policy.max_concurrent_tasks,
             )
             if not ready:
                 all_done = all(

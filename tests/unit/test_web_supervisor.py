@@ -416,3 +416,62 @@ def test_sse_stream_carries_graph_events(
         assert "graph.node_started" in event_types
         assert "graph.paused" in event_types
         assert "run.created" in event_types
+
+
+def test_supervisor_restart_recovery_and_env_file_provider_detection(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    env_file = tmp_path / "custom.env"
+    env_file.write_text("CUSTOM_SECRET_TOKEN=dummy-local-test-value\n", encoding="utf-8")
+    olympus_dir = tmp_path / ".olympus"
+    olympus_dir.mkdir(parents=True, exist_ok=True)
+    (olympus_dir / "providers.json").write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "id": "custom_env_provider",
+                        "dialect": "openai-chat",
+                        "default_model": "custom-model",
+                        "base_url": "https://example.invalid/v1",
+                        "api_key_env": "CUSTOM_SECRET_TOKEN",
+                        "env_file": str(env_file),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = RunStore(olympus_dir / "olympus.db")
+    sup1 = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(responder=_responder),
+    )
+    started = sup1.start_run(
+        title="Short Title",
+        raw_input="Build an inventory REST API so operators can create and read items",
+        workflow_name="product_blueprint",
+        sync=True,
+    )
+    run_id = started["run_id"]
+    assert started["paused"]["node"] == "gate_spec"
+    sup1.shutdown()
+
+    # Simulate process restart with a brand-new RunSupervisor instance.
+    sup2 = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(responder=_responder),
+    )
+    try:
+        providers = {p["id"]: p for p in sup2.list_providers_status()}
+        assert providers["custom_env_provider"]["configured"] is True
+        assert sup2.is_supervised(run_id) is True
+
+        app2 = AriadneApp(store=store, workspace_root=tmp_path, supervisor=sup2)
+        res = app2.execute_command(run_id, {"action": "approve_spec", "sync": True})
+        assert res["command_result"]["workflow"]["paused"]["node"] == "gate_design"
+        assert res["projection"]["design"] is not None
+    finally:
+        sup2.shutdown()

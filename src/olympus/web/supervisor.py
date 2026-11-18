@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -21,6 +20,7 @@ from olympus.graph import (
     run_graph,
 )
 from olympus.graph.loader import WorkflowRuntime
+from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
 from olympus.providers.registry import ProviderRegistry, ProviderSpec
@@ -107,6 +107,8 @@ class RunSupervisor:
     # -------------------------------------------------------------------- providers
 
     def _configured(self, spec: ProviderSpec) -> bool:
+        if any(ep.api_key and ep.api_key.strip() for ep in spec.endpoints):
+            return True
         names: list[str] = []
         if spec.api_key_env:
             names.append(spec.api_key_env)
@@ -117,11 +119,19 @@ class RunSupervisor:
                 names.append(endpoint.api_key_env)
             if endpoint.api_keys_env:
                 names.append(endpoint.api_keys_env)
-        return any(os.environ.get(name, "").strip() for name in names)
+        if not names:
+            return False
+        env = resolve_env_mapping(
+            provider_env_file=Path(spec.env_file) if spec.env_file else None,
+            cwd=self.workspace_root,
+        )
+        return any(env.get(name, "").strip() for name in names)
 
     def list_providers_status(self) -> list[dict[str, Any]]:
         """Registry view with configuration booleans only — secrets never leave the process."""
-        registry = ProviderRegistry.load()
+        registry = ProviderRegistry.load(
+            project_providers_path=self.workspace_root / ".olympus" / "providers.json"
+        )
         statuses: list[dict[str, Any]] = []
         for provider_id in registry.list_ids():
             spec = registry.get(provider_id)
@@ -146,13 +156,18 @@ class RunSupervisor:
         requested = str(config.get("provider") or "").strip().lower()
         if requested == "mock":
             return MockLLMProvider()
-        kwargs = {
+        kwargs: dict[str, Any] = {
             key: value
             for key, value in config.items()
             if key in _PROVIDER_KWARGS and value not in (None, "")
         }
         kwargs.setdefault("provider", "auto")
         builder = self.provider_builder or build_provider
+        if builder is build_provider:
+            kwargs.setdefault(
+                "project_providers_path",
+                self.workspace_root / ".olympus" / "providers.json",
+            )
         return builder(**kwargs)
 
     def resolve_provider(self, run_id: str) -> LLMProvider:
@@ -162,7 +177,8 @@ class RunSupervisor:
         if cached is not None:
             return cached
         snap = self.store.get_run(run_id)
-        config = dict(snap.get("provider_config") or {})
+        raw_cfg = snap.get("provider_config")
+        config = dict(raw_cfg or {})
         provider: LLMProvider
         if self.provider_builder is not None:
             # An injected builder is authoritative (tests, custom routers, replays).
@@ -175,7 +191,7 @@ class RunSupervisor:
                 provider = self.provider_builder(**kwargs)
             except Exception:  # noqa: BLE001 - never let provider wiring break a run
                 provider = MockLLMProvider()
-        elif not config or str(config.get("provider") or "").strip().lower() == "mock":
+        elif raw_cfg is None or str(config.get("provider") or "").strip().lower() == "mock":
             provider = MockLLMProvider()
         else:
             try:
@@ -194,7 +210,14 @@ class RunSupervisor:
 
     def is_supervised(self, run_id: str) -> bool:
         with self._guard:
-            return run_id in self._managed_runs
+            if run_id in self._managed_runs:
+                return True
+        events = self.store.list_events(run_id, after_seq=0)
+        supervised = any(ev.stage == "graph" for ev in events)
+        if supervised:
+            with self._guard:
+                self._managed_runs.add(run_id)
+        return supervised
 
     def _observer(self, run_id: str) -> Callable[[str, dict[str, Any]], None]:
         def _observe(event: str, payload: dict[str, Any]) -> None:
@@ -377,12 +400,19 @@ class RunSupervisor:
     ) -> dict[str, Any]:
         """Create a run and drive its workflow until a human gate or completion."""
         definition = load_workflow(workflow_name)
-        config = dict(provider_config or {})
+        config = dict(provider_config) if provider_config else {"provider": "auto"}
         run_id = self.store.create_run(
             title=title,
             workflow_name=definition.name,
             provider_config=config,
             actor="supervisor",
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type="graph.input_recorded",
+            actor="supervisor",
+            payload={"raw_input": raw_input},
         )
         with self._guard:
             self._managed_runs.add(run_id)
@@ -448,6 +478,14 @@ class RunSupervisor:
 
         return "intake" if "intake" in names else ("align" if "align" in names else None)
 
+    def _recorded_raw_input(self, run_id: str, fallback: str) -> str:
+        for ev in reversed(self.store.list_events(run_id, after_seq=0)):
+            if ev.event_type == "graph.input_recorded":
+                raw = ev.payload.get("raw_input")
+                if isinstance(raw, str) and raw.strip():
+                    return raw
+        return fallback
+
     def resume_run(self, run_id: str, *, sync: bool = False) -> dict[str, Any]:
         """Advance a paused/awaiting run to its next gate or completion."""
         snap = self.store.get_run(run_id)
@@ -478,7 +516,7 @@ class RunSupervisor:
             }
         return self._launch(
             run_id,
-            raw_input=str(snap["title"]),
+            raw_input=self._recorded_raw_input(run_id, str(snap["title"])),
             start_from=entry,
             auto_approve=False,
             sync=sync,

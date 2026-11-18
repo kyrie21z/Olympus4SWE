@@ -77,8 +77,12 @@ Rules:
 4. Data ownership: every DataEntity names the module id that owns it; fields are concrete.
 5. Stay white-box: name real files/directories, never a single monolith, never `src/` as
    a whole, and never leave `target_paths` empty.
-6. Set spec_id and spec_hash to the frozen values supplied in the prompt.
-7. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
+6. State-first & cohesion discipline: derive DataEntity structures before slicing modules,
+   keep module count cohesive (typically 3-6 orthogonal modules for product apps instead of
+   micro-module sprawl), and pin concrete request/response fields + error cases on every
+   InterfaceContract.
+7. Set spec_id and spec_hash to the frozen values supplied in the prompt.
+8. Output ONLY a single JSON object conforming to DesignSpec (no $comment/$schema/extra keys)."""
 
 
 def _parse_structured_payload(raw_input: str | dict[str, Any]) -> dict[str, Any] | None:

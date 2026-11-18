@@ -314,3 +314,66 @@ def test_agent_loop_retries_once_on_transient_timeout() -> None:
     assert res.completed is True
     assert res.final_content == "recovered"
     assert calls == 2
+
+
+def test_run_structured_loop_salvages_submit_tool_and_recovers_max_steps(tmp_path: Path) -> None:
+    from pydantic import Field
+
+    from olympus.core.contracts import StrictModel
+    from olympus.stages.common import run_structured_loop
+
+    class Out(StrictModel):
+        value: int = Field(ge=1)
+
+    # 1. Hallucinated submit_plan tool call on max_steps is salvaged without extra LLM calls.
+    def submit_responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del messages, tools
+        return LLMResponse(
+            content="Here is the plan:",
+            tool_calls=(
+                ToolCall(
+                    id="sp-1",
+                    name="submit_plan",
+                    arguments={"plan": json.dumps({"value": 9})},
+                ),
+            ),
+        )
+
+    loop1 = AgentLoop(
+        provider=MockLLMProvider(responder=submit_responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=1,
+    )
+    out1 = run_structured_loop(loop=loop1, system_prompt="S", user_prompt="U", model_cls=Out)
+    assert out1.value == 9
+
+    # 2. Empty first repair after max_steps retries cleanly with max_parse_retries=2 default.
+    turns = 0
+
+    def repair_responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        nonlocal turns
+        del messages, tools
+        turns += 1
+        if turns == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=(
+                    ToolCall(
+                        id="g-1",
+                        name="glob_files",
+                        arguments={"path": str(tmp_path), "pattern": "*"},
+                    ),
+                ),
+            )
+        if turns == 2:
+            return LLMResponse(content="")
+        return LLMResponse(content=json.dumps({"value": 11}))
+
+    loop2 = AgentLoop(
+        provider=MockLLMProvider(responder=repair_responder),
+        toolkit=WorkspaceToolkit(tmp_path, read_only=True),
+        max_steps=1,
+    )
+    out2 = run_structured_loop(loop=loop2, system_prompt="S", user_prompt="U", model_cls=Out)
+    assert out2.value == 11
+    assert turns == 3

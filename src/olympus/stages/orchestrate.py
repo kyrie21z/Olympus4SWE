@@ -65,7 +65,13 @@ Rules:
    '; try:', '; except:', '; for ', '; if ', or '; def ' on a single line (Python raises
    SyntaxError)—use real '\\n' newlines, simple expressions/asserts, or 'python -m pytest ...'.
 6. Honor all GoalSpec constraints and resolved open_ambiguities answers in task objectives/checks.
-7. Output ONLY a single JSON object matching TaskPlan (no $comment, $schema, or extra keys)."""
+7. Every TaskNode MUST declare non-empty `write_scope` (repo-relative paths/dirs owned by
+   that task; NEVER omit `write_scope` or confuse it with `deliverables`), `task_id`, `title`,
+   `objective`, `requirement_refs`, and `acceptance_checks`.
+8. Exploration limit: inspect at most 3 existing files from Observed workspace files; if design
+   paths do not exist yet (greenfield), emit TaskPlan JSON directly without running glob/grep.
+9. Output ONLY a single raw JSON object starting with '{' matching TaskPlan (NEVER call an
+   invented 'submit_plan' tool, and include no leading prose, $comment, $schema, or extra keys)."""
 
 _WORKER_SYSTEM_PROMPT = """You are the Stage 2 Execution Engineer (Hephaestus) of Olympus4SWE.
 Implement the assigned TaskNode inside the isolated sandbox workspace.
@@ -317,7 +323,8 @@ Modular product decomposition (topology={topology}):
   NOT list shared_contract_paths in write_scope (they are read-only during Wave 1+).
 - Emit Wave 2 verification tasks (kind='test', role='qa') plus one integration task
   (kind='integrate', role='engineer') when more than one module exists.
-- Every design module id MUST appear in at least one task's design_refs; never invent ids.
+- Every design module id MUST appear in at least one task's design_refs; `design_refs` may ONLY
+  list DesignSpec module ids or interface ids (NEVER data_model names or invariant ids).
 - Tasks in different modules MUST NOT share overlapping write_scope.
 - Command acceptance_checks MUST only reference modules or test paths inside the task's own
   write_scope or its transitive depends_on ancestors (NEVER import a concurrent sibling task's
@@ -445,6 +452,16 @@ class OrchestrateStage:
                 else ""
             ) + f"Approved DesignSpec:\n{design.model_dump_json(indent=2)}\n\n"
             modular_block = _MODULAR_PLANNER_GUIDANCE.format(topology=topology)
+            design_paths = [
+                p for mod in design.modules for p in mod.target_paths
+            ] + list(design.shared_contract_paths)
+            if design_paths and not any(
+                (self.workspace_root / p.rstrip("/")).exists() for p in design_paths
+            ):
+                context_block += (
+                    "Greenfield workspace note: none of DesignSpec's target_paths exist on disk "
+                    "yet — output TaskPlan JSON immediately without searching unrelated files.\n\n"
+                )
         else:
             context_block = (
                 f"Confirmed GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"

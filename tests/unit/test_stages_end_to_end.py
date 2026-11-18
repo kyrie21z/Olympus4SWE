@@ -531,6 +531,35 @@ def test_parse_model_json_strips_meta_keys_and_preserves_extra_forbid() -> None:
         )
 
 
+def test_parse_model_json_skips_prose_inline_dicts_and_embedded_code_fences() -> None:
+    from olympus.core.contracts import ReviewVerdict
+    from olympus.stages.common import extract_json_payload
+
+    verdict_json = json.dumps(
+        {
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": True,
+            "summary": "Handled cleanly:\n```python\nexcept ValueError:\n    pass\n```\n",
+            "findings": [],
+        }
+    )
+    prose_wrapped = (
+        '1. `server.py` returns `{"status": "ok", "path": ...}`.\n'
+        '2. Also saw `{"tiny": 1}`.\n\n'
+        f"{verdict_json}"
+    )
+    parsed = parse_model_json(prose_wrapped, ReviewVerdict)
+    assert parsed.passed is True
+    assert "except ValueError" in parsed.summary
+
+    broken_after_prose = (
+        '1. Note `{"status": "ok", "path": ...}`.\n\n{\n  "bad": ,\n  "passed": true\n}'
+    )
+    extracted = extract_json_payload(broken_after_prose)
+    assert extracted.startswith('{\n  "bad"')
+
+
 def test_stage1_propose_spec_injects_observed_workspace_inventory(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / "src").mkdir()

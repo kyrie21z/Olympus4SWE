@@ -303,6 +303,23 @@ class AriadneApp:
                 task_mutator=_mutate_reassign,
                 result_status=TaskStatus.READY.value,
             )
+        elif action == "retry_workflow":
+            if snap["state_revision"] != expected_rev:
+                raise ConcurrencyConflictError(
+                    f"State revision mismatch: expected {expected_rev}, "
+                    f"got {snap['state_revision']}"
+                )
+            if snap["status"] == RunStatus.FAILED:
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    actor=actor,
+                    stage="graph",
+                    detail={"action": "retry_workflow"},
+                )
+            cmd_result = self.supervisor.resume_run(
+                run_id, sync=bool(body.get("sync", False))
+            )
         else:
             raise ValueError(f"Unsupported HITL action: {action}")
 
@@ -411,6 +428,10 @@ def create_http_server(
                         )
                         return
                     self._send_html(index_file.read_bytes())
+                    return
+
+                if path == "/favicon.ico":
+                    self._send_bytes("image/x-icon", b"")
                     return
 
                 if path == "/healthz":

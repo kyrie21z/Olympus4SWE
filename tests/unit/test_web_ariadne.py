@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -12,11 +13,14 @@ from olympus.core.contracts import (
     AmbiguityItem,
     CheckKind,
     DataEntity,
+    DeliverableKind,
     DesignModule,
     DesignSpec,
+    EarsPattern,
     GoalSpec,
     InterfaceContract,
     RequirementItem,
+    RunStatus,
     SpecStatus,
     TaskKind,
     TaskNode,
@@ -24,10 +28,12 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
-from olympus.providers.types import MockLLMProvider
+from olympus.graph.loader import build_graph, load_workflow
+from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
 from olympus.web.projection import build_run_projection, seed_demo_runs
 from olympus.web.server import AriadneApp, create_http_server
+from olympus.web.supervisor import RunSupervisor
 
 
 def _seed_gated_run(store: RunStore) -> str:
@@ -743,3 +749,119 @@ def test_direct_design_spec_projection_pipeline_and_matrix(tmp_path: Path) -> No
     assert proj["traceability_matrix"][0]["task_ids"] == ["T01"]
     assert proj["traceability_matrix"][1]["design_module_ids"] == ["MOD-API"]
     assert proj["traceability_matrix"][1]["task_ids"] == ["T02"]
+
+
+def test_workflow_graph_describe_includes_router_targets() -> None:
+    definition = load_workflow("product_blueprint")
+    described = build_graph(definition).describe()
+    edges = {(edge["source"], edge["target"]): edge for edge in described["edges"]}
+    for pair in (
+        ("intake", "align"),
+        ("intake", "gate_spec"),
+        ("intake", "validate_design"),
+        ("align", "critic"),
+        ("critic", "gate_spec"),
+        ("validate_design", "gate_design"),
+        ("validate_plan", "gate_plan"),
+    ):
+        assert pair in edges, f"Missing router target edge {pair}"
+        assert edges[pair]["conditional"] is True
+
+
+def test_failed_workflow_projection_and_retry_workflow(tmp_path: Path) -> None:
+    db_path = tmp_path / ".olympus" / "olympus.db"
+    store = RunStore(db_path)
+    run_id = store.create_run(
+        title="RedNote Dev",
+        workflow_name="product_blueprint",
+        provider_config={"provider": "mock"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.input_recorded",
+        actor="supervisor",
+        payload={"raw_input": "我想开发一款小红书这样的产品"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.node_started",
+        actor="supervisor",
+        payload={"node": "align", "kind": "align_goal"},
+    )
+    store.append_event(
+        run_id=run_id,
+        stage="graph",
+        event_type="graph.failed",
+        actor="supervisor",
+        payload={"error": "provider_error: The read operation timed out"},
+    )
+    store.set_run_status(
+        run_id,
+        RunStatus.FAILED,
+        actor="supervisor",
+        stage="graph",
+        detail={"error": "provider_error: The read operation timed out"},
+    )
+
+    proj = build_run_projection(store, tmp_path, run_id)
+    assert proj["raw_input"] == "我想开发一款小红书这样的产品"
+    assert proj["workflow"]["failed_node"] == "align"
+    assert proj["workflow"]["node_statuses"]["align"] == "failed"
+    assert proj["hitl_banner"] is not None
+    assert proj["hitl_banner"]["kind"] == "run_failed"
+    assert proj["hitl_banner"]["actions"] == ["retry_workflow"]
+
+    canned_goal = GoalSpec(
+        spec_id="spec-retry-1",
+        goal="构建图文内容社区与瀑布流浏览服务",
+        deliverable_kind=DeliverableKind.MULTI_SURFACE,
+        observable_surfaces=["REST API /notes", "Web UI 信息流页"],
+        actors=["内容创作者", "普通读者"],
+        requirements=[
+            RequirementItem(
+                id="REQ-1",
+                description="支持发布带图笔记并按时间倒序浏览信息流",
+                ears_criteria=[
+                    {
+                        "id": "AC-1",
+                        "pattern": EarsPattern.EVENT_DRIVEN,
+                        "condition": "When a user submits a valid note",
+                        "outcome": "the system persists the note and returns HTTP 201",
+                    }
+                ],
+                acceptance_criteria=["POST /notes returns 201 and GET /notes lists the note"],
+            )
+        ],
+        out_of_scope=["不接入即时音视频直播"],
+    ).model_dump(mode="json")
+
+    def _responder(messages: object, _tools: object) -> LLMResponse:
+        sys_msg = str(getattr(messages[0], "content", "")) if messages else ""  # type: ignore[index]
+        if "Alignment Architect" in sys_msg or "GoalSpec" in sys_msg:
+            return LLMResponse(content=json.dumps(canned_goal, ensure_ascii=False))
+        return LLMResponse(content=json.dumps({"notes": []}, ensure_ascii=False))
+
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **_: MockLLMProvider(responder=_responder),
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    try:
+        res = app.execute_command(
+            run_id,
+            {
+                "operation_id": "op-retry-wf-1",
+                "action": "retry_workflow",
+                "expected_state_revision": proj["state_revision"],
+                "sync": True,
+            },
+        )
+        assert res["ok"] is True
+        after = res["projection"]
+        assert after["status"] != "failed"
+        assert after["spec"] is not None
+    finally:
+        app.supervisor.shutdown()

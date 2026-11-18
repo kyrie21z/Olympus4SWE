@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ariadne · Olympus4SWE 研发编排与独立验收控制台</title>
+  <title>Ariadne · Olympus4SWE 研发编排工作台</title>
+  <link rel="icon" href="data:,">
   <script>
     (() => {
       try {
@@ -19,67 +20,70 @@
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-dock="closed">
   <div class="cockpit">
-    <nav id="rail" class="scroller" aria-label="工作台导航">
+    <nav id="rail" class="scroller" aria-label="工作台线程栏">
       <div class="rail-head-row">
         <div class="rail-brand">
           <span class="rail-mark" aria-hidden="true">◈</span>
           <span class="rail-wordmark">Ariadne</span>
         </div>
-        <button type="button" class="btn btn-quiet" id="btn-rail-collapse" aria-expanded="true" aria-label="折叠导航">⇤</button>
+        <div class="rail-head-actions">
+          <button type="button" class="btn btn-quiet" id="theme-toggle" aria-label="切换主题">☾</button>
+          <button type="button" class="btn btn-quiet" id="btn-rail-collapse" aria-expanded="true" aria-label="折叠侧栏">⇤</button>
+        </div>
       </div>
       <button type="button" class="btn btn-primary rail-new-run" id="btn-new-run">+ 新建编排</button>
-      <p class="rail-section-title">视图</p>
-      <div class="rail-nav">
-        <a class="rail-link" href="#topology" data-view="topology" aria-current="page">
-          <span class="rail-glyph" aria-hidden="true">◇</span>
-          <span class="rail-label">拓扑</span>
-        </a>
-        <a class="rail-link" href="#design" data-view="design">
-          <span class="rail-glyph" aria-hidden="true">◫</span>
-          <span class="rail-label">架构规格</span>
-        </a>
-        <a class="rail-link" href="#matrix" data-view="matrix">
-          <span class="rail-glyph" aria-hidden="true">▦</span>
-          <span class="rail-label">矩阵</span>
-        </a>
-        <a class="rail-link" href="#waterfall" data-view="waterfall">
-          <span class="rail-glyph" aria-hidden="true">▤</span>
-          <span class="rail-label">瀑布</span>
-        </a>
-      </div>
       <p class="rail-section-title">编排线程</p>
-      <div class="thread-list" id="thread-list" aria-label="编排线程列表"></div>
-      <div class="rail-foot">
+      <div class="thread-list scroller" id="thread-list" aria-label="编排线程列表"></div>
+      <div class="rail-foot" hidden>
         <label class="rail-foot-label" for="run-selector">运行实例</label>
-        <div class="rail-foot-controls">
-          <select id="run-selector" class="run-select" aria-label="切换运行实例"></select>
-          <button type="button" class="btn btn-quiet" id="theme-toggle" aria-label="切换主题">☾</button>
-        </div>
+        <select id="run-selector" class="run-select" aria-label="切换运行实例"></select>
       </div>
     </nav>
 
     <main id="stage" class="scroller">
       <header class="stage-head">
         <div class="stage-title-row">
-          <h1 class="stage-title" id="run-title">Ariadne 研发编排控制台</h1>
-          <span class="stage-kicker" id="run-kicker">事件溯源 · 只读投影</span>
+          <div class="stage-title-group">
+            <h1 class="stage-title" id="run-title">Ariadne 研发编排控制台</h1>
+            <span class="badge" data-variant="muted" id="run-kicker">准备就绪</span>
+          </div>
+          <nav class="view-switcher" aria-label="视图切换">
+            <a class="rail-link" href="#topology" data-view="topology" aria-current="page">
+              <span class="rail-label">工作流</span>
+            </a>
+            <a class="rail-link" href="#design" data-view="design">
+              <span class="rail-label">架构规格</span>
+            </a>
+            <a class="rail-link" href="#matrix" data-view="matrix">
+              <span class="rail-label">追踪矩阵</span>
+            </a>
+            <a class="rail-link" href="#waterfall" data-view="waterfall">
+              <span class="rail-label">执行瀑布</span>
+            </a>
+          </nav>
+          <div class="stage-actions">
+            <button type="button" class="btn" id="btn-dock-open">检查器</button>
+            <button type="button" class="btn btn-danger" id="btn-toggle-pause" hidden>暂停调度</button>
+          </div>
         </div>
         <div class="stage-bar-row">
           <nav class="stage-pipeline" id="stage-pipeline" aria-label="阶段进度"></nav>
-          <div class="stage-actions">
-            <button type="button" class="btn" id="btn-dock-open" hidden>打开检查器</button>
-            <button type="button" class="btn btn-danger" id="btn-toggle-pause">暂停全部</button>
-          </div>
+          <div class="stat-band" id="stat-band" aria-label="运行指标"></div>
         </div>
-        <div class="stat-band" id="stat-band" aria-label="运行指标"></div>
+      </header>
+
+      <div class="stage-inline">
         <section class="hitl-banner" id="hitl-banner" data-tone="danger" aria-live="polite" hidden>
-          <p class="hitl-headline" id="hitl-headline">正在加载编排状态…</p>
+          <div class="hitl-copy">
+            <p class="hitl-headline" id="hitl-headline">正在加载编排状态…</p>
+            <p class="hitl-detail" id="hitl-detail"></p>
+          </div>
           <div class="hitl-actions" id="hitl-task-actions">
             <button type="button" class="btn btn-primary" id="btn-banner-hint">注入提示</button>
             <button type="button" class="btn" id="btn-banner-inspect">查看定位</button>
-            <button type="button" class="btn" id="btn-banner-retry">重试</button>
+            <button type="button" class="btn" id="btn-banner-retry">重试任务</button>
             <button type="button" class="btn" id="btn-banner-reassign">改派给人</button>
             <button type="button" class="btn btn-danger hitl-risk-sep" id="btn-banner-accept-risk">接受风险</button>
           </div>
@@ -87,17 +91,20 @@
             <button type="button" class="btn btn-primary" id="btn-approve-spec" hidden>批准 GoalSpec 进入架构设计</button>
             <button type="button" class="btn btn-primary" id="btn-approve-design" hidden>批准 DesignSpec 启动任务分解</button>
             <button type="button" class="btn btn-primary" id="btn-approve-plan" hidden>批准任务计划</button>
+            <button type="button" class="btn btn-primary" id="btn-retry-workflow" hidden>从断点重试</button>
+            <button type="button" class="btn" id="btn-inspect-failure" hidden>查看节点日志</button>
           </div>
         </section>
-      </header>
 
-      <div class="stage-inline">
-        <section class="triage-banner" id="triage-banner" data-maturity="raw_intent" hidden aria-live="polite">
-          <div class="triage-head">
-            <span class="triage-title">输入分级</span>
+        <section class="intent-card" id="intent-card" hidden aria-label="需求输入与分级">
+          <div class="intent-head">
+            <span class="intent-label">需求输入</span>
             <span class="badge" data-variant="muted" id="triage-maturity">raw_intent</span>
           </div>
-          <ul class="triage-reasons" id="triage-reasons"></ul>
+          <p class="intent-text" id="intent-text"></p>
+          <div class="triage-banner" id="triage-banner" data-maturity="raw_intent" hidden aria-live="polite">
+            <ul class="triage-reasons" id="triage-reasons"></ul>
+          </div>
         </section>
 
         <section class="clarify-panel" id="clarify-panel" hidden aria-labelledby="clarify-title">
@@ -112,33 +119,46 @@
         </section>
       </div>
 
-      <section class="view" data-pane="topology" id="view-topology" aria-labelledby="topology-title">
-        <header class="view-head">
-          <h2 class="view-title" id="topology-title">任务依赖图</h2>
-          <div class="dag-legend" aria-label="图例">
-            <span class="legend-item">✓ 已验收</span>
-            <span class="legend-item">▶ 运行中</span>
-            <span class="legend-item">✕ 阻塞</span>
-            <span class="legend-item">⚠ 人工接受</span>
-            <span class="legend-item">◷ 等待</span>
-            <span class="legend-item"><span class="legend-swatch" data-tone="critical" aria-hidden="true"></span> 关键路径</span>
-            <span class="legend-item"><span class="legend-swatch" data-tone="blocked" aria-hidden="true"></span> 阻塞传递</span>
-            <span class="legend-item"><span class="legend-dash" aria-hidden="true"></span> 条件跳转</span>
-          </div>
-        </header>
+      <section class="view" data-pane="topology" id="view-topology" aria-labelledby="workflow-title">
         <section class="workflow-section" aria-labelledby="workflow-title">
-          <div class="card-head">
-            <h3 class="card-title" id="workflow-title">编排工作流</h3>
-            <span class="card-note" id="workflow-badge">拓扑加载中…</span>
-          </div>
+          <header class="view-head">
+            <div class="view-head-meta">
+              <h2 class="view-title" id="workflow-title">编排工作流</h2>
+              <span class="card-note" id="workflow-badge">拓扑加载中…</span>
+            </div>
+            <div class="dag-legend" aria-label="状态图例">
+              <span class="legend-item">✓ 完成</span>
+              <span class="legend-item">▶ 运行中</span>
+              <span class="legend-item">✕ 中断/阻塞</span>
+              <span class="legend-item">◷ 待确认</span>
+              <span class="legend-item"><span class="legend-dash" aria-hidden="true"></span> 条件路由 / 修复回边</span>
+            </div>
+          </header>
           <div class="dag-frame scroller">
-            <svg class="dag-svg workflow-svg" id="workflow-svg" role="img" aria-label="工作流拓扑有向图" viewBox="0 0 760 120"></svg>
+            <svg class="dag-svg workflow-svg" id="workflow-svg" role="img" aria-label="工作流拓扑有向图" width="760" height="148" viewBox="0 0 760 148"></svg>
           </div>
         </section>
-        <div class="dag-frame scroller">
-          <svg class="dag-svg" id="dag-svg" role="img" aria-label="任务依赖有向无环图" viewBox="0 0 760 216"></svg>
-        </div>
-        <section class="lane-section" aria-labelledby="lane-title">
+
+        <section class="stage-live-panel" id="stage-live-panel" hidden aria-label="阶段执行进展"></section>
+
+        <section class="task-dag-section" id="task-dag-section" aria-labelledby="topology-title" hidden>
+          <header class="view-head">
+            <h2 class="view-title" id="topology-title">任务依赖图</h2>
+            <div class="dag-legend" aria-label="任务图例">
+              <span class="legend-item">✓ 已验收</span>
+              <span class="legend-item">▶ 运行中</span>
+              <span class="legend-item">✕ 阻塞</span>
+              <span class="legend-item">⚠ 人工接受</span>
+              <span class="legend-item"><span class="legend-swatch" data-tone="critical" aria-hidden="true"></span> 关键路径</span>
+              <span class="legend-item"><span class="legend-swatch" data-tone="blocked" aria-hidden="true"></span> 阻塞传递</span>
+            </div>
+          </header>
+          <div class="dag-frame scroller">
+            <svg class="dag-svg" id="dag-svg" role="img" aria-label="任务依赖有向无环图" width="760" height="216" viewBox="0 0 760 216"></svg>
+          </div>
+        </section>
+
+        <section class="lane-section" id="lane-section" aria-labelledby="lane-title" hidden>
           <div class="card-head">
             <h3 class="card-title" id="lane-title">Agent 泳道（时间 →）</h3>
             <span class="card-note" id="lane-badge">隔离通道</span>
@@ -196,7 +216,7 @@
       <header class="dock-head">
         <div>
           <span class="dock-kicker">检查器</span>
-          <h2 class="dock-title" id="dock-title">任务执行详情</h2>
+          <h2 class="dock-title" id="dock-title">节点执行详情</h2>
         </div>
         <button type="button" class="btn btn-quiet" id="btn-dock-close" aria-label="收起检查器">⇥</button>
       </header>

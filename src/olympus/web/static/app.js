@@ -17,6 +17,7 @@
     optionsLoaded: false,
     workflows: [],
     clarifySig: "",
+    userOpenedDock: false,
     sse: null,
   };
 
@@ -82,9 +83,17 @@
     designBadge: document.getElementById("design-badge"),
     taskActions: document.getElementById("hitl-task-actions"),
     gateActions: document.getElementById("hitl-gate-actions"),
+    bannerDetail: document.getElementById("hitl-detail"),
     approveSpec: document.getElementById("btn-approve-spec"),
     approveDesign: document.getElementById("btn-approve-design"),
     approvePlan: document.getElementById("btn-approve-plan"),
+    retryWorkflow: document.getElementById("btn-retry-workflow"),
+    inspectFailure: document.getElementById("btn-inspect-failure"),
+    intentCard: document.getElementById("intent-card"),
+    intentText: document.getElementById("intent-text"),
+    stageLivePanel: document.getElementById("stage-live-panel"),
+    taskDagSection: document.getElementById("task-dag-section"),
+    laneSection: document.getElementById("lane-section"),
   };
 
   const MATURITY_LABELS = {
@@ -92,6 +101,75 @@
     goal_spec_ready: "GoalSpec 就绪",
     design_spec_ready: "DesignSpec 就绪",
   };
+
+  const WORKFLOW_LABELS = {
+    product_blueprint: "产品蓝图",
+    full_sdlc_tdd: "全流程 TDD",
+    repo_fast_patch: "快速补丁",
+  };
+
+  const NODE_LABELS = {
+    intake: "输入分流",
+    align: "需求对齐",
+    critic: "多维评审",
+    gate_spec: "需求确认",
+    design: "白盒架构",
+    validate_design: "架构校验",
+    gate_design: "架构确认",
+    plan: "任务分解",
+    validate_plan: "计划校验",
+    gate_plan: "计划确认",
+    execute: "并发执行",
+  };
+
+  const STAGE_EVENT_LABELS = {
+    "intake.triaged": "完成输入成熟度分级与入口路由",
+    "spec.drafted": "已生成 GoalSpec 需求草案",
+    "spec.clarified": "已合并澄清回答并更新 GoalSpec",
+    "spec.confirmed": "已批准并冻结 GoalSpec",
+    "design.generated": "已生成 DesignSpec 白盒架构草案",
+    "design.approved": "已批准并冻结 DesignSpec",
+    "plan.generated": "已生成 TaskPlan 任务依赖图",
+    "plan.approved": "已批准任务计划",
+  };
+
+  function localizeTriageReason(text) {
+    const raw = String(text || "").trim();
+    if (raw.startsWith("Free-form intent without frozen requirements")) {
+      return "输入为自然语言描述，尚未冻结可验收需求、模块边界或接口契约。";
+    }
+    if (raw.startsWith("Stage 1 Align must synthesize an EARS GoalSpec")) {
+      return "需先经 Stage 1 需求对齐生成 EARS GoalSpec，再进入白盒架构设计。";
+    }
+    if (raw.startsWith("Input describes WHAT the product must do")) {
+      return "已明确业务目标（What），待 Stage 2a 补齐模块路径、数据归属与接口接缝（How）。";
+    }
+    if (raw.startsWith("No interface contracts")) {
+      return "缺少明确的模块间接口签名与异常分支契约。";
+    }
+    if (raw.startsWith("No data ownership map")) {
+      return "缺少数据实体及其唯一所属模块的归属映射。";
+    }
+    if (raw.startsWith("GoalSpec passed deterministic validation")) {
+      return "输入已达到 GoalSpec 就绪标准，可直接跨过澄清进入白盒架构设计。";
+    }
+    if (raw.startsWith("DesignSpec passed deterministic validation")) {
+      return "输入已达到完整 DesignSpec 标准，可直接进入任务分解（PM Decompose）。";
+    }
+    return raw;
+  }
+
+  function localizeError(text) {
+    const raw = String(text || "").trim();
+    if (!raw) return "";
+    if (/read operation timed out|ReadTimeout/i.test(raw)) {
+      return `模型接口读取超时（已将默认超时阈值提升至 180s，可直接点击“从断点重试”继续）· ${raw}`;
+    }
+    if (/provider_error/i.test(raw)) {
+      return `模型调用异常（可检查提供方配置后点击“从断点重试”）· ${raw}`;
+    }
+    return raw;
+  }
 
   let toastTimer = null;
 
@@ -169,6 +247,9 @@
       if (link.dataset.view === view) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
+    if (state.projection) {
+      renderTriage(state.projection);
+    }
   }
 
   function formatTokens(value) {
@@ -177,8 +258,10 @@
   }
 
   function renderStage(projection) {
+    const runMeta = statusMeta(projection.status, null);
     el.runTitle.textContent = projection.title || "Ariadne 研发编排控制台";
-    el.runKicker.textContent = `${projection.mode} · ${projection.status} · r${projection.state_revision}`;
+    el.runKicker.textContent = `${runMeta.glyph} ${runMeta.label} · r${projection.state_revision}`;
+    el.runKicker.setAttribute("data-variant", runMeta.variant);
 
     el.pipeline.innerHTML = (projection.stage_pipeline || [])
       .map((stage, index, all) => {
@@ -199,17 +282,19 @@
       .join("");
 
     el.statBand.innerHTML = uiStatBand([
-      { label: "已验收任务", value: projection.progress.ratio_text },
+      { label: "任务", value: projection.progress.ratio_text },
       {
-        label: "LLM 调用",
+        label: "LLM",
         value: `${projection.budget.calls_used} / ${projection.budget.max_calls}`,
       },
-      { label: "Token 消耗", value: formatTokens(projection.budget.total_tokens) },
-      { label: "状态修订", value: `r${projection.state_revision}` },
+      { label: "Token", value: formatTokens(projection.budget.total_tokens) },
+      { label: "修订", value: `r${projection.state_revision}` },
     ]);
 
     const paused = projection.status === "paused";
-    el.pauseButton.textContent = paused ? "恢复运行" : "暂停全部";
+    const hasTasks = (projection.dag && projection.dag.nodes && projection.dag.nodes.length > 0);
+    el.pauseButton.hidden = !(hasTasks && (projection.status === "running" || paused));
+    el.pauseButton.textContent = paused ? "恢复运行" : "暂停调度";
     el.pauseButton.className = paused ? "btn btn-primary" : "btn btn-danger";
     el.footNote.textContent = `${projection.run_id} · 最近事件 #${projection.latest_event_seq}`;
   }
@@ -223,14 +308,18 @@
   }
 
   function renderGateActions(projection) {
+    const banner = projection.hitl_banner;
     const specGate = Boolean(projection.spec && !projection.spec_approved);
     const designGate = Boolean(projection.design && !projection.design_approved);
     const planGate = Boolean(projection.plan && !projection.plan_approved);
+    const runFailed = Boolean(banner && banner.kind === "run_failed");
     el.approveSpec.hidden = !specGate;
     el.approveDesign.hidden = !designGate;
     el.approvePlan.hidden = !planGate;
-    el.gateActions.hidden = !(specGate || designGate || planGate);
-    return specGate || designGate || planGate;
+    el.retryWorkflow.hidden = !runFailed;
+    el.inspectFailure.hidden = !runFailed;
+    el.gateActions.hidden = !(specGate || designGate || planGate || runFailed);
+    return specGate || designGate || planGate || runFailed;
   }
 
   function renderBanner(projection) {
@@ -251,14 +340,32 @@
     const cleanDetail = String(banner ? banner.detail || "" : "")
       .replace(/\s*\n+\s*/g, "，")
       .trim();
+    const localized = cleanDetail ? localizeError(cleanDetail) : "";
     el.bannerHeadline.innerHTML = `<span aria-hidden="true">${glyph}</span><span>${esc(
       headline
-    )}<span class="hitl-detail">${esc(cleanDetail)}</span></span>`;
+    )}</span>`;
+    el.bannerDetail.textContent = localized;
+    el.bannerDetail.hidden = !localized;
   }
 
   function renderTriage(projection) {
+    if (state.view !== "topology") {
+      el.intentCard.hidden = true;
+      return;
+    }
     const triage = projection.triage;
+    const raw = String(projection.raw_input || "").trim();
+    if (!triage && !raw) {
+      el.intentCard.hidden = true;
+      el.triageBanner.hidden = true;
+      return;
+    }
+    el.intentCard.hidden = false;
+    el.intentText.textContent = raw;
+    el.intentText.hidden = !raw;
     if (!triage) {
+      el.triageMaturity.textContent = "输入上下文";
+      el.triageMaturity.setAttribute("data-variant", "muted");
       el.triageBanner.hidden = true;
       return;
     }
@@ -268,12 +375,12 @@
     el.triageMaturity.textContent = MATURITY_LABELS[maturity] || maturity;
     el.triageMaturity.setAttribute(
       "data-variant",
-      maturity === "design_spec_ready" ? "ok" : maturity === "goal_spec_ready" ? "live" : "muted"
+      maturity === "design_spec_ready" ? "ok" : maturity === "goal_spec_ready" ? "live" : "warn"
     );
     const reasons = triage.reasons || [];
     el.triageReasons.innerHTML = reasons.length
-      ? reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")
-      : "<li>输入分级未附带补充说明</li>";
+      ? reasons.map((reason) => `<li>${esc(localizeTriageReason(reason))}</li>`).join("")
+      : "<li>输入分级已记录</li>";
   }
 
   function renderClarify(projection) {
@@ -323,24 +430,33 @@
   }
 
   function workflowLayers(graph) {
-    const names = (graph.nodes || []).map((node) => node.name);
+    const nodes = graph.nodes || [];
+    const names = nodes.map((node) => node.name);
     const known = new Set(names);
-    const edges = (graph.edges || []).filter(
-      (edge) => known.has(edge.source) && known.has(edge.target)
+    const orderOf = new Map(names.map((name, idx) => [name, idx]));
+    const forwardEdges = (graph.edges || []).filter(
+      (edge) =>
+        known.has(edge.source) &&
+        known.has(edge.target) &&
+        (orderOf.get(edge.target) || 0) > (orderOf.get(edge.source) || 0)
     );
     const incoming = new Map(names.map((name) => [name, 0]));
-    edges.forEach((edge) => incoming.set(edge.target, (incoming.get(edge.target) || 0) + 1));
+    forwardEdges.forEach((edge) =>
+      incoming.set(edge.target, (incoming.get(edge.target) || 0) + 1)
+    );
     const layerOf = new Map();
     const starts = (graph.start || []).filter((name) => known.has(name));
-    const queue = (starts.length ? starts : names.filter((name) => !incoming.get(name))).slice();
-    if (!queue.length && names.length) queue.push(names[0]);
+    const roots = starts.length
+      ? starts
+      : names.filter((name) => !incoming.get(name));
+    const queue = (roots.length ? roots : names.slice(0, 1)).slice();
     queue.forEach((name) => layerOf.set(name, 0));
-    let guard = names.length * 8;
+    let guard = names.length * Math.max(4, forwardEdges.length + 1);
     while (queue.length && guard > 0) {
       guard -= 1;
       const name = queue.shift();
       const layer = layerOf.get(name) || 0;
-      edges
+      forwardEdges
         .filter((edge) => edge.source === name)
         .forEach((edge) => {
           const next = layer + 1;
@@ -350,8 +466,10 @@
           }
         });
     }
-    names.forEach((name) => {
-      if (!layerOf.has(name)) layerOf.set(name, 0);
+    names.forEach((name, idx) => {
+      if (!layerOf.has(name)) {
+        layerOf.set(name, idx);
+      }
     });
     return layerOf;
   }
@@ -361,8 +479,12 @@
     const graph = workflow.graph;
     const statuses = workflow.node_statuses || {};
     const name = workflow.name || projection.workflow_name || "workflow";
+    const wfLabel = WORKFLOW_LABELS[name] || name;
     if (!graph || !graph.nodes || !graph.nodes.length) {
-      el.workflowBadge.textContent = `${name} · 拓扑不可用`;
+      el.workflowBadge.textContent = `${wfLabel} · 拓扑不可用`;
+      el.workflowSvg.setAttribute("width", "760");
+      el.workflowSvg.setAttribute("height", "120");
+      el.workflowSvg.setAttribute("viewBox", "0 0 760 120");
       el.workflowSvg.innerHTML =
         '<text class="dag-empty" x="32" y="64">当前工作流未提供拓扑描述</text>';
       return;
@@ -381,40 +503,70 @@
       byLayer.get(layer).push(node);
     });
     const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
-    const nodeWidth = 118;
-    const nodeHeight = 64;
+    const nodeWidth = 116;
+    const nodeHeight = 58;
     const rowGap = 14;
-    const columnGap = 158;
+    const columnGap = 140;
+    const topPad = 30;
+    const bottomPad = 42;
     const tallest = Math.max(...layers.map((layer) => byLayer.get(layer).length));
-    const canvasWidth = Math.max(760, layers.length * columnGap + 48);
-    const canvasHeight = Math.max(150, tallest * (nodeHeight + rowGap) + 36);
+    const canvasWidth = Math.max(760, layers.length * columnGap + 24);
+    const canvasHeight = Math.max(
+      148,
+      topPad + tallest * nodeHeight + Math.max(0, tallest - 1) * rowGap + bottomPad
+    );
+    el.workflowSvg.setAttribute("width", String(canvasWidth));
+    el.workflowSvg.setAttribute("height", String(canvasHeight));
     el.workflowSvg.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
 
     const coords = new Map();
+    const innerHeight = canvasHeight - topPad - bottomPad;
     layers.forEach((layer, column) => {
       const columnNodes = byLayer.get(layer);
       const totalHeight =
         columnNodes.length * nodeHeight + (columnNodes.length - 1) * rowGap;
-      const startY = Math.max(16, Math.round((canvasHeight - totalHeight) / 2));
+      const startY = topPad + Math.max(0, Math.round((innerHeight - totalHeight) / 2));
       columnNodes.forEach((node, row) => {
         coords.set(node.name, {
-          x: 24 + column * columnGap,
+          x: 20 + column * columnGap,
           y: startY + row * (nodeHeight + rowGap),
+          column,
           node,
         });
       });
     });
 
     const defs = `<defs>
-      <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
-      <marker id="wf-arrow-cond" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
+      <marker id="wf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
+      <marker id="wf-arrow-cond" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="dag-arrow" d="M0,0 L10,5 L0,10 z"></path></marker>
     </defs>`;
 
+    let skipIndex = 0;
+    let backIndex = 0;
     const paths = edges
       .map((edge) => {
         const source = coords.get(edge.source);
         const target = coords.get(edge.target);
         if (!source || !target) return "";
+        const colDelta = target.column - source.column;
+        if (colDelta <= 0) {
+          backIndex += 1;
+          const x1 = source.x + nodeWidth / 2;
+          const y1 = source.y;
+          const x2 = target.x + nodeWidth / 2;
+          const y2 = target.y;
+          const arcY = Math.max(8, topPad - 12 - (backIndex % 2) * 8);
+          return `<path class="dag-edge" data-conditional="true" data-backedge="true" d="M${x1},${y1} C${x1},${arcY} ${x2},${arcY} ${x2},${y2}" marker-end="url(#wf-arrow-cond)"></path>`;
+        }
+        if (colDelta > 1) {
+          skipIndex += 1;
+          const x1 = source.x + nodeWidth * 0.65;
+          const y1 = source.y + nodeHeight;
+          const x2 = target.x + nodeWidth * 0.35;
+          const y2 = target.y + nodeHeight;
+          const railY = canvasHeight - 10 - ((skipIndex - 1) % 3) * 8;
+          return `<path class="dag-edge" data-conditional="true" d="M${x1},${y1} C${x1},${railY} ${x2},${railY} ${x2},${y2}" marker-end="url(#wf-arrow-cond)"></path>`;
+        }
         const x1 = source.x + nodeWidth;
         const y1 = source.y + nodeHeight / 2;
         const x2 = target.x;
@@ -433,30 +585,32 @@
         if (!pos) return "";
         const status = statuses[node.name] || "pending";
         const meta = statusMeta(status, null);
+        const label = NODE_LABELS[node.name] || node.name;
         const selected = node.name === state.workflowNode ? "true" : "false";
         const centerX = pos.x + nodeWidth / 2;
         return `<g class="dag-node wf-node" data-workflow-node="${esc(
           node.name
-        )}" data-status="${esc(status)}" aria-selected="${selected}" tabindex="0" role="button" aria-label="工作流节点 ${esc(
-          node.name
-        )} ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
+        )}" data-status="${esc(status)}" aria-selected="${selected}" tabindex="0" role="button" aria-label="${esc(
+          label
+        )} (${esc(node.name)}) ${esc(meta.label)}"><rect class="dag-node-box" x="${pos.x}" y="${
           pos.y
         }" width="${nodeWidth}" height="${nodeHeight}" rx="8"></rect><text class="dag-node-title" x="${centerX}" y="${
-          pos.y + 22
-        }" text-anchor="middle">${esc(node.name)}</text><text class="dag-node-kind" x="${centerX}" y="${
-          pos.y + 38
-        }" text-anchor="middle">${esc(node.kind || "")}</text><text class="dag-node-meta" x="${centerX}" y="${
-          pos.y + 55
+          pos.y + 20
+        }" text-anchor="middle">${esc(label)}</text><text class="dag-node-kind" x="${centerX}" y="${
+          pos.y + 34
+        }" text-anchor="middle">${esc(node.name)}</text><text class="dag-node-meta" x="${centerX}" y="${
+          pos.y + 49
         }" text-anchor="middle">${meta.glyph} ${esc(meta.label)}</text></g>`;
       })
       .join("");
 
     el.workflowSvg.innerHTML = defs + paths + shapes;
 
-    const current = workflow.current_node || (workflow.paused && workflow.paused.node);
-    el.workflowBadge.textContent = `${name} · ${workflow.topology || "topology"} · stop_after=${
+    const current = workflow.current_node || workflow.failed_node || (workflow.paused && workflow.paused.node);
+    const currentText = current ? `${NODE_LABELS[current] || current} (${current})` : "";
+    el.workflowBadge.textContent = `${wfLabel} · ${workflow.topology || "topology"} · stop=${
       workflow.stop_after || "-"
-    }${current ? ` · 当前 ${current}` : ""}`;
+    }${currentText ? ` · 当前 ${currentText}` : ""}`;
   }
 
   function requirementList(spec) {
@@ -621,8 +775,8 @@
           )}" aria-pressed="${active ? "true" : "false"}"><span class="thread-item-title">${esc(
             run.title
           )}</span><span class="thread-item-meta"><span class="badge" data-variant="muted">${esc(
-            run.workflow_name || "workflow"
-          )}</span>${uiBadge(meta.label, meta.variant)}</span></button>`;
+            WORKFLOW_LABELS[run.workflow_name] || run.workflow_name || "workflow"
+          )}</span>${uiBadge(`${meta.glyph} ${meta.label}`, meta.variant)}</span></button>`;
         })
         .join("") || '<p class="thread-empty">尚无编排线程</p>';
   }
@@ -642,10 +796,73 @@
     return data;
   }
 
+  function renderStageLivePanel(projection) {
+    const nodes = (projection.dag && projection.dag.nodes) || [];
+    const hasDag = nodes.length > 0;
+    el.taskDagSection.hidden = !hasDag;
+    el.laneSection.hidden = !hasDag;
+    if (hasDag) {
+      el.stageLivePanel.hidden = true;
+      el.stageLivePanel.innerHTML = "";
+      return;
+    }
+    el.stageLivePanel.hidden = false;
+    const activity = (projection.stage_activity || []).slice(-8).reverse();
+    const activityHtml = activity.length
+      ? activity
+          .map((item) => {
+            const isFailed = item.event_type === "graph.failed";
+            const summaryText = isFailed
+              ? "当前阶段节点调用中断（详见上方提示栏，可直接点击“从断点重试”）"
+              : STAGE_EVENT_LABELS[item.summary] || item.summary;
+            return `<div class="stage-activity-item" data-tone="normal"><div class="stage-activity-main"><span class="mono">#${esc(
+              item.event_seq
+            )}</span>${uiBadge(item.stage || "stage", isFailed ? "warn" : "muted")}<span class="mono">${esc(
+              item.actor
+            )}</span><span class="stage-activity-summary">${esc(
+              summaryText
+            )}</span></div></div>`;
+          })
+          .join("")
+      : '<p class="view-note">工作流准备就绪，等待节点执行事件。</p>';
+
+    const artifactSummary = [];
+    if (projection.spec) {
+      artifactSummary.push(
+        uiCard(
+          "GoalSpec 草案",
+          `<p class="spec-list">${esc(projection.spec.goal)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="spec">在架构规格查看完整 GoalSpec →</button></div>`,
+          { note: `v${projection.spec.version || 1} · ${(projection.spec.requirements || []).length} 条需求` }
+        )
+      );
+    }
+    if (projection.design) {
+      artifactSummary.push(
+        uiCard(
+          "DesignSpec 白盒架构",
+          `<p class="spec-list">${esc(projection.design.architecture_summary)}</p><div class="clarify-actions"><button type="button" class="btn" data-jump-design="design">查看模块边界与接口契约 →</button></div>`,
+          { note: `${(projection.design.modules || []).length} 个模块` }
+        )
+      );
+    }
+
+    el.stageLivePanel.innerHTML = [
+      uiCard(
+        "当前阶段执行动态",
+        `<div class="stage-activity-list">${activityHtml}</div>`,
+        { note: `r${projection.state_revision} · 任务分解尚未启动` }
+      ),
+      ...artifactSummary,
+    ].join("");
+  }
+
   function renderDag(projection) {
     const nodes = projection.dag.nodes || [];
     const edges = projection.dag.edges || [];
     if (!nodes.length) {
+      el.dag.setAttribute("width", "760");
+      el.dag.setAttribute("height", "120");
+      el.dag.setAttribute("viewBox", "0 0 760 120");
       el.dag.innerHTML =
         '<text class="dag-empty" x="32" y="64">当前运行尚未生成任务 DAG</text>';
       return;
@@ -658,12 +875,15 @@
       byLayer.get(layer).push(node);
     });
     const layers = Array.from(byLayer.keys()).sort((a, b) => a - b);
-    const nodeWidth = 118;
+    const nodeWidth = 152;
     const nodeHeight = 62;
     const rowGap = 12;
-    const columnGap = 168;
+    const columnGap = 196;
+    const tallest = Math.max(...layers.map((layer) => byLayer.get(layer).length));
     const canvasWidth = Math.max(760, layers.length * columnGap + 40);
-    const canvasHeight = 216;
+    const canvasHeight = Math.max(216, tallest * (nodeHeight + rowGap) + 32);
+    el.dag.setAttribute("width", String(canvasWidth));
+    el.dag.setAttribute("height", String(canvasHeight));
     el.dag.setAttribute("viewBox", `0 0 ${canvasWidth} ${canvasHeight}`);
 
     const coords = new Map();
@@ -921,11 +1141,17 @@
     const outgoing = (graph.edges || []).filter((edge) => edge.source === name);
     const incoming = (graph.edges || []).filter((edge) => edge.target === name);
     const events = (projection.events || [])
-      .filter((event) => event.payload && event.payload.node === name)
-      .slice(-12)
+      .filter(
+        (event) =>
+          (event.payload && event.payload.node === name) ||
+          event.stage === name ||
+          (name === "intake" && event.event_type === "intake.triaged") ||
+          (name === workflow.failed_node && event.event_type === "graph.failed")
+      )
+      .slice(-16)
       .reverse();
 
-    el.dockTitle.textContent = `${name} · 工作流节点`;
+    el.dockTitle.textContent = `${NODE_LABELS[name] || name} · ${name}`;
     el.dockStages.innerHTML = [
       uiBadge(`${meta.glyph} ${meta.label}`, meta.variant),
       uiBadge(`类型 ${node.kind || "node"}`, "muted"),
@@ -963,7 +1189,12 @@
           )}</span></div>`
       )
       .join("");
+    const failureNotice =
+      workflow.failed_node === name && workflow.last_error
+        ? uiNotice("bad", esc(localizeError(workflow.last_error)))
+        : "";
     el.dockBody.innerHTML = [
+      failureNotice,
       uiCard("节点定义", `<div class="kv">${rows}</div>`),
       uiCard(
         "节点事件",
@@ -982,11 +1213,21 @@
     }
     const task = currentTask(projection);
     if (!task) {
-      el.dockTitle.textContent = "任务执行详情";
+      const wf = projection.workflow || {};
+      const focusNode =
+        wf.failed_node ||
+        wf.current_node ||
+        (wf.graph && wf.graph.nodes && wf.graph.nodes[0] && wf.graph.nodes[0].name);
+      if (focusNode) {
+        renderWorkflowDock(projection, focusNode);
+        return;
+      }
+      el.dockTitle.textContent = "节点执行详情";
       el.dockStages.innerHTML = "";
       el.dockSubpane.innerHTML = "";
       el.dockTools.innerHTML = "";
-      el.dockBody.innerHTML = '<p class="view-note">暂无选中任务</p>';
+      el.dockTabs.innerHTML = "";
+      el.dockBody.innerHTML = '<p class="view-note">点击工作流或任务节点以查看事件与产物</p>';
       el.dockReceipt.innerHTML = "";
       return;
     }
@@ -1022,7 +1263,13 @@
     el.dockReceipt.innerHTML = receiptBlock(task.receipt);
   }
 
+  function setDockOpen(open) {
+    document.body.dataset.dock = open ? "open" : "closed";
+    el.dockOpen.hidden = Boolean(open);
+  }
+
   function renderAll(projection) {
+    const switchedRun = !state.projection || state.projection.run_id !== projection.run_id;
     state.projection = projection;
     const nodes = projection.dag.nodes || [];
     if (
@@ -1039,11 +1286,18 @@
       runEntry.status = projection.status;
       runEntry.workflow_name = projection.workflow_name || runEntry.workflow_name;
     }
+    if (switchedRun && !state.userOpenedDock) {
+      const hasBlockedTask = Boolean(
+        projection.hitl_banner && projection.hitl_banner.kind === "task_blocked"
+      );
+      setDockOpen(hasBlockedTask);
+    }
     renderStage(projection);
     renderBanner(projection);
     renderTriage(projection);
     renderClarify(projection);
     renderWorkflow(projection);
+    renderStageLivePanel(projection);
     renderDag(projection);
     renderLanes(projection);
     renderMatrix(projection);
@@ -1057,19 +1311,21 @@
     if (!state.projection || !taskId) return;
     state.workflowNode = null;
     state.selectedTaskId = taskId;
+    state.userOpenedDock = true;
     renderWorkflow(state.projection);
     renderDag(state.projection);
     renderLanes(state.projection);
     renderDock(state.projection);
+    setDockOpen(true);
   }
 
   function selectWorkflowNode(name) {
     if (!state.projection || !name) return;
     state.workflowNode = name;
+    state.userOpenedDock = true;
     renderWorkflow(state.projection);
     renderDock(state.projection);
-    document.body.dataset.dock = "open";
-    el.dockOpen.hidden = true;
+    setDockOpen(true);
   }
 
   function updateWorkflowMeta() {
@@ -1171,6 +1427,7 @@
 
   async function loadRun(runId) {
     state.runId = runId;
+    state.userOpenedDock = false;
     const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
     const data = await response.json();
     if (state.runId !== runId) return;
@@ -1187,7 +1444,7 @@
       state.sse.close();
       state.sse = null;
     }
-    if (typeof EventSource === "undefined") return;
+    if (typeof EventSource === "undefined" || params.get("nosse") === "1") return;
     const source = new EventSource(
       `/api/runs/${encodeURIComponent(runId)}/stream?after_seq=${afterSeq}`
     );
@@ -1323,13 +1580,13 @@
     });
 
     el.dockClose.addEventListener("click", () => {
-      document.body.dataset.dock = "closed";
-      el.dockOpen.hidden = false;
+      state.userOpenedDock = false;
+      setDockOpen(false);
     });
 
     el.dockOpen.addEventListener("click", () => {
-      document.body.dataset.dock = "open";
-      el.dockOpen.hidden = true;
+      state.userOpenedDock = true;
+      setDockOpen(true);
     });
 
     el.dag.addEventListener("click", (event) => {
@@ -1429,6 +1686,20 @@
 
     el.approvePlan.addEventListener("click", async () => {
       await sendCommand({ action: "approve_plan" }, "已批准任务计划，开始执行");
+    });
+
+    el.retryWorkflow.addEventListener("click", async () => {
+      await sendCommand({ action: "retry_workflow" }, "已从断点重新启动工作流");
+    });
+
+    el.inspectFailure.addEventListener("click", () => {
+      const workflow = (state.projection && state.projection.workflow) || {};
+      selectWorkflowNode(workflow.failed_node || workflow.current_node || "align");
+    });
+
+    el.stageLivePanel.addEventListener("click", (event) => {
+      const jump = event.target.closest("[data-jump-design]");
+      if (jump) setView("design");
     });
 
     el.lanes.addEventListener("click", (event) => {

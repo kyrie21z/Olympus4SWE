@@ -37,7 +37,7 @@ class AnthropicMessagesDialect:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] = (),
         temperature: float = 0.0,
-        timeout: float = 90.0,
+        timeout: float = 180.0,
     ) -> LLMResponse:
         body = self._build_body(
             model=model,

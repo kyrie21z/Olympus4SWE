@@ -844,11 +844,15 @@ def _build_workflow_view(
     statuses: dict[str, str] = {name: "pending" for name in node_names}
     current_node: str | None = None
     paused: dict[str, Any] | None = None
+    failed_node: str | None = None
+    last_error: str | None = None
     finished = False
     for event in events:
         payload = event.payload
         node = payload.get("node")
         if event.event_type == "graph.node_started" and isinstance(node, str):
+            failed_node = None
+            last_error = None
             current_node = node
             if node in statuses:
                 statuses[node] = "running"
@@ -868,6 +872,23 @@ def _build_workflow_view(
             finished = True
         elif event.event_type == "graph.node_error" and isinstance(node, str) and node in statuses:
             statuses[node] = "error"
+            failed_node = node
+            if payload.get("error"):
+                last_error = str(payload.get("error"))
+        elif event.event_type == "graph.failed":
+            last_error = str(payload.get("error") or "工作流执行异常中断")
+            failed_node = current_node or (node if isinstance(node, str) else None)
+            if failed_node and failed_node in statuses:
+                statuses[failed_node] = "failed"
+            current_node = None
+
+    if run_status == RunStatus.FAILED:
+        for name, st in list(statuses.items()):
+            if st == "running":
+                statuses[name] = "failed"
+                failed_node = failed_node or name
+        if last_error is None:
+            last_error = "工作流执行异常中断"
 
     return {
         "name": workflow_name,
@@ -878,6 +899,8 @@ def _build_workflow_view(
         "node_statuses": dict(statuses),
         "current_node": current_node,
         "paused": paused,
+        "failed_node": failed_node,
+        "last_error": last_error,
         "finished": finished or run_status == RunStatus.COMPLETED,
     }
 
@@ -1021,6 +1044,9 @@ def build_run_projection(
                 }
             )
 
+    workflow_name = str(snap.get("workflow_name") or "product_blueprint")
+    workflow_view = _build_workflow_view(workflow_name, events, snap["status"])
+
     blocked_tasks = [t for t in tasks if t.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     hitl_banner: dict[str, Any] | None = None
     if blocked_tasks:
@@ -1032,6 +1058,18 @@ def build_run_projection(
             "headline": f"阻塞：{bt.task_id} 重试 {max(1, bt.review_cycle)} 次仍失败，需要人工处理",
             "detail": bt.last_error or "验收未通过且重试额度已用尽",
             "actions": ["inspect", "retry", "hint", "reassign", "accept_risk"],
+        }
+    elif snap["status"] == RunStatus.FAILED:
+        f_node = workflow_view.get("failed_node") or "workflow"
+        err_msg = workflow_view.get("last_error") or "模型调用超时或执行异常中断"
+        hitl_banner = {
+            "kind": "run_failed",
+            "tone": "danger",
+            "task_id": None,
+            "failed_node": f_node,
+            "headline": f"节点 {f_node} 执行中断，可从当前断点直接重试",
+            "detail": err_msg,
+            "actions": ["retry_workflow"],
         }
     elif spec is not None and not spec_approved:
         blockers = spec.unresolved_blockers()
@@ -1085,26 +1123,57 @@ def build_run_projection(
     accepted_count = sum(1 for t in tasks if t.status == TaskStatus.ACCEPTED)
     ledger: BudgetLedger = snap["budget_ledger"]
     policy: BudgetPolicy = snap["budget_policy"]
+    raw_input = spec.goal if spec is not None else str(snap["title"])
     triage_payload: dict[str, Any] | None = None
+    stage_activity: list[dict[str, Any]] = []
+    stage_event_types = {
+        "intake.triaged",
+        "spec.drafted",
+        "spec.clarified",
+        "spec.confirmed",
+        "design.generated",
+        "design.approved",
+        "plan.generated",
+        "plan.approved",
+        "graph.failed",
+    }
     for event in events:
-        if event.event_type == "intake.triaged":
+        if event.event_type == "graph.input_recorded":
+            recorded = str(event.payload.get("raw_input") or "").strip()
+            if recorded:
+                raw_input = recorded
+        elif event.event_type == "intake.triaged":
             triage_payload = dict(event.payload)
+        if event.event_type in stage_event_types or (
+            event.event_type == "turn.receipt" and event.payload.get("task_id") is None
+        ):
+            stage_activity.append(
+                {
+                    "event_seq": event.event_seq,
+                    "stage": event.stage,
+                    "event_type": event.event_type,
+                    "actor": event.actor,
+                    "summary": str(
+                        event.payload.get("one_line")
+                        or event.payload.get("error")
+                        or event.event_type
+                    ),
+                }
+            )
 
     return {
         "run_id": snap["run_id"],
         "title": snap["title"],
+        "raw_input": raw_input,
         "mode": snap["mode"].value,
         "status": snap["status"].value,
         "state_revision": snap["state_revision"],
         "created_at": snap["created_at"],
         "updated_at": snap["updated_at"],
-        "workflow_name": snap.get("workflow_name", "product_blueprint"),
-        "workflow": _build_workflow_view(
-            str(snap.get("workflow_name") or "product_blueprint"),
-            events,
-            snap["status"],
-        ),
+        "workflow_name": workflow_name,
+        "workflow": workflow_view,
         "triage": triage_payload,
+        "stage_activity": stage_activity[-12:],
         "spec_approved": spec_approved,
         "design_approved": design_approved,
         "plan_approved": plan_approved,

@@ -8,7 +8,7 @@ cycles always converge.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -66,6 +66,7 @@ class Graph:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: dict[str, list[str]] = field(default_factory=dict)
     routers: dict[str, RouterFn] = field(default_factory=dict)
+    router_targets: dict[str, list[str]] = field(default_factory=dict)
 
     def add_node(
         self,
@@ -94,10 +95,19 @@ class Graph:
         if target not in (START, END):
             self.edges.setdefault(target, [])
 
-    def add_router(self, source: str, fn: RouterFn) -> None:
+    def add_router(
+        self,
+        source: str,
+        fn: RouterFn,
+        *,
+        targets: Sequence[str] | None = None,
+    ) -> Graph:
         if source not in self.nodes:
             raise KeyError(f"Cannot attach router to unknown node: {source}")
         self.routers[source] = fn
+        if targets is not None:
+            self.router_targets[source] = [t for t in dict.fromkeys(targets) if t]
+        return self
 
     def successors(self, node_name: str, state: Mapping[str, Any]) -> list[str]:
         """Resolve the next node names from a router first, then static edges."""
@@ -112,6 +122,35 @@ class Graph:
 
     def describe(self) -> dict[str, Any]:
         """Serializable topology summary used by the workflow API and projection."""
+        edges_out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for source, targets in self.edges.items():
+            if source == START:
+                continue
+            for target in targets:
+                if (source, target) not in seen:
+                    seen.add((source, target))
+                    edges_out.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            # Router fan-out is a runtime decision; the console draws it dashed.
+                            "conditional": source in self.routers,
+                        }
+                    )
+        for source, targets in self.router_targets.items():
+            if source == START:
+                continue
+            for target in targets:
+                if (source, target) not in seen:
+                    seen.add((source, target))
+                    edges_out.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "conditional": True,
+                        }
+                    )
         return {
             "name": self.name,
             "start": [n for n in self.edges.get(START, [])],
@@ -125,17 +164,7 @@ class Graph:
                 }
                 for node in self.nodes.values()
             ],
-            "edges": [
-                {
-                    "source": source,
-                    "target": target,
-                    # Router fan-out is a runtime decision; the console draws it dashed.
-                    "conditional": source in self.routers,
-                }
-                for source, targets in self.edges.items()
-                for target in targets
-                if source != START
-            ],
+            "edges": edges_out,
             "routers": sorted(self.routers),
         }
 

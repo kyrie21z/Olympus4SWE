@@ -154,7 +154,7 @@ class PooledProvider:
         model_name: str,
         dialect: Dialect,
         pool: CredentialPool,
-        timeout: float = 90.0,
+        timeout: float = 180.0,
     ) -> None:
         self.model_name = model_name
         self.dialect = dialect

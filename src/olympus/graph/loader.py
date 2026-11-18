@@ -446,7 +446,11 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
     for edge in definition.edges:
         graph.add_edge(edge.source, edge.target)
     for router in definition.routers:
-        graph.add_router(router.at, _bind_router(router))
+        graph.add_router(
+            router.at,
+            _bind_router(router),
+            targets=[*router.rules.values(), router.default],
+        )
     return graph
 
 

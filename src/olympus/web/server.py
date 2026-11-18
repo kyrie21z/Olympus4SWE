@@ -25,6 +25,7 @@ from olympus.graph.loader import load_workflow
 from olympus.stages.align import AlignStage
 from olympus.stages.design import DesignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo
 from olympus.web.projection import build_run_projection, seed_demo_runs
 from olympus.web.supervisor import RunSupervisor
 
@@ -75,10 +76,13 @@ class AriadneApp:
             "default_run_id": runs[0]["run_id"] if runs else None,
         }
 
+    def _workspace_for(self, run_id: str) -> Path:
+        return self.supervisor.resolve_workspace(run_id)
+
     def get_run_payload(self, run_id: str) -> dict[str, Any]:
         proj = build_run_projection(
             self.store,
-            self.workspace_root,
+            self._workspace_for(run_id),
             run_id,
             artifacts_root=self.artifacts_root,
         )
@@ -106,6 +110,7 @@ class AriadneApp:
         operation_id = str(body.get("operation_id") or new_id("op"))
         actor = str(body.get("actor") or "zeus")
         snap = self.store.get_run(run_id)
+        ws = self._workspace_for(run_id)
         expected_rev_raw = body.get("expected_state_revision")
         expected_rev = (
             int(expected_rev_raw) if expected_rev_raw is not None else int(snap["state_revision"])
@@ -155,7 +160,7 @@ class AriadneApp:
             align = AlignStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 trace_dir=self.artifacts_root,
             )
             spec = align.confirm_spec(
@@ -179,7 +184,7 @@ class AriadneApp:
             design_stage = DesignStage(
                 self.store,
                 self.supervisor.resolve_provider(run_id),
-                self.workspace_root,
+                ws,
                 artifacts_root=self.artifacts_root,
             )
             record = design_stage.approve_design(
@@ -197,7 +202,7 @@ class AriadneApp:
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 artifacts_root=self.artifacts_root,
             )
             rec = orch.approve_plan(
@@ -215,7 +220,7 @@ class AriadneApp:
             align = AlignStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 trace_dir=self.artifacts_root,
             )
             spec = align.apply_clarifications(
@@ -237,7 +242,7 @@ class AriadneApp:
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 artifacts_root=self.artifacts_root,
             )
             cmd_result = orch.retry_blocked_task(
@@ -258,7 +263,7 @@ class AriadneApp:
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 artifacts_root=self.artifacts_root,
             )
             cmd_result = orch.accept_task_risk(
@@ -280,7 +285,7 @@ class AriadneApp:
             orch = OrchestrateStage(
                 store=self.store,
                 provider=self.supervisor.resolve_provider(run_id),
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 artifacts_root=self.artifacts_root,
             )
 
@@ -432,7 +437,7 @@ class AriadneApp:
 
         projection = build_run_projection(
             self.store,
-            self.workspace_root,
+            ws,
             run_id,
             artifacts_root=self.artifacts_root,
         )
@@ -555,6 +560,13 @@ def create_http_server(
                     )
                     return
 
+                if path == "/api/demos":
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"ok": True, "demos": list_benchmark_presets()},
+                    )
+                    return
+
                 if path.startswith("/api/runs/"):
                     parts = [p for p in path.split("/") if p]
                     # parts: ['api', 'runs', '<run_id>', ...]
@@ -656,7 +668,28 @@ def create_http_server(
 
                 parts = [p for p in path.split("/") if p]
                 if len(parts) == 2 and parts[0] == "api" and parts[1] == "runs":
-                    raw_input = str(body.get("raw_input") or body.get("goal") or "").strip()
+                    demo_id = str(body.get("demo_id") or "").strip()
+                    preset: dict[str, Any] | None = None
+                    resolved_ws: Path | str | None = body.get("workspace_root")
+                    if demo_id:
+                        preset, demo_ws = materialize_benchmark_demo(
+                            demo_id,
+                            workspace_parent=app.workspace_root / ".olympus" / "workspaces",
+                        )
+                        if not resolved_ws:
+                            resolved_ws = demo_ws
+                    elif resolved_ws:
+                        ws_candidate = Path(str(resolved_ws)).resolve()
+                        if not ws_candidate.is_dir():
+                            raise FileNotFoundError(
+                                f"workspace_root not found: {resolved_ws}"
+                            )
+                        resolved_ws = ws_candidate
+
+                    default_goal = str(preset["raw_input"]) if preset else ""
+                    raw_input = str(
+                        body.get("raw_input") or body.get("goal") or default_goal
+                    ).strip()
                     if not raw_input:
                         self._send_json(
                             HTTPStatus.BAD_REQUEST,
@@ -666,13 +699,30 @@ def create_http_server(
                             },
                         )
                         return
+                    raw_constraints = body.get("constraints")
+                    if isinstance(raw_constraints, list):
+                        constraints = [
+                            str(item).strip()
+                            for item in raw_constraints
+                            if str(item).strip()
+                        ]
+                    elif preset:
+                        constraints = list(preset.get("constraints") or [])
+                    else:
+                        constraints = []
+                    default_title = str(preset["title"]) if preset else raw_input[:60]
+                    default_workflow = (
+                        str(preset["default_workflow"]) if preset else "product_blueprint"
+                    )
                     started = app.supervisor.start_run(
-                        title=str(body.get("title") or raw_input[:60]),
+                        title=str(body.get("title") or default_title),
                         raw_input=raw_input,
-                        workflow_name=str(body.get("workflow_name") or "product_blueprint"),
+                        workflow_name=str(body.get("workflow_name") or default_workflow),
                         provider_config=dict(body.get("provider_config") or {}),
                         auto_approve=bool(body.get("auto_approve", False)),
                         sync=bool(body.get("sync", False)),
+                        constraints=constraints,
+                        workspace_root=resolved_ws,
                     )
                     self._send_json(HTTPStatus.OK, {"ok": True, **started})
                     return
@@ -707,7 +757,7 @@ def create_http_server(
                     with contextlib.suppress(Exception):
                         conflict_payload["projection"] = build_run_projection(
                             app.store,
-                            app.workspace_root,
+                            app._workspace_for(req_parts[2]),
                             req_parts[2],
                             artifacts_root=app.artifacts_root,
                         )

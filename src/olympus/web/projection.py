@@ -1284,6 +1284,7 @@ def build_run_projection(
         "run_id": snap["run_id"],
         "title": snap["title"],
         "raw_input": raw_input,
+        "workspace_root": snap.get("workspace_root") or str(Path(workspace_root).resolve()),
         "mode": snap["mode"].value,
         "status": snap["status"].value,
         "state_revision": snap["state_revision"],

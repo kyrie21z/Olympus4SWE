@@ -66,13 +66,13 @@ routers:
     key: route
     default: critic
     rules:
-      blocked: END
+      blocked: gate_spec
       ready: critic
   - at: critic
     key: route
     default: gate_spec
     rules:
-      blocked: END
+      blocked: gate_spec
       ready: gate_spec
   - at: validate_design
     key: route

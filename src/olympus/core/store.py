@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS runs (
     design_json TEXT,
     workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch',
     provider_config_json TEXT,
+    workspace_root TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -136,6 +137,7 @@ class RunStore:
             "design_json": "design_json TEXT",
             "workflow_name": "workflow_name TEXT NOT NULL DEFAULT 'repo_fast_patch'",
             "provider_config_json": "provider_config_json TEXT",
+            "workspace_root": "workspace_root TEXT",
         }
         for column, ddl in additions.items():
             if column in existing:
@@ -344,6 +346,7 @@ class RunStore:
         actor: str = "system",
         workflow_name: str = "product_blueprint",
         provider_config: dict[str, Any] | None = None,
+        workspace_root: Path | str | None = None,
     ) -> str:
         rid = run_id or new_id("run")
         policy = budget_policy or BudgetPolicy()
@@ -354,6 +357,7 @@ class RunStore:
             if provider_config is not None
             else None
         )
+        ws_root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
         with self._tx() as conn:
             conn.execute(
                 """
@@ -361,9 +365,9 @@ class RunStore:
                     run_id, title, mode, status, state_revision,
                     budget_policy_json, budget_ledger_json,
                     spec_json, plan_json, design_json,
-                    workflow_name, provider_config_json,
+                    workflow_name, provider_config_json, workspace_root,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
                 """,
                 (
                     rid,
@@ -375,6 +379,7 @@ class RunStore:
                     ledger.model_dump_json(),
                     workflow_name,
                     provider_json,
+                    ws_root,
                     now,
                     now,
                 ),
@@ -389,6 +394,7 @@ class RunStore:
                     "title": title,
                     "mode": mode.value,
                     "workflow_name": workflow_name,
+                    "workspace_root": ws_root,
                 },
                 state_revision=1,
             )
@@ -441,6 +447,7 @@ class RunStore:
                     if row["provider_config_json"]
                     else None
                 ),
+                "workspace_root": row["workspace_root"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }

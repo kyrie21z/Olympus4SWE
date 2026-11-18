@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,13 @@ def build_sandbox_env(
     venv_candidates = [ws / ".venv"]
     if host is not None and host != ws:
         venv_candidates.append(host / ".venv")
+    current_prefix = Path(sys.executable).resolve().parent.parent
+    if (
+        (current_prefix / "pyvenv.cfg").exists()
+        and (current_prefix / "bin" / "pytest").exists()
+        and current_prefix not in venv_candidates
+    ):
+        venv_candidates.append(current_prefix)
     for venv_dir in venv_candidates:
         bin_dir = venv_dir / "bin"
         if bin_dir.is_dir():

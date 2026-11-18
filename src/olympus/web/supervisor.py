@@ -234,6 +234,16 @@ class RunSupervisor:
 
         return _observe
 
+    def resolve_workspace(self, run_id: str) -> Path:
+        """Return the run's dedicated workspace_root when configured, else supervisor root."""
+        snap = self.store.get_run(run_id)
+        raw = snap.get("workspace_root")
+        if isinstance(raw, str) and raw.strip():
+            candidate = Path(raw).expanduser().resolve()
+            if candidate.exists():
+                return candidate
+        return self.workspace_root
+
     def _advance(
         self,
         run_id: str,
@@ -244,11 +254,12 @@ class RunSupervisor:
     ) -> dict[str, Any]:
         with self._lock_for(run_id):
             snap = self.store.get_run(run_id)
+            ws = self.resolve_workspace(run_id)
             definition = load_workflow(snap["workflow_name"])
             graph = build_graph(definition)
             runtime = WorkflowRuntime(
                 store=self.store,
-                workspace_root=self.workspace_root,
+                workspace_root=ws,
                 artifacts_root=self.artifacts_root,
                 provider=self.resolve_provider(run_id),
                 auto_approve=auto_approve,
@@ -257,7 +268,7 @@ class RunSupervisor:
             state: dict[str, Any] = {
                 "run_id": run_id,
                 "raw_input": raw_input,
-                "constraints": [],
+                "constraints": self._recorded_constraints(run_id),
                 "topology": definition.topology,
                 "route": None,
                 "_runtime": runtime,
@@ -404,6 +415,8 @@ class RunSupervisor:
         provider_config: dict[str, Any] | None = None,
         auto_approve: bool = False,
         sync: bool = False,
+        constraints: list[str] | None = None,
+        workspace_root: Path | str | None = None,
     ) -> dict[str, Any]:
         """Create a run and drive its workflow until a human gate or completion."""
         definition = load_workflow(workflow_name)
@@ -412,14 +425,19 @@ class RunSupervisor:
             title=title,
             workflow_name=definition.name,
             provider_config=config,
+            workspace_root=workspace_root,
             actor="supervisor",
         )
+        cleaned_constraints = [str(c).strip() for c in (constraints or []) if str(c).strip()]
         self.store.append_event(
             run_id=run_id,
             stage="graph",
             event_type="graph.input_recorded",
             actor="supervisor",
-            payload={"raw_input": raw_input},
+            payload={
+                "raw_input": raw_input,
+                "constraints": cleaned_constraints,
+            },
         )
         with self._guard:
             self._managed_runs.add(run_id)
@@ -492,6 +510,14 @@ class RunSupervisor:
                 if isinstance(raw, str) and raw.strip():
                     return raw
         return fallback
+
+    def _recorded_constraints(self, run_id: str) -> list[str]:
+        for ev in reversed(self.store.list_events(run_id, after_seq=0)):
+            if ev.event_type == "graph.input_recorded":
+                items = ev.payload.get("constraints")
+                if isinstance(items, list):
+                    return [str(item).strip() for item in items if str(item).strip()]
+        return []
 
     def resume_run(self, run_id: str, *, sync: bool = False) -> dict[str, Any]:
         """Advance a paused/awaiting run to its next gate or completion."""

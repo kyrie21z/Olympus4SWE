@@ -16,6 +16,7 @@
     pendingAction: null,
     optionsLoaded: false,
     workflows: [],
+    demos: [],
     clarifySig: "",
     userOpenedDock: false,
     sse: null,
@@ -63,6 +64,8 @@
     threadList: document.getElementById("thread-list"),
     newRunButton: document.getElementById("btn-new-run"),
     newRunDialog: document.getElementById("new-run-dialog"),
+    newRunDemo: document.getElementById("new-run-demo"),
+    newRunDemoNote: document.getElementById("new-run-demo-note"),
     newRunTitle: document.getElementById("new-run-title"),
     newRunWorkflow: document.getElementById("new-run-workflow"),
     newRunProvider: document.getElementById("new-run-provider"),
@@ -1451,17 +1454,47 @@
     el.newRunWorkflowMeta.textContent = `${summary} · 编写代码：${runsCode}`;
   }
 
+  function applyDemoSelection() {
+    if (!el.newRunDemo || !el.newRunDemoNote) return;
+    const demoId = el.newRunDemo.value;
+    const demo = state.demos.find((item) => item.id === demoId);
+    if (!demo) {
+      el.newRunDemoNote.textContent = "";
+      el.newRunDemoNote.hidden = true;
+      return;
+    }
+    el.newRunTitle.value = demo.title || "";
+    el.newRunInput.value = demo.raw_input || "";
+    if (
+      demo.default_workflow &&
+      state.workflows.some((wf) => wf.name === demo.default_workflow)
+    ) {
+      el.newRunWorkflow.value = demo.default_workflow;
+      updateWorkflowMeta();
+    }
+    const constraints = (demo.constraints || []).join("；");
+    const hints = (demo.clarification_hints || []).join(" / ");
+    const parts = [demo.workspace_summary || "独立隔离 git 工作区"];
+    if (constraints) parts.push(`初始约束：${constraints}`);
+    if (hints) parts.push(`建议澄清参考：${hints}`);
+    el.newRunDemoNote.textContent = parts.join(" · ");
+    el.newRunDemoNote.hidden = false;
+  }
+
   async function loadNewRunOptions() {
     if (state.optionsLoaded) return;
-    const [workflowsRes, providersRes] = await Promise.all([
+    const [workflowsRes, providersRes, demosRes] = await Promise.all([
       fetch("/api/workflows"),
       fetch("/api/providers"),
+      fetch("/api/demos"),
     ]);
-    const [workflowsData, providersData] = await Promise.all([
+    const [workflowsData, providersData, demosData] = await Promise.all([
       workflowsRes.json(),
       providersRes.json(),
+      demosRes.json(),
     ]);
     state.workflows = workflowsData.workflows || [];
+    state.demos = demosData.demos || [];
     el.newRunWorkflow.innerHTML = state.workflows
       .map(
         (workflow) =>
@@ -1475,6 +1508,19 @@
       el.newRunWorkflow.value = "product_blueprint";
     }
     updateWorkflowMeta();
+
+    if (el.newRunDemo) {
+      el.newRunDemo.innerHTML = [
+        '<option value="">空白需求（自由输入 · 主仓库工作区）</option>',
+        ...state.demos.map(
+          (demo) =>
+            `<option value="${esc(demo.id)}">${esc(
+              demo.label || demo.title || demo.id
+            )}</option>`
+        ),
+      ].join("");
+      applyDemoSelection();
+    }
 
     const providers = providersData.providers || [];
     el.newRunProvider.innerHTML = [
@@ -1510,12 +1556,22 @@
     const model = el.newRunModel.value.trim();
     const providerConfig = provider === "auto" ? {} : { provider };
     if (model) providerConfig.model = model;
+    const demoId = el.newRunDemo ? el.newRunDemo.value.trim() : "";
+    const selectedDemo = demoId
+      ? state.demos.find((item) => item.id === demoId)
+      : null;
     const payload = {
       raw_input: rawInput,
       title: el.newRunTitle.value.trim() || rawInput.slice(0, 60),
       workflow_name: el.newRunWorkflow.value || "product_blueprint",
       provider_config: providerConfig,
     };
+    if (demoId) {
+      payload.demo_id = demoId;
+      if (selectedDemo && Array.isArray(selectedDemo.constraints)) {
+        payload.constraints = selectedDemo.constraints;
+      }
+    }
     const response = await fetch("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1528,6 +1584,8 @@
     }
     await refreshRuns();
     el.runSelector.value = data.run_id;
+    if (el.newRunDemo) el.newRunDemo.value = "";
+    applyDemoSelection();
     el.newRunInput.value = "";
     el.newRunTitle.value = "";
     el.newRunModel.value = "";
@@ -1703,6 +1761,10 @@
     el.newRunButton.addEventListener("click", () => {
       openNewRun();
     });
+
+    if (el.newRunDemo) {
+      el.newRunDemo.addEventListener("change", applyDemoSelection);
+    }
 
     el.newRunWorkflow.addEventListener("change", updateWorkflowMeta);
 

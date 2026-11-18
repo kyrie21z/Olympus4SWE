@@ -669,3 +669,224 @@ def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Pat
         httpd.shutdown()
         httpd.server_close()
         supervisor.shutdown()
+
+
+def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    captured_align_prompts: list[str] = []
+
+    b001_spec_blocked: dict[str, object] = {
+        "spec_id": "spec-b001",
+        "version": 1,
+        "goal": "Add per-API-key rate limiting to the HTTP layer.",
+        "deliverable_kind": "rest_api",
+        "observable_surfaces": ["HTTP layer", "src/api/server.py", "src/api/store.py"],
+        "actors": ["api_client", "admin"],
+        "requirements": [
+            {
+                "id": "R1",
+                "description": "Enforce per-API-key rate limiting on HTTP requests",
+                "actor": "api_client",
+                "ears_criteria": [
+                    {
+                        "id": "R1-C1",
+                        "pattern": "event_driven",
+                        "condition": "an API key exceeds its request quota",
+                        "outcome": "reject with rate-limit error JSON",
+                    }
+                ],
+            }
+        ],
+        "out_of_scope": ["new third-party dependencies", "changing HTTP routes"],
+        "constraints": ["不得新增第三方依赖", "保持现有 HTTP 路由不变"],
+        "open_ambiguities": [
+            {
+                "id": "A1",
+                "question": "使用现有 SQLite 还是引入 Redis，限流阈值是多少？",
+                "impact": "决定存储契约与速率限制策略",
+                "options": ["复用现有 SQLite + 100 req/min", "引入 Redis"],
+                "default_assumption": None,
+                "blocking": True,
+                "answer": None,
+            }
+        ],
+    }
+
+    b001_design = json.loads(json.dumps(DESIGN_SPEC))
+    b001_design["shared_contract_paths"] = ["src/api/contracts.py"]
+    b001_design["modules"] = [
+        {
+            "id": "M1",
+            "name": "HTTPServer",
+            "responsibility": "HTTP rate-limit guard",
+            "requirement_refs": ["R1"],
+            "target_paths": ["src/api/server.py"],
+        },
+        {
+            "id": "M2",
+            "name": "SQLiteStore",
+            "responsibility": "SQLite rate-limit counters",
+            "requirement_refs": ["R1"],
+            "target_paths": ["src/api/store.py"],
+        },
+    ]
+    b001_design["interfaces"] = [
+        {
+            **b001_design["interfaces"][0],
+            "provider_module_id": "M2",
+            "consumer_module_ids": ["M1"],
+            "signature": "check_and_increment(api_key: str, limit: int) -> bool",
+        }
+    ]
+
+    b001_plan = json.loads(json.dumps(TASK_PLAN))
+    b001_plan["tasks"][0]["write_scope"] = ["src/api/contracts.py"]
+    b001_plan["tasks"][0]["deliverables"] = ["src/api/contracts.py"]
+    b001_plan["tasks"][0]["requirement_refs"] = ["R1"]
+    b001_plan["tasks"][0]["acceptance_checks"][0]["command"] = (
+        "python -c 'import api.store; assert callable(api.store.connect)'"
+    )
+    b001_plan["tasks"][1]["write_scope"] = ["src/api/server.py"]
+    b001_plan["tasks"][1]["acceptance_checks"][0]["command"] = (
+        "python -c 'from api.server import handle; "
+        "assert handle({\"path\": \"/\"})[\"status\"] == \"ok\"'"
+    )
+    b001_plan["tasks"][2] = {
+        "task_id": "T2",
+        "title": "Rate-limit pytest verification",
+        "objective": "Verify isolated B-001 test suite runs via pytest",
+        "requirement_refs": ["R1"],
+        "design_refs": ["M1", "M2"],
+        "depends_on": ["T1"],
+        "write_scope": ["tests/"],
+        "kind": "test",
+        "role": "qa",
+        "deliverables": ["tests/test_api.py"],
+        "acceptance_checks": [
+            {
+                "id": "T2-pytest",
+                "kind": "command",
+                "description": "run isolated B-001 pytest suite",
+                "command": "pytest -q",
+            }
+        ],
+    }
+    b001_plan["tasks"] = b001_plan["tasks"][:3]
+
+    def _b001_responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        system = messages[0].content
+        if "Requirements Alignment Architect" in system:
+            captured_align_prompts.append(messages[-1].content)
+            return LLMResponse(content=json.dumps(b001_spec_blocked))
+        if "White-Box Solution Architect" in system:
+            return LLMResponse(content=json.dumps(b001_design))
+        if "Stage 2 Task Planner" in system:
+            return LLMResponse(content=json.dumps(b001_plan))
+        if "Execution Engineer (Hephaestus)" in system:
+            return LLMResponse(content="Verified isolated B-001 module cleanly.")
+        if "Independent Verifier (Argus)" in system:
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": "T-CHECK",
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "All isolated B-001 checks passed.",
+                        "findings": [],
+                    }
+                )
+            )
+        raise AssertionError(f"Unexpected system prompt: {system[:120]}")
+
+    supervisor = RunSupervisor(
+        store=store,
+        workspace_root=tmp_path,
+        provider_builder=lambda **kwargs: MockLLMProvider(responder=_b001_responder),
+    )
+    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
+    httpd = create_http_server(app, host="127.0.0.1", port=0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with httpx.Client(base_url=base_url, timeout=60.0) as client:
+            assert 'id="new-run-demo"' in client.get("/").text
+            demos_res = client.get("/api/demos")
+            assert demos_res.status_code == 200
+            demos = demos_res.json()["demos"]
+            b001 = next(item for item in demos if item["id"] == "B-001")
+            assert b001["default_workflow"] == "full_sdlc_tdd"
+            assert "不得新增第三方依赖" in b001["constraints"]
+
+            # Create B-001 run; blocking ambiguity must route to gate_spec, never END.
+            created = client.post(
+                "/api/runs",
+                json={
+                    "demo_id": "B-001",
+                    "provider_config": {"provider": "mock"},
+                    "sync": True,
+                },
+            )
+            assert created.status_code == 200, created.text
+            created_data = created.json()
+            assert created_data["status"] == "awaiting_human"
+            assert created_data["paused"]["node"] == "gate_spec"
+            run_id = created_data["run_id"]
+
+            assert captured_align_prompts
+            assert "不得新增第三方依赖" in captured_align_prompts[0]
+            assert "保持现有 HTTP 路由不变" in captured_align_prompts[0]
+
+            proj = client.get(f"/api/runs/{run_id}").json()["projection"]
+            isolated_ws = Path(proj["workspace_root"])
+            assert isolated_ws != tmp_path.resolve()
+            assert (isolated_ws / "src" / "api" / "server.py").is_file()
+            assert (isolated_ws / "src" / "api" / "store.py").is_file()
+            assert (isolated_ws / "tests" / "test_api.py").is_file()
+            assert not (tmp_path / "src" / "api").exists()
+            assert proj["hitl_banner"]["kind"] == "spec_gate"
+            assert "未决阻断项" in proj["hitl_banner"]["headline"]
+
+            # Clarify in place, then approve spec -> design -> plan -> execute in isolated repo.
+            clarified = client.post(
+                f"/api/runs/{run_id}/command",
+                json={
+                    "action": "clarify",
+                    "answers": {"A1": "复用现有 SQLite 限流 100 req/min"},
+                    "auto_advance": False,
+                },
+            ).json()["projection"]
+            assert "关口 1 待批准" in clarified["hitl_banner"]["headline"]
+
+            spec_ok = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "approve_spec", "sync": True},
+            ).json()["projection"]
+            assert spec_ok["design"] is not None, (
+                spec_ok.get("status"),
+                spec_ok.get("hitl_banner"),
+                spec_ok.get("workflow"),
+            )
+            assert spec_ok["hitl_banner"]["kind"] == "design_gate"
+
+            design_ok = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "approve_design", "sync": True},
+            ).json()["projection"]
+            assert design_ok["plan"] is not None
+            assert design_ok["hitl_banner"]["kind"] == "plan_gate"
+
+            exec_ok = client.post(
+                f"/api/runs/{run_id}/command",
+                json={"action": "approve_plan", "sync": True},
+            ).json()["projection"]
+            assert exec_ok["status"] == "completed"
+            assert [s["status"] for s in exec_ok["stage_pipeline"]] == ["done"] * 5
+            assert all(n["status"] == "accepted" for n in exec_ok["dag"]["nodes"])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        supervisor.shutdown()

@@ -234,6 +234,12 @@ export class Workbench {
   /** Switch the console to another run; the transport hook reconnects on `streamGeneration`. */
   loadRun(runId: string): void {
     const s = this.state;
+    if (s.runId !== runId) {
+      this.pendingAction = null;
+      s.dialog = null;
+      const hitlDialog = byId<HTMLDialogElement>("hitl-dialog");
+      if (hitlDialog?.open) hitlDialog.close();
+    }
     s.runId = runId;
     s.userOpenedDock = false;
     s.activity = undefined;
@@ -698,17 +704,27 @@ export class Workbench {
   }
 
   async retryBannerTask(): Promise<void> {
+    const projection = this.state.projection;
     const taskId = this.bannerTaskId();
-    if (!taskId) return;
+    if (!taskId || !projection || projection.run_id !== this.state.runId) return;
     await this.sendCommand(
-      { action: "retry_task", task_id: taskId, hint: "" },
+      {
+        action: "retry_task",
+        task_id: taskId,
+        hint: "",
+        expected_state_revision: projection.state_revision,
+      },
       `已将任务 ${taskId} 重置为就绪 (READY)`,
+      projection.run_id,
     );
   }
 
   hintBannerTask(): void {
+    const projection = this.state.projection;
     const taskId = this.bannerTaskId();
-    if (!taskId) return;
+    if (!taskId || !projection || projection.run_id !== this.state.runId) return;
+    const targetRunId = projection.run_id;
+    const expectedRevision = projection.state_revision;
     this.openDialog({
       title: `向任务 ${taskId} 注入人工提示并重试`,
       description:
@@ -719,15 +735,24 @@ export class Workbench {
       requireNonEmpty: true,
       onConfirm: (hint) =>
         this.sendCommand(
-          { action: "retry_task", task_id: taskId, hint },
+          {
+            action: "retry_task",
+            task_id: taskId,
+            hint,
+            expected_state_revision: expectedRevision,
+          },
           `已向 ${taskId} 注入提示并重新排入就绪队列`,
+          targetRunId,
         ),
     });
   }
 
   reassignBannerTask(): void {
+    const projection = this.state.projection;
     const taskId = this.bannerTaskId();
-    if (!taskId) return;
+    if (!taskId || !projection || projection.run_id !== this.state.runId) return;
+    const targetRunId = projection.run_id;
+    const expectedRevision = projection.state_revision;
     this.openDialog({
       title: `将任务 ${taskId} 改派给人工工程师`,
       description:
@@ -738,15 +763,24 @@ export class Workbench {
       requireNonEmpty: true,
       onConfirm: (note) =>
         this.sendCommand(
-          { action: "reassign_human", task_id: taskId, note },
+          {
+            action: "reassign_human",
+            task_id: taskId,
+            note,
+            expected_state_revision: expectedRevision,
+          },
           `已记录 ${taskId} 改派人工并回到就绪态`,
+          targetRunId,
         ),
     });
   }
 
   acceptBannerTaskRisk(): void {
+    const projection = this.state.projection;
     const taskId = this.bannerTaskId();
-    if (!taskId) return;
+    if (!taskId || !projection || projection.run_id !== this.state.runId) return;
+    const targetRunId = projection.run_id;
+    const expectedRevision = projection.state_revision;
     this.openDialog({
       title: `接受风险完成任务 ${taskId}`,
       description:
@@ -757,8 +791,14 @@ export class Workbench {
       requireNonEmpty: true,
       onConfirm: (reason) =>
         this.sendCommand(
-          { action: "accept_risk", task_id: taskId, reason },
+          {
+            action: "accept_risk",
+            task_id: taskId,
+            reason,
+            expected_state_revision: expectedRevision,
+          },
           `已记录人工接受风险，${taskId} 标记为未验证 · 人工接受`,
+          targetRunId,
         ),
     });
   }
@@ -795,6 +835,10 @@ export class Workbench {
   async closeDialog(returnValue: string): Promise<void> {
     const pending = this.pendingAction;
     this.pendingAction = null;
+    if (this.state.dialog !== null) {
+      this.state.dialog = null;
+      this.commit();
+    }
     if (returnValue !== "confirm" || !pending) return;
     const text = (byId<HTMLTextAreaElement>("hitl-dialog-input")?.value || "").trim();
     if (pending.requireNonEmpty && !text) {

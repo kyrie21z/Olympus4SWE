@@ -136,10 +136,13 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
     });
   };
 
+  const fileReadSeq = useRef(0);
+
   const onClose = async (choice: string) => {
     if (choice !== "create") return;
     const created = await workbench.submitNewRun(formRef.current);
     if (!created) return;
+    fileReadSeq.current += 1;
     setForm((current) => ({ ...current, demoId: "", input: "", title: "", model: "" }));
     setFileNote(FILE_NOTE);
   };
@@ -147,12 +150,17 @@ export function NewRunDialog({ workbench, state }: { workbench: Workbench; state
   const onFile = () => {
     const file = fileInput.current?.files?.[0];
     if (!file) return;
+    const seq = ++fileReadSeq.current;
     const reader = new FileReader();
     reader.addEventListener("load", () => {
+      if (seq !== fileReadSeq.current) return;
       set({ input: String(reader.result || "") });
       setFileNote(`已载入 ${file.name} · ${file.size} bytes`);
     });
-    reader.addEventListener("error", () => workbench.toast("读取本地文件失败"));
+    reader.addEventListener("error", () => {
+      if (seq !== fileReadSeq.current) return;
+      workbench.toast("读取本地文件失败");
+    });
     reader.readAsText(file, "utf-8");
     if (fileInput.current) fileInput.current.value = "";
   };

@@ -71,12 +71,27 @@ export function openRunStream(
 
     stream.addEventListener("state", async (event: MessageEvent<string>) => {
       if (!isCurrent()) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== "object") return;
+      const frame = parsed as Partial<StreamStateFrame>;
+      if (frame.run_id !== runId) return;
+      if (typeof frame.state_revision !== "number" || !Number.isFinite(frame.state_revision)) {
+        return;
+      }
+      const revision = frame.state_revision;
+      const events = Array.isArray(frame.events) ? frame.events : [];
+      const lastEventSeq = events.at(-1)?.event_seq;
+      const seq =
+        typeof lastEventSeq === "number" && Number.isFinite(lastEventSeq)
+          ? lastEventSeq
+          : afterSeq;
       let request: [number, number] | undefined;
       try {
-        const frame = JSON.parse(event.data) as StreamStateFrame;
-        if (frame.run_id !== runId) return;
-        const revision = frame.state_revision;
-        const seq = frame.events.at(-1)?.event_seq ?? afterSeq;
         const current = handlers.current();
         const shownRevision = current?.run_id === runId ? current.state_revision : -1;
         const shownSeq = current?.run_id === runId ? current.latest_event_seq : -1;
@@ -116,8 +131,15 @@ export function openRunStream(
 
     stream.addEventListener("activity", (event: MessageEvent<string>) => {
       if (!isCurrent()) return;
-      const frame = JSON.parse(event.data) as StreamActivityFrame;
-      if (frame.run_id !== runId) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== "object") return;
+      const frame = parsed as Partial<StreamActivityFrame>;
+      if (frame.run_id !== runId || !frame.previews || typeof frame.previews !== "object") return;
       handlers.activity(frame.previews);
     });
 

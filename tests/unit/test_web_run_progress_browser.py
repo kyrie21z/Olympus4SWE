@@ -951,6 +951,10 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
     expect(broken.locator("#workflow-badge")).to_contain_text("产品蓝图")
     expect(broken.locator("#run-current-stage")).to_contain_text("有任务受阻")
+    broken.unroute("**/static/assets/ariadne-graph*.js")
+    broken.locator("#thread-list .thread-item").nth(1).click()
+    expect(broken.locator("#dag-graph .ag-island")).to_be_visible()
+    expect(broken.locator("#workflow-graph .ag-island")).to_be_visible()
     broken.close()
 
 

@@ -18,7 +18,26 @@ IGNORED_DIR_NAMES = frozenset(
     {".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".olympus"}
 )
 
+SANDBOX_TMP_ENV_VARS = ("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR")
+
 _GLOB_CHARS = ("*", "?", "[")
+
+
+def sandbox_tmp_path(
+    workspace_root: Path | str,
+    host_root: Path | str | None = None,
+) -> Path:
+    """Return the per-sandbox temp directory, kept outside the sandbox git worktree."""
+    ws = Path(workspace_root).resolve()
+    if host_root is not None:
+        host = Path(host_root).resolve()
+    else:
+        parent = ws.parent
+        if parent.name == "sandboxes" and parent.parent.name == ".olympus":
+            host = parent.parent.parent
+        else:
+            host = next((c for c in (ws, *ws.parents) if (c / ".git").is_dir()), ws)
+    return host / ".olympus" / "sandbox_tmp" / ws.name
 
 
 def build_sandbox_env(
@@ -61,6 +80,10 @@ def build_sandbox_env(
             if entry and entry not in python_roots:
                 python_roots.append(entry)
     env["PYTHONPATH"] = os.pathsep.join(python_roots)
+    tmp_dir = sandbox_tmp_path(ws, host)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for name in SANDBOX_TMP_ENV_VARS:
+        env[name] = str(tmp_dir)
     return env
 
 

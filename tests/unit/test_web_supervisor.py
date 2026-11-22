@@ -1045,7 +1045,7 @@ def test_supervisor_resolves_configured_watchdog_provider(tmp_path: Path) -> Non
 
     supervisor = RunSupervisor(
         store=store, workspace_root=tmp_path, provider_builder=provider_builder,
-        watchdog_config=WatchdogConfig(clock=lambda: now, wait=wait),
+        watchdog_config=WatchdogConfig(interval_seconds=300, clock=lambda: now, wait=wait),
     )
     app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
     try:

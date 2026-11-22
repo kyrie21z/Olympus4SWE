@@ -801,7 +801,8 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
 
     ledger = store.get_run(run_id)["budget_ledger"]
     assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
-    assert ledger.llm_calls_used == 3  # two Pi steps + one native Argus call
+    watchdog_calls = 1 if watchdog_enabled else 0
+    assert ledger.llm_calls_used == 3 + watchdog_calls
 
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
     assert "--mode" in argv and argv[argv.index("--mode") + 1] == "rpc"

@@ -1037,6 +1037,10 @@ class OrchestrateStage:
                     objective=leased.objective,
                     write_scope=leased.write_scope,
                     emit=emit_watchdog,
+                    store=self.store,
+                    run_id=run_id,
+                    baseline=worker_baseline,
+                    forbidden_globs=list(forbidden_contracts),
                 )
             worker_error = None
             try:

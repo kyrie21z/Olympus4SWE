@@ -1962,7 +1962,11 @@ def test_watchdog_timers_fail_open_through_stage(
             stage.run_execution(run_id=run_id)
     else:
         assert stage.run_execution(run_id=run_id)["status"] == RunStatus.COMPLETED
-    watchdog_events = [e for e in store.list_events(run_id) if e.actor == "watchdog"]
+    watchdog_events = [
+        e
+        for e in store.list_events(run_id)
+        if e.actor == "watchdog" and e.event_type.startswith("watchdog.")
+    ]
     assert len(monitor.recorded_requests) == len(expected_triggers)
     assert [event.event_type for event in watchdog_events] == [event_type] * len(expected_triggers)
     assert [event.payload["trigger"] for event in watchdog_events] == expected_triggers

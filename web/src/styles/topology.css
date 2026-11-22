@@ -1,0 +1,134 @@
+/* Topology graph hosts (workflow + task DAG): the React Flow + ELK Graph Island mounts here and
+ * sets its own adaptive height; cards keep a fixed 1:1 size, so wide graphs pan, never scroll. */
+.graph-host {
+  position: relative;
+  min-inline-size: 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  background: var(--surface-paper);
+  overflow: hidden;
+}
+
+.graph-host > .notice {
+  margin: var(--space-3);
+}
+
+.dag-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.legend-swatch {
+  display: inline-block;
+  inline-size: 14px;
+  block-size: 3px;
+  background: var(--rule-hard);
+  border-radius: var(--shape-pill);
+}
+
+.legend-swatch[data-tone="critical"],
+.legend-swatch[data-tone="traversed"] {
+  background: var(--text-ink);
+}
+
+.legend-swatch[data-tone="blocked"] {
+  background: var(--bad);
+}
+
+.legend-swatch[data-tone="running"] {
+  background: var(--live);
+}
+
+.legend-ring {
+  display: inline-block;
+  inline-size: 12px;
+  block-size: 10px;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius);
+}
+
+.lanes {
+  display: flex;
+  flex-direction: column;
+}
+
+.lane {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+  padding-block: var(--space-2);
+  border-block-end: 1px solid var(--rule);
+}
+
+.lane:last-child {
+  border-block-end: 0;
+}
+
+.lane-actor {
+  font-family: var(--face-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.lane-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.lane-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--face-mono);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color var(--motion-fast), color var(--motion-fast);
+}
+
+.lane-chip:hover {
+  border-color: var(--text-muted);
+  color: var(--text-ink);
+}
+
+.lane-chip[data-status="accepted"] {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.lane-chip[data-status="running"],
+.lane-chip[data-status="verifying"] {
+  border-color: var(--live);
+  color: var(--live);
+}
+
+.lane-chip[data-status="blocked"],
+.lane-chip[data-status="failed"] {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.lane-chip[aria-pressed="true"] {
+  border-color: var(--text-ink);
+  color: var(--text-ink);
+}

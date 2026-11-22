@@ -1,0 +1,89 @@
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--rule-hard);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-ink);
+  font-family: var(--face-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color var(--motion-fast), border-color var(--motion-fast);
+}
+
+.btn:hover {
+  background: var(--surface-paper);
+  border-color: var(--text-muted);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn[disabled] {
+  color: var(--text-muted);
+  border-color: var(--rule);
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  border-color: var(--text-ink);
+  background: var(--surface-paper);
+  color: var(--text-ink);
+}
+
+.btn-primary:hover {
+  background: var(--surface-raised);
+  border-color: var(--text-ink);
+}
+
+.btn-accent {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.btn-accent:hover {
+  background: var(--surface-paper);
+  border-color: var(--accent);
+}
+
+.btn-danger {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.btn-danger:hover {
+  background: var(--surface-paper);
+  border-color: var(--bad);
+}
+
+.btn-quiet {
+  padding: var(--space-1);
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.btn-quiet:hover {
+  background: var(--surface-sunk);
+  border-color: transparent;
+  color: var(--text-ink);
+}

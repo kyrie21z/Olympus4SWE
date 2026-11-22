@@ -1,0 +1,24 @@
+/* React mounts into #root; it must not add a box between <body> and the cockpit grid. */
+#root {
+  display: contents;
+}
+
+.cockpit {
+  display: grid;
+  grid-template-columns: var(--rail-width) minmax(0, 1fr) var(--resizer-width) var(--dock-width);
+  block-size: 100dvh;
+  overflow: hidden;
+}
+
+body[data-rail="collapsed"] .cockpit {
+  --rail-width: 56px;
+}
+
+body[data-dock="closed"] .cockpit {
+  --dock-width: 0px;
+}
+
+body[data-dock="closed"] #dock-resizer,
+body[data-dock="closed"] #dock {
+  display: none;
+}

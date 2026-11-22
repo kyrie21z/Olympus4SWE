@@ -945,7 +945,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     page.close()
 
     broken = browser.new_page()
-    broken.route("**/static/graph/ariadne-graph.js", lambda route: route.abort())
+    broken.route("**/static/assets/ariadne-graph*.js", lambda route: route.abort())
     broken.goto(f"{url}/?run={run_id}")
     expect(broken.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
     expect(broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")

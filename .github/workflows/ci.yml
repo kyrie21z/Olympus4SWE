@@ -43,3 +43,45 @@ jobs:
 
       - name: Test
         run: uv run --no-sync pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Forbid untyped JS sources
+        run: |
+          if find web/src -type f \( -name '*.js' -o -name '*.jsx' \) | grep -q .; then
+            echo "Untyped .js/.jsx source files are forbidden under web/src/"
+            exit 1
+          fi
+
+      - name: Check OpenAPI TypeScript schema sync
+        run: |
+          pnpm --dir web generate:api
+          git diff --exit-code web/src/api/schema.d.ts
+
+      - name: Typecheck and build
+        run: |
+          pnpm --dir web typecheck
+          pnpm --dir web build
+          git diff --exit-code src/olympus/web/static

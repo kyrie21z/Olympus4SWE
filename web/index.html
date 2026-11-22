@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ariadne · Olympus4SWE 研发编排工作台</title>
+  <link rel="icon" href="data:,">
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("olympus-theme");
+        if (saved === "dark" || saved === "light") {
+          document.documentElement.dataset.theme = saved;
+        }
+      } catch (error) {
+        return;
+      }
+    })();
+  </script>
+</head>
+<body data-dock="closed">
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

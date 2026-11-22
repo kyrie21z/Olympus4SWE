@@ -1,21 +1,51 @@
-"""Deterministic design-system gate for the Ariadne console static assets.
+"""Deterministic design-system and TypeScript-only gates for the Ariadne web SPA.
 
-style.css, index.html, ui.js and app.js may only read tokens. tokens.css is the
-single file allowed to name a colour. These checks fail on any hand-written
-colour, shadow, type size, weight, face, corner or transition duration.
+web/src/styles/tokens.css is the single file allowed to name a colour. Every other
+stylesheet, component, and HTML shell under web/ must read tokens only, zero .js/.jsx
+source files may live under web/src/, and legacy vanilla console files must stay absent.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
-STATIC = Path(__file__).resolve().parents[2] / "src" / "olympus" / "web" / "static"
-LINTED = ("style.css", "index.html", "ui.js", "app.js")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WEB_DIR = REPO_ROOT / "web"
+WEB_SRC = WEB_DIR / "src"
+TOKENS_CSS = WEB_SRC / "styles" / "tokens.css"
+STATIC_DIR = REPO_ROOT / "src" / "olympus" / "web" / "static"
+
+COLOUR = re.compile(r"(?<![&\w])#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(")
+BUTTONS = re.compile(r"(?:^|[\s,>+~])(?:button|\.btn)\b")
+GROUNDS = {
+    "transparent",
+    "none",
+    "var(--surface-paper)",
+    "var(--surface-raised)",
+    "var(--surface-sunk)",
+    "var(--surface-bg)",
+}
+SIZES = {f"var(--text-{size})" for size in ("xs", "sm", "base", "lg", "xl", "2xl")}
+WEIGHTS = {"400", "500", "normal", "var(--font-weight-normal)", "var(--font-weight-medium)"}
+SHAPES = {
+    "0",
+    "var(--radius)",
+    "var(--radius-lg)",
+    "var(--shape-chip)",
+    "var(--shape-circle)",
+    "var(--shape-pill)",
+    "var(--shape-bubble)",
+}
 
 
-def _text(name: str) -> str:
-    return (STATIC / name).read_text(encoding="utf-8")
+def _css_sources() -> list[Path]:
+    return sorted(path for path in WEB_SRC.rglob("*.css") if path != TOKENS_CSS)
+
+
+def _code_sources() -> list[Path]:
+    return sorted([*WEB_SRC.rglob("*.ts"), *WEB_SRC.rglob("*.tsx")])
 
 
 def _blocks(css: str) -> list[tuple[str, str]]:
@@ -34,121 +64,92 @@ def _decls(body: str) -> list[tuple[str, str]]:
 
 
 def _declarations() -> list[tuple[str, str, str, str]]:
-    """(file, selector, property, value) for style.css and every inline style attribute."""
-    rows = [
-        ("style.css", selector, prop, value)
-        for selector, body in _blocks(_text("style.css"))
-        for prop, value in _decls(body)
-    ]
-    for name in ("index.html", "ui.js", "app.js"):
-        source = _text(name)
-        for match in re.finditer(r'style="([^"]*)"', source):
-            rows += [(name, "style=", prop, value) for prop, value in _decls(match.group(1))]
+    """(relpath, selector, property, value) across every non-token stylesheet."""
+    rows: list[tuple[str, str, str, str]] = []
+    for path in _css_sources():
+        rel = path.relative_to(WEB_SRC).as_posix()
+        for selector, body in _blocks(path.read_text(encoding="utf-8")):
+            for prop, value in _decls(body):
+                rows.append((rel, selector, prop, value))
     return rows
 
 
-def test_design_files_load_in_order() -> None:
-    html = _text("index.html")
-    tokens_at = html.find('href="/static/tokens.css"')
-    style_at = html.find('href="/static/style.css"')
-    assert tokens_at != -1, "index.html must load tokens.css"
-    assert style_at != -1, "index.html must load style.css"
-    assert tokens_at < style_at, "tokens.css must load before style.css"
+def _web_source_stamp() -> str:
+    """Mirror web/vite.config.ts `sourceStamp()` offline without Node."""
+    files = [
+        WEB_DIR / name
+        for name in (
+            "package.json",
+            "pnpm-lock.yaml",
+            ".pnpmfile.cjs",
+            "tsconfig.json",
+            "vite.config.ts",
+            "index.html",
+            "../src/olympus/web/openapi.json",
+        )
+    ]
+    files += [path for path in WEB_SRC.rglob("*") if path.is_file()]
+    records = sorted(
+        (path.resolve().relative_to(WEB_DIR.resolve(), walk_up=True).as_posix(), path)
+        for path in files
+    )
+    digest = hashlib.sha256()
+    for rel, path in records:
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
-    ui_at = html.find('src="/static/ui.js"')
-    app_at = html.find('src="/static/app.js"')
-    assert ui_at != -1, "index.html must load ui.js"
-    assert app_at != -1, "index.html must load app.js"
-    assert ui_at < app_at, "ui.js must load before app.js"
 
-
-COLOUR = re.compile(r"(?<![&\w])#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(")
+def test_no_untyped_js_sources_or_legacy_shell_assets() -> None:
+    assert not (REPO_ROOT / "web-graph").exists(), "web-graph/ must be consolidated into web/"
+    js_sources = sorted([*WEB_SRC.rglob("*.js"), *WEB_SRC.rglob("*.jsx")])
+    assert not js_sources, f"untyped JS sources forbidden under web/src/: {js_sources}"
+    for retired in ("app.js", "ui.js", "style.css", "tokens.css", "graph"):
+        assert not (STATIC_DIR / retired).exists(), f"retired legacy asset still exists: {retired}"
 
 
 def test_no_colour_literals() -> None:
-    """Every colour is a token, including SVG fills and inline style attributes."""
-    for name in LINTED:
-        source = _text(name)
-        found = COLOUR.findall(source)
-        assert not found, f"{name} holds raw colours — use var(--token): {found[:8]}"
-    found_decls = [(f, s, p, v) for f, s, p, v in _declarations() if COLOUR.search(v)]
-    assert not found_decls, f"raw colours in declarations: {found_decls[:8]}"
-
-
-GRAPH_SOURCES = Path(__file__).resolve().parents[2] / "web-graph" / "src"
-
-
-def test_graph_island_reads_tokens_only() -> None:
-    """The Graph Island stylesheet and components name no colour; tokens.css drives both themes."""
-    sources = [*GRAPH_SOURCES.rglob("*.css"), *GRAPH_SOURCES.rglob("*.tsx"),
-               *GRAPH_SOURCES.rglob("*.ts")]
-    assert sources, "web-graph/src is missing"
+    """Every colour outside tokens.css must reference a CSS custom property."""
+    sources = [*_css_sources(), *_code_sources(), WEB_DIR / "index.html"]
+    assert sources, "web/src sources missing"
     for path in sources:
         found = COLOUR.findall(path.read_text(encoding="utf-8"))
-        assert not found, f"{path.name} holds raw colours — use var(--token): {found[:8]}"
-    css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
-    decls = [(selector, prop, val) for selector, body in _blocks(css) for prop, val in _decls(body)]
-    sizes = [v for _s, p, v in decls if p == "font-size"]
-    assert sizes and set(sizes) <= SIZES, f"graph font-size must be a --text-* token: {sizes}"
-    faces = [
-        (s, v)
-        for s, p, v in decls
-        if p == "font-family" and v != "inherit" and not v.startswith("var(--face-")
-    ]
-    assert not faces, f"graph font-family must be a --face-* token: {faces}"
-    corners = [(s, v) for s, p, v in decls if p == "border-radius" and not set(v.split()) <= SHAPES]
-    assert not corners, f"graph border-radius must use SHAPES tokens: {corners}"
-    bad_motion = [
-        (s, v)
-        for s, p, v in decls
-        if p in ("transition", "transition-duration")
-        and re.search(r"(?<![\w-])\d*\.?\d+m?s\b", v)
-    ]
-    assert not bad_motion, f"graph transitions must use var(--motion-fast): {bad_motion}"
+        assert not found, (
+            f"{path.relative_to(WEB_DIR)} holds raw colours — use var(--token): {found[:8]}"
+        )
+    found_decls = [(f, s, p, v) for f, s, p, v in _declarations() if COLOUR.search(v)]
+    assert not found_decls, f"raw colours in declarations: {found_decls[:8]}"
 
 
 def test_no_shadows_except_floating() -> None:
     allowed = (".floating-menu", "dialog[open]")
     found = [
-        (selector, value)
-        for _f, selector, prop, value in _declarations()
+        (name, selector, value)
+        for name, selector, prop, value in _declarations()
         if prop == "box-shadow"
         and value != "none"
         and not any(marker in selector for marker in allowed)
     ]
     assert not found, f"only a floating menu or an open dialog takes --shadow-md: {found}"
     wrong = [
-        (selector, value)
-        for _f, selector, prop, value in _declarations()
+        (name, selector, value)
+        for name, selector, prop, value in _declarations()
         if prop == "box-shadow" and value not in ("none", "var(--shadow-md)")
     ]
     assert not wrong, f"box-shadow is none or var(--shadow-md): {wrong}"
 
 
-BUTTONS = re.compile(r"(?:^|[\s,>+~])(?:button|\.btn)\b")
-GROUNDS = {
-    "transparent",
-    "none",
-    "var(--surface-paper)",
-    "var(--surface-raised)",
-    "var(--surface-sunk)",
-    "var(--surface-bg)",
-}
-
-
 def test_buttons_never_fill() -> None:
     found = [
-        (selector, value)
+        (name, selector, value)
         for name, selector, prop, value in _declarations()
-        if name == "style.css"
-        and BUTTONS.search(selector)
+        if BUTTONS.search(selector)
         and prop in ("background", "background-color")
         and value not in GROUNDS
     ]
     assert not found, f"buttons never fill: {found}"
-
-
-SIZES = {f"var(--text-{size})" for size in ("xs", "sm", "base", "lg", "xl", "2xl")}
 
 
 def test_font_sizes_use_tokens() -> None:
@@ -166,9 +167,6 @@ def test_font_sizes_use_tokens() -> None:
     assert not shorthand, f"use font-family/font-size, not the font shorthand: {shorthand}"
 
 
-WEIGHTS = {"400", "500", "normal", "var(--font-weight-normal)", "var(--font-weight-medium)"}
-
-
 def test_two_weights() -> None:
     found = [
         (name, selector, value)
@@ -178,27 +176,18 @@ def test_two_weights() -> None:
     assert not found, f"only 400 and 500: {found[:10]}"
 
 
-SHAPES = {
-    "0",
-    "var(--radius)",
-    "var(--radius-lg)",
-    "var(--shape-chip)",
-    "var(--shape-circle)",
-    "var(--shape-pill)",
-    "var(--shape-bubble)",
-}
-
-
 def test_soft_rounded_tokens() -> None:
-    tokens = _text("tokens.css")
+    tokens = TOKENS_CSS.read_text(encoding="utf-8")
     assert "--radius: 8px;" in tokens
     assert "--radius-lg: 12px;" in tokens
     assert "--shape-chip: 999px;" in tokens
-    assert 'rx="2"' not in _text("app.js")
-    graph_css = (GRAPH_SOURCES / "graph.css").read_text(encoding="utf-8")
+    graph_css = (WEB_SRC / "styles" / "graph.css").read_text(encoding="utf-8")
     card_corners = [
-        value for selector, body in _blocks(graph_css) if selector == ".ag-card"
-        for prop, value in _decls(body) if prop == "border-radius"
+        value
+        for selector, body in _blocks(graph_css)
+        if selector == ".ag-card"
+        for prop, value in _decls(body)
+        if prop == "border-radius"
     ]
     assert card_corners == ["var(--radius)"], "graph cards share the soft --radius corner"
 
@@ -228,28 +217,15 @@ def test_transitions_use_motion_token() -> None:
     assert not found, f"transitions use var(--motion-fast): {found}"
 
 
-UI_FUNCTIONS = (
-    "esc",
-    "uiCard",
-    "uiBadge",
-    "uiTable",
-    "uiTabs",
-    "uiNotice",
-    "uiStatBand",
-    "uiRow",
-    "uiButton",
-    "toolRow",
-    "subPane",
-    "receiptBlock",
-    "stampSlots",
-    "watchSlots",
-)
+def test_committed_spa_bundle_matches_web_sources() -> None:
+    """Offline freshness gate: rebuild via `pnpm --dir web build` after any web/ or OpenAPI edit."""
+    stamp = _web_source_stamp()
+    index_html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert f'<meta name="ariadne-source-sha256" content="{stamp}">' in index_html
 
-
-def test_ui_primitives_and_watch_slots() -> None:
-    ui = _text("ui.js")
-    for name in UI_FUNCTIONS:
-        assert re.search(rf"^function {name}\(", ui, re.MULTILINE), f"ui.js must define {name}"
-    assert "MutationObserver" in ui, "watchSlots must observe the DOM"
-    app = _text("app.js")
-    assert re.search(r"watchSlots\(\);", app), "app.js must call watchSlots() at bootstrap"
+    banner = f"/*! ariadne | source-sha256:{stamp} */"
+    assets = STATIC_DIR / "assets"
+    for name in ("ariadne.js", "ariadne.css", "ariadne-graph.js", "ariadne-graph.css"):
+        head = (assets / name).read_text(encoding="utf-8").splitlines()[:3]
+        assert banner in head, f"{name} is stale; run `pnpm --dir web build`"
+    assert not list(assets.glob("*.map")), "production static bundle must not commit sourcemaps"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -17,6 +18,15 @@ from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
+
+
+def _assert_spa_control_ids(client: TestClient, *control_ids: str) -> None:
+    bundle = client.get("/static/assets/ariadne.js")
+    assert bundle.status_code == 200
+    for control_id in control_ids:
+        pattern = rf"""\bid\s*:\s*(["'`]){re.escape(control_id)}\1"""
+        assert re.search(pattern, bundle.text), f"SPA bundle missing id={control_id}"
+
 
 GOAL_SPEC: dict[str, object] = {
     "spec_id": "spec-inventory",
@@ -557,7 +567,7 @@ def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Pat
                 },
             ).json()
             run_id = created["run_id"]
-            assert 'id="btn-promote-execute"' in client.get("/").text
+            _assert_spa_control_ids(client, "btn-promote-execute")
             client.post(
                 f"/api/runs/{run_id}/command", json={"action": "approve_spec", "sync": True}
             )
@@ -818,7 +828,7 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
     app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
     try:
         with TestClient(create_fastapi_app(app)) as client:
-            assert 'id="new-run-demo"' in client.get("/").text
+            _assert_spa_control_ids(client, "new-run-demo")
             demos_res = client.get("/api/demos")
             assert demos_res.status_code == 200
             demos = demos_res.json()["demos"]
@@ -904,14 +914,11 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
     monkeypatch.setenv("OLYMPUS_MONITOR_MODEL", "environment-monitor")
     monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
     with make_client() as client:
-        form = client.get("/").text
-        assert all(
-            f'id="new-run-{field}"' in form
-            for field in (
-                "worker-driver",
-                "reviewer-driver",
-                "monitor-model",
-            )
+        _assert_spa_control_ids(
+            client,
+            "new-run-worker-driver",
+            "new-run-reviewer-driver",
+            "new-run-monitor-model",
         )
         response = client.post(
             "/api/runs",

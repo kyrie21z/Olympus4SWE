@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-import olympus.web
 from olympus.core.contracts import (
     AcceptanceCheck,
     ApprovalDecision,
@@ -46,7 +45,7 @@ from olympus.web.supervisor import RunSupervisor
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
-_APP_JS = Path(olympus.web.__file__).parent / "static" / "app.js"
+_WEB_SRC = Path(__file__).resolve().parents[2] / "web" / "src"
 
 
 def _init_repo(root: Path) -> None:
@@ -1059,35 +1058,33 @@ def test_completed_run_reopened_by_clarify_routes_to_gate_spec(tmp_path: Path) -
         supervisor.shutdown()
 
 
-# --------------------------------------------------------------------------- 5. app.js static
+def test_web_spa_renders_unlimited_llm_calls() -> None:
+    text = (_WEB_SRC / "components" / "TopologyView.tsx").read_text(encoding="utf-8")
+    assert "budget.max_calls == null" in text
+    assert "`${budget.calls_used} 次`" in text
+    assert "`${budget.calls_used} / ${budget.max_calls}`" in text
 
 
-def test_app_js_renders_unlimited_llm_calls() -> None:
-    text = _APP_JS.read_text(encoding="utf-8")
-    assert "projection.budget.max_calls == null" in text
-    assert "`${projection.budget.calls_used} 次`" in text
-    assert "`${projection.budget.calls_used} / ${projection.budget.max_calls}`" in text
+def test_web_spa_gate_actions_show_retry_for_banner_actions() -> None:
+    text = (_WEB_SRC / "components" / "HitlBanner.tsx").read_text(encoding="utf-8")
+    assert 'gateBanner.actions.includes("retry_workflow")' in text
+    assert "inspectFailure()" in text
 
 
-def test_app_js_gate_actions_show_retry_for_banner_actions() -> None:
-    text = _APP_JS.read_text(encoding="utf-8")
-    assert 'banner.actions.includes("retry_workflow")' in text
-    assert "el.retryWorkflow.hidden = !canRetry;" in text
-    assert "el.inspectFailure.hidden = !runFailed;" in text
-
-
-def test_app_js_has_no_hardcoded_waitlist_defaults() -> None:
-    text = _APP_JS.read_text(encoding="utf-8")
+def test_web_spa_has_no_hardcoded_waitlist_defaults() -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted([*_WEB_SRC.rglob("*.ts"), *_WEB_SRC.rglob("*.tsx")])
+    )
     for stale in (
         "SELECT WAITLISTED",
         "由值班后端工程师接手修复事务锁边界",
         "首期社团活动仅单管理员人工触发取消",
     ):
-        assert stale not in text
-    assert text.count('defaultValue: ""') >= 3
+        assert stale not in combined
     for placeholder in (
         "输入要注入的人工提示",
         "输入改派备注",
         "输入接受风险的明确理由",
     ):
-        assert placeholder in text
+        assert placeholder in combined

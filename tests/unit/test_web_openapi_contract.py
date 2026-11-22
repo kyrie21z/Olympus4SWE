@@ -61,6 +61,10 @@ def test_openapi_projection_and_command_contracts_are_concrete() -> None:
     assert "ProviderConfig" in components
     assert "anyOf" in components["ApprovalReview"]["properties"]["baseline"]
 
+    budget = components["BudgetSummary"]
+    assert {"cache_read_tokens", "cache_write_tokens"} <= set(budget["properties"])
+    assert {"cache_read_tokens", "cache_write_tokens"} <= set(budget["required"])
+
     for path_item in schema["paths"].values():
         for operation in path_item.values():
             assert "422" not in operation.get("responses", {})

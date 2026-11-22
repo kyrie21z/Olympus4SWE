@@ -44,6 +44,11 @@ def milestone_fields(kind: str, payload: dict[str, Any]) -> dict[str, Any] | Non
         if isinstance(source, str) and source in _STEER_REASONS:
             return {"source": source, "reason": _STEER_REASONS[source]}
         return None
+    if kind == "agent.compaction":
+        phase = payload.get("phase")
+        if phase in ("start", "end"):
+            return {"phase": phase}
+        return None
     if kind not in ("agent.tool_started", "agent.tool_finished"):
         return None
 

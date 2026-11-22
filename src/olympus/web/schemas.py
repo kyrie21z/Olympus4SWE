@@ -337,6 +337,8 @@ class BudgetSummary(StrictModel):
     max_calls: int | None = None
     input_tokens: int
     output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
     total_tokens: int
     max_tokens: int | None = None
     unknown_outcome_calls: int

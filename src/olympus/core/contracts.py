@@ -650,11 +650,18 @@ class BudgetLedger(StrictModel):
     llm_calls_reserved: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
     unknown_outcome_calls: int = Field(default=0, ge=0)
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
 
     def can_reserve(self, policy: BudgetPolicy) -> bool:
         calls_ok = (
@@ -675,6 +682,8 @@ class BudgetLedger(StrictModel):
         self,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
         *,
         unknown: bool = False,
     ) -> BudgetLedger:
@@ -686,6 +695,8 @@ class BudgetLedger(StrictModel):
                 "llm_calls_used": self.llm_calls_used + 1,
                 "input_tokens": self.input_tokens + max(0, input_tokens),
                 "output_tokens": self.output_tokens + max(0, output_tokens),
+                "cache_read_tokens": self.cache_read_tokens + max(0, cache_read_tokens),
+                "cache_write_tokens": self.cache_write_tokens + max(0, cache_write_tokens),
                 "unknown_outcome_calls": self.unknown_outcome_calls + (1 if unknown else 0),
             }
         )

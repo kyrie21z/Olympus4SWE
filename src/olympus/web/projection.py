@@ -1571,6 +1571,8 @@ def build_run_projection(
             "max_calls": policy.max_llm_calls,
             "input_tokens": ledger.input_tokens,
             "output_tokens": ledger.output_tokens,
+            "cache_read_tokens": ledger.cache_read_tokens,
+            "cache_write_tokens": ledger.cache_write_tokens,
             "total_tokens": ledger.total_tokens,
             "max_tokens": policy.max_total_tokens,
             "unknown_outcome_calls": ledger.unknown_outcome_calls,

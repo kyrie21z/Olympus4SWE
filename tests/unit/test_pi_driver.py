@@ -23,6 +23,7 @@ from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
+    BudgetPolicy,
     GoalSpec,
     RunMode,
     RunStatus,
@@ -30,6 +31,7 @@ from olympus.core.contracts import (
     TaskStatus,
 )
 from olympus.core.store import RunStore
+from olympus.harness.activity import milestone_fields
 from olympus.harness.driver import (
     ActiveTurnHandle,
     DriverTurnRequest,
@@ -68,12 +70,14 @@ def _emit(record):
 
 
 def _usage(tin, tout):
+    cache_read = int(os.environ.get("FAKE_PI_CACHE_READ", "0"))
+    cache_write = int(os.environ.get("FAKE_PI_CACHE_WRITE", "0"))
     return {
         "input": tin,
         "output": tout,
-        "cacheRead": 0,
-        "cacheWrite": 0,
-        "totalTokens": tin + tout,
+        "cacheRead": cache_read,
+        "cacheWrite": cache_write,
+        "totalTokens": tin + tout + cache_read + cache_write,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
     }
 
@@ -168,6 +172,14 @@ def _emit_work():
                 "result": {"content": [{"type": "text", "text": "Repeated error"}]},
                 "isError": True,
             })
+    if os.environ.get("FAKE_PI_COMPACT") == "1":
+        _emit({"type": "compaction_start", "reason": "threshold"})
+        _emit({
+            "type": "compaction_end",
+            "reason": "threshold",
+            "result": {"summary": "SECRET COMPACTION PROSE"},
+            "aborted": False,
+        })
     _emit({"type": "turn_end", "message": first, "toolResults": []})
     _emit({"type": "agent_end", "messages": [first], "willRetry": False})
 
@@ -432,13 +444,13 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
         entry["event"] == "agent.steered" and entry["source"] == "human"
         for entry in normalized
     )
-    raw_updates = [
-        entry["record"]
-        for entry in entries
-        if entry.get("record", {}).get("type") == "message_update"
-    ]
+    assert not any(
+        entry.get("record", {}).get("type") == "message_update" for entry in entries
+    )
+    text_deltas = [payload for kind, payload in events if kind == "text_delta"]
+    assert any(payload["text"] == "Working on it " for payload in text_deltas)
     assert any(
-        update["assistantMessageEvent"]["delta"] == "Working on it " for update in raw_updates
+        entry["event"] == "llm" and entry["input_tokens"] == 11 for entry in normalized
     )
 
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
@@ -453,6 +465,91 @@ def test_pi_driver_streams_rpc_events_usage_receipt_and_steer(
     assert json.loads(env["write_scope"]) == ["feature.py"]
     assert json.loads(env["forbidden_globs"]) == ["shared/*.py"]
     assert env["cwd"] == str(tmp_path)
+
+
+def test_pi_driver_settles_cache_tokens_and_enforces_true_total_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_PI_CACHE_READ", "50")
+    monkeypatch.setenv("FAKE_PI_CACHE_WRITE", "10")
+    store = RunStore(tmp_path / "run.db")
+    run_id = store.create_run(
+        title="cache-token-cap",
+        mode=RunMode.SIMULATION,
+        budget_policy=BudgetPolicy(max_total_tokens=50),
+    )
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    outcome = PiDriver(binary=str(fake), store=store, run_id=run_id).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    ledger = store.get_run(run_id)["budget_ledger"]
+    assert not outcome.completed
+    assert outcome.stop_reason.startswith("budget_exhausted")
+    assert outcome.steps_taken == ledger.llm_calls_used == 2
+    assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
+    assert (ledger.cache_read_tokens, ledger.cache_write_tokens) == (100, 20)
+    # The same run stays under the cap without cache tokens; cached reads/writes trip it.
+    assert ledger.total_tokens == 146 > 50
+
+    llm_events = [payload for kind, payload in events if kind == "llm"]
+    assert all(
+        (payload["cache_read_tokens"], payload["cache_write_tokens"]) == (50, 10)
+        for payload in llm_events
+    )
+    llm_trace = [entry for entry in _read_jsonl(trace_path) if entry.get("event") == "llm"]
+    assert llm_trace and all(
+        (entry["cache_read_tokens"], entry["cache_write_tokens"]) == (50, 10)
+        for entry in llm_trace
+    )
+
+
+def test_pi_driver_bridges_compaction_milestones_without_raw_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_PI_COMPACT", "1")
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "trace.jsonl"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    outcome = PiDriver(binary=str(fake)).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert outcome.completed
+    compactions = [payload for kind, payload in events if kind == "agent.compaction"]
+    assert [payload["phase"] for payload in compactions] == ["start", "end"]
+    assert "SECRET COMPACTION PROSE" not in json.dumps(compactions)
+
+    trace_compactions = [
+        entry for entry in _read_jsonl(trace_path) if entry.get("event") == "agent.compaction"
+    ]
+    assert [entry["phase"] for entry in trace_compactions] == ["start", "end"]
+
+
+def test_compaction_milestone_fields_drop_raw_prose() -> None:
+    payload = {"phase": "end", "result": {"summary": "SECRET COMPACTION PROSE"}}
+    assert milestone_fields("agent.compaction", payload) == {"phase": "end"}
+    assert milestone_fields("agent.compaction", {"phase": "middle"}) is None
 
 
 def test_pi_driver_cancel_reclaims_process_group_with_grandchild(
@@ -933,8 +1030,6 @@ def test_pi_driver_help_probe_reaps_helper_child_process(tmp_path: Path) -> None
 
 
 def test_pi_driver_enforces_budget_and_max_steps_with_honest_ledger(tmp_path: Path) -> None:
-    from olympus.core.contracts import BudgetPolicy, RunMode
-
     store = RunStore(tmp_path / "run.db")
     run_id = store.create_run(
         title="budget-cap",

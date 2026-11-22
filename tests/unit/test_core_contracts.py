@@ -121,3 +121,21 @@ def test_budget_ledger_is_monotonic_and_enforces_limit() -> None:
     assert not ledger.can_reserve(policy)
     with pytest.raises(ValueError):
         ledger.reserve(policy)
+
+
+def test_budget_ledger_accounts_cache_tokens_and_reads_legacy_json() -> None:
+    legacy = BudgetLedger.model_validate_json('{"input_tokens": 300, "output_tokens": 200}')
+    assert (legacy.cache_read_tokens, legacy.cache_write_tokens) == (0, 0)
+    assert legacy.total_tokens == 500
+
+    settled = legacy.reserve(BudgetPolicy(max_total_tokens=2000)).settle(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=250,
+        cache_write_tokens=150,
+    )
+    assert settled.total_tokens == 1050
+    assert (settled.cache_read_tokens, settled.cache_write_tokens) == (250, 150)
+    # Cached tokens count against the true total even when input/output stay small.
+    assert settled.can_reserve(BudgetPolicy(max_total_tokens=1050)) is False
+    assert settled.can_reserve(BudgetPolicy(max_total_tokens=1051)) is True

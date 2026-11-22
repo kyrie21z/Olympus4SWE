@@ -545,6 +545,14 @@
       "BudgetSummary": {
         "additionalProperties": false,
         "properties": {
+          "cache_read_tokens": {
+            "title": "Cache Read Tokens",
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "title": "Cache Write Tokens",
+            "type": "integer"
+          },
           "calls_reserved": {
             "title": "Calls Reserved",
             "type": "integer"
@@ -597,6 +605,8 @@
           "calls_reserved",
           "input_tokens",
           "output_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens",
           "total_tokens",
           "unknown_outcome_calls"
         ],

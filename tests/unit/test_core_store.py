@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -204,3 +206,53 @@ def test_store_idempotent_commands_and_monotonic_budget(tmp_path: Path) -> None:
     store.settle_llm_call(rid, actor="align", input_tokens=10, output_tokens=5)
     with pytest.raises(ValueError):
         store.reserve_llm_call(rid, actor="align", purpose="exceed")
+
+
+def test_store_accounts_cache_tokens_and_reads_legacy_ledger_json(tmp_path: Path) -> None:
+    db_path = tmp_path / "olympus.db"
+    store = RunStore(db_path)
+    rid = store.create_run(
+        title="Cache ledger", budget_policy=BudgetPolicy(max_total_tokens=500)
+    )
+    legacy_ledger = {
+        "llm_calls_used": 0,
+        "llm_calls_reserved": 0,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "unknown_outcome_calls": 0,
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE runs SET budget_ledger_json = ? WHERE run_id = ?",
+            (json.dumps(legacy_ledger), rid),
+        )
+
+    assert store.get_run(rid)["budget_ledger"].total_tokens == 15
+
+    store.reserve_llm_call(rid, actor="align", purpose="cached call")
+    ledger = store.settle_llm_call(
+        rid,
+        actor="align",
+        input_tokens=20,
+        output_tokens=10,
+        cache_read_tokens=300,
+        cache_write_tokens=100,
+    )
+    assert (ledger.cache_read_tokens, ledger.cache_write_tokens) == (300, 100)
+    assert ledger.total_tokens == 445
+    assert ledger.can_reserve(BudgetPolicy(max_total_tokens=445)) is False
+
+    over_budget = store.record_external_llm_usage(
+        rid,
+        actor="pi",
+        purpose="pi_step_1",
+        input_tokens=30,
+        output_tokens=10,
+        cache_read_tokens=60,
+        cache_write_tokens=10,
+    )
+    assert over_budget is True
+    ledger = store.get_run(rid)["budget_ledger"]
+    assert ledger.llm_calls_used == 2
+    assert (ledger.cache_read_tokens, ledger.cache_write_tokens) == (360, 110)
+    assert ledger.total_tokens == 555

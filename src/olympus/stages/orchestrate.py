@@ -1071,7 +1071,7 @@ class OrchestrateStage:
                     emit=emit_watchdog,
                     store=self.store,
                     run_id=run_id,
-                    baseline=worker_baseline,
+                    baseline=task_baseline,
                     forbidden_globs=list(forbidden_contracts),
                 )
             worker_error = None

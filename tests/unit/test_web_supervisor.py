@@ -5,17 +5,17 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
-import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from olympus.core.contracts import ApprovalDecision, ApprovalRecord, ApprovalTarget, TaskPlan
 from olympus.core.store import RunStore
 from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
-from olympus.web.server import AriadneApp, create_http_server
+from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
 
 GOAL_SPEC: dict[str, object] = {
@@ -224,7 +224,9 @@ def _responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LL
 
 
 @pytest.fixture()
-def supervisor_app(tmp_path: Path) -> Iterator[tuple[AriadneApp, RunSupervisor, str]]:
+def supervisor_app(
+    tmp_path: Path,
+) -> Iterator[tuple[AriadneApp, RunSupervisor, Callable[[], TestClient]]]:
     _init_git_repo(tmp_path)
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
     supervisor = RunSupervisor(
@@ -233,23 +235,21 @@ def supervisor_app(tmp_path: Path) -> Iterator[tuple[AriadneApp, RunSupervisor, 
         provider_builder=lambda **kwargs: MockLLMProvider(responder=_responder),
     )
     app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
+
+    def make_client() -> TestClient:
+        return TestClient(create_fastapi_app(app))
+
     try:
-        yield app, supervisor, f"http://127.0.0.1:{port}"
+        yield app, supervisor, make_client
     finally:
-        httpd.shutdown()
-        httpd.server_close()
         supervisor.shutdown()
 
 
 def test_provider_and_workflow_discovery_endpoints(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
 ) -> None:
-    _, _, base_url = supervisor_app
-    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+    _, _, make_client = supervisor_app
+    with make_client() as client:
         providers = client.get("/api/providers")
         assert providers.status_code == 200
         payload = providers.json()
@@ -287,8 +287,8 @@ def test_provider_and_workflow_discovery_endpoints(
 def test_post_runs_requires_raw_input(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
 ) -> None:
-    _, _, base_url = supervisor_app
-    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+    _, _, make_client = supervisor_app
+    with make_client() as client:
         res = client.post("/api/runs", json={"title": "empty"})
         assert res.status_code == 400
         assert "raw_input" in res.json()["error"]
@@ -297,8 +297,8 @@ def test_post_runs_requires_raw_input(
 def test_full_product_blueprint_flow_over_http(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
 ) -> None:
-    app, _, base_url = supervisor_app
-    with httpx.Client(base_url=base_url, timeout=60.0) as client:
+    app, _, make_client = supervisor_app
+    with make_client() as client:
         created = client.post(
             "/api/runs",
             json={
@@ -390,8 +390,8 @@ def test_full_product_blueprint_flow_over_http(
 def test_direct_design_spec_bypass(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
 ) -> None:
-    app, supervisor, base_url = supervisor_app
-    with httpx.Client(base_url=base_url, timeout=60.0) as client:
+    app, supervisor, make_client = supervisor_app
+    with make_client() as client:
         created = client.post(
             "/api/runs",
             json={
@@ -427,8 +427,8 @@ def test_direct_design_spec_bypass(
 def test_sse_stream_carries_graph_events(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
 ) -> None:
-    _, _, base_url = supervisor_app
-    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+    _, _, make_client = supervisor_app
+    with make_client() as client:
         created = client.post(
             "/api/runs",
             json={
@@ -542,13 +542,8 @@ def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Pat
         provider_builder=lambda **kwargs: MockLLMProvider(responder=_exec_responder),
     )
     app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{port}"
     try:
-        with httpx.Client(base_url=base_url, timeout=60.0) as client:
+        with TestClient(create_fastapi_app(app)) as client:
             created = client.post(
                 "/api/runs",
                 json={
@@ -683,8 +678,6 @@ def test_promote_completed_blueprint_to_execute_and_blocked_status(tmp_path: Pat
             assert blocked_proj["status"] == "awaiting_human"
             assert blocked_proj["hitl_banner"]["kind"] == "task_blocked"
     finally:
-        httpd.shutdown()
-        httpd.server_close()
         supervisor.shutdown()
 
 
@@ -823,13 +816,8 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
         provider_builder=lambda **kwargs: MockLLMProvider(responder=_b001_responder),
     )
     app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{port}"
     try:
-        with httpx.Client(base_url=base_url, timeout=60.0) as client:
+        with TestClient(create_fastapi_app(app)) as client:
             assert 'id="new-run-demo"' in client.get("/").text
             demos_res = client.get("/api/demos")
             assert demos_res.status_code == 200
@@ -904,8 +892,6 @@ def test_b001_benchmark_demo_isolated_workspace_clarify_and_execute(tmp_path: Pa
             assert [s["status"] for s in exec_ok["stage_pipeline"]] == ["done"] * 5
             assert all(n["status"] == "accepted" for n in exec_ok["dag"]["nodes"])
     finally:
-        httpd.shutdown()
-        httpd.server_close()
         supervisor.shutdown()
 
 
@@ -913,11 +899,11 @@ def test_create_run_resolves_role_drivers_from_api_and_environment(
     supervisor_app: tuple[AriadneApp, RunSupervisor, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app, supervisor, base_url = supervisor_app
+    app, supervisor, make_client = supervisor_app
     monkeypatch.setenv("OLYMPUS_WORKER_DRIVER", "environment-worker")
     monkeypatch.setenv("OLYMPUS_MONITOR_MODEL", "environment-monitor")
     monkeypatch.delenv("OLYMPUS_REVIEWER_DRIVER", raising=False)
-    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+    with make_client() as client:
         form = client.get("/").text
         assert all(
             f'id="new-run-{field}"' in form

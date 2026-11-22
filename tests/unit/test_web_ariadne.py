@@ -6,11 +6,10 @@ import hashlib
 import json
 import sqlite3
 import subprocess
-import threading
 from pathlib import Path
 
-import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -41,7 +40,7 @@ from olympus.providers.types import LLMResponse, MockLLMProvider
 from olympus.stages.design import DesignStage
 from olympus.web.demos import seed_demo_runs
 from olympus.web.projection import build_run_projection
-from olympus.web.server import AriadneApp, create_http_server
+from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
 
 
@@ -324,103 +323,95 @@ def test_rereview_all_gates_http_snapshot_sse_and_version_binding(tmp_path: Path
     store.save_design(run_id, design)
     store.save_plan(run_id, plan)
     app = AriadneApp(store=store, workspace_root=tmp_path)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
     path = f"/api/runs/{run_id}"
-    try:
-        with httpx.Client(base_url=f"http://127.0.0.1:{httpd.server_port}") as client:
-            def approve(action, target_hash, projection):
-                return client.post(f"{path}/command", json={
-                    "action": action, "target_hash": target_hash,
-                    "expected_state_revision": projection["state_revision"], "auto_advance": False,
-                })
-
-            initial = client.get(path).json()["projection"]
-            projection = initial
-            for action, artifact in (
-                ("approve_spec", spec), ("approve_design", design), ("approve_plan", plan)
-            ):
-                response = approve(action, artifact.content_hash, projection)
-                assert response.status_code == 200, response.text
-                projection = response.json()["projection"]
-
-            store.acquire_task_lease(run_id, root.task_id)
-            updated = client.get(path).json()["projection"]
-            assert updated["plan"]["content_hash"] == plan.content_hash
-            assert updated["plan_approved"] and "approve_plan" not in updated["approval_reviews"]
-
-            revised_spec = spec.model_copy(update={
-                "version": 2, "requirements": [spec.requirements[0].model_copy(update={
-                    "description": "所有成员可以取消自己的报名",
-                })],
+    with TestClient(create_fastapi_app(app)) as client:
+        def approve(action, target_hash, projection):
+            return client.post(f"{path}/command", json={
+                "action": action, "target_hash": target_hash,
+                "expected_state_revision": projection["state_revision"], "auto_advance": False,
             })
-            revised_design = DesignSpec.model_validate({
-                **design.model_dump(), "version": 2, "spec_hash": revised_spec.content_hash,
-                "design_tradeoffs": [
-                    {"impact": "rollback", "choice": "保留旧列", "cost": "延后清理一个月"},
-                    {"impact": "existing_system", "choice": "沿用现有入口", "cost": "保留兼容层"},
-                ],
-            })
-            revised_plan = plan.model_copy(update={
-                "version": 2, "design_hash": revised_design.content_hash,
-                "spec_hash": revised_spec.content_hash, "tasks": [
-                    root.model_copy(update={"deliverables": ["新的权限处理器"]}),
-                    downstream.model_copy(update={"depends_on": []}),
-                ],
-            })
-            store.save_spec(run_id, revised_spec)
-            store.save_design(run_id, revised_design)
-            store.save_plan(run_id, revised_plan)
-            rereview = client.get(path).json()["projection"]
-            stream = client.get(f"{path}/stream?after_seq={updated['latest_event_seq']}&once=1")
-            assert stream.status_code == 200
-            state = json.loads(next(line[6:] for line in stream.text.splitlines()
-                                    if line.startswith("data: ")))
-            assert state["state_revision"] == rereview["state_revision"]
-            assert [event["payload"]["content_hash"] for event in state["events"]] == [
-                revised_spec.content_hash, revised_design.content_hash, revised_plan.content_hash,
-            ]
-            for action, old, new in (
-                ("approve_spec", spec, revised_spec), ("approve_design", design, revised_design),
-                ("approve_plan", plan, revised_plan),
-            ):
-                review = rereview["approval_reviews"][action]
-                assert review["baseline"]["content_hash"] == old.content_hash
-                assert review["target_hash"] == new.content_hash
-                conflict = approve(action, old.content_hash, rereview)
-                assert conflict.status_code == 409 and conflict.json()["conflict"]
-                assert conflict.json()["projection"]["approval_reviews"][action] == review
 
-            reviews = rereview["approval_reviews"]
-            design_entries = [entry for section in reviews["approve_design"]["sections"]
-                              if section["title"] == "关键取舍" for entry in section["entries"]]
-            assert {entry["change"]: entry["text"] for entry in design_entries} == {
-                "changed": "保留旧列", "added": "沿用现有入口", "removed": "同步切流",
-            }
-            plan_review = reviews["approve_plan"]
-            assert plan_review["baseline"]["tasks"][0]["status"] == "ready"
-            plan_entries = [entry for section in plan_review["sections"]
-                            for entry in section["entries"]]
-            assert any(entry["change"] == "removed" and "T01" in entry["text"]
-                       and "T02" in entry["text"] for entry in plan_entries)
-            assert any(entry["change"] == "affected" and entry["text"] ==
-                       spec.requirements[0].acceptance_criteria[0] for entry in plan_entries)
-            for key, artifact in (
-                ("spec", revised_spec), ("design", revised_design), ("plan", revised_plan),
-            ):
-                response = approve(f"approve_{key}", artifact.content_hash, rereview)
-                assert response.status_code == 200, response.text
-                rereview = response.json()["projection"]
-                assert rereview[f"{key}_approved"]
-                assert rereview[key]["content_hash"] == artifact.content_hash
-            assert not rereview["approval_reviews"]
-            assert sum(event.event_type == "approval.recorded"
-                       for event in store.list_events(run_id)) == 6
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join()
+        initial = client.get(path).json()["projection"]
+        projection = initial
+        for action, artifact in (
+            ("approve_spec", spec), ("approve_design", design), ("approve_plan", plan)
+        ):
+            response = approve(action, artifact.content_hash, projection)
+            assert response.status_code == 200, response.text
+            projection = response.json()["projection"]
+
+        store.acquire_task_lease(run_id, root.task_id)
+        updated = client.get(path).json()["projection"]
+        assert updated["plan"]["content_hash"] == plan.content_hash
+        assert updated["plan_approved"] and "approve_plan" not in updated["approval_reviews"]
+
+        revised_spec = spec.model_copy(update={
+            "version": 2, "requirements": [spec.requirements[0].model_copy(update={
+                "description": "所有成员可以取消自己的报名",
+            })],
+        })
+        revised_design = DesignSpec.model_validate({
+            **design.model_dump(), "version": 2, "spec_hash": revised_spec.content_hash,
+            "design_tradeoffs": [
+                {"impact": "rollback", "choice": "保留旧列", "cost": "延后清理一个月"},
+                {"impact": "existing_system", "choice": "沿用现有入口", "cost": "保留兼容层"},
+            ],
+        })
+        revised_plan = plan.model_copy(update={
+            "version": 2, "design_hash": revised_design.content_hash,
+            "spec_hash": revised_spec.content_hash, "tasks": [
+                root.model_copy(update={"deliverables": ["新的权限处理器"]}),
+                downstream.model_copy(update={"depends_on": []}),
+            ],
+        })
+        store.save_spec(run_id, revised_spec)
+        store.save_design(run_id, revised_design)
+        store.save_plan(run_id, revised_plan)
+        rereview = client.get(path).json()["projection"]
+        stream = client.get(f"{path}/stream?after_seq={updated['latest_event_seq']}&once=1")
+        assert stream.status_code == 200
+        state = json.loads(next(line[6:] for line in stream.text.splitlines()
+                                if line.startswith("data: ")))
+        assert state["state_revision"] == rereview["state_revision"]
+        assert [event["payload"]["content_hash"] for event in state["events"]] == [
+            revised_spec.content_hash, revised_design.content_hash, revised_plan.content_hash,
+        ]
+        for action, old, new in (
+            ("approve_spec", spec, revised_spec), ("approve_design", design, revised_design),
+            ("approve_plan", plan, revised_plan),
+        ):
+            review = rereview["approval_reviews"][action]
+            assert review["baseline"]["content_hash"] == old.content_hash
+            assert review["target_hash"] == new.content_hash
+            conflict = approve(action, old.content_hash, rereview)
+            assert conflict.status_code == 409 and conflict.json()["conflict"]
+            assert conflict.json()["projection"]["approval_reviews"][action] == review
+
+        reviews = rereview["approval_reviews"]
+        design_entries = [entry for section in reviews["approve_design"]["sections"]
+                          if section["title"] == "关键取舍" for entry in section["entries"]]
+        assert {entry["change"]: entry["text"] for entry in design_entries} == {
+            "changed": "保留旧列", "added": "沿用现有入口", "removed": "同步切流",
+        }
+        plan_review = reviews["approve_plan"]
+        assert plan_review["baseline"]["tasks"][0]["status"] == "ready"
+        plan_entries = [entry for section in plan_review["sections"]
+                        for entry in section["entries"]]
+        assert any(entry["change"] == "removed" and "T01" in entry["text"]
+                   and "T02" in entry["text"] for entry in plan_entries)
+        assert any(entry["change"] == "affected" and entry["text"] ==
+                   spec.requirements[0].acceptance_criteria[0] for entry in plan_entries)
+        for key, artifact in (
+            ("spec", revised_spec), ("design", revised_design), ("plan", revised_plan),
+        ):
+            response = approve(f"approve_{key}", artifact.content_hash, rereview)
+            assert response.status_code == 200, response.text
+            rereview = response.json()["projection"]
+            assert rereview[f"{key}_approved"]
+            assert rereview[key]["content_hash"] == artifact.content_hash
+        assert not rereview["approval_reviews"]
+        assert sum(event.event_type == "approval.recorded"
+                   for event in store.list_events(run_id)) == 6
 
 
 def test_design_approval_review_snapshot_projects_the_candidate_tradeoffs(tmp_path: Path) -> None:
@@ -743,204 +734,194 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
     seed_demo_runs(store, tmp_path)
     app = AriadneApp(store=store, workspace_root=tmp_path)
 
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{port}"
 
-    try:
-        with httpx.Client(base_url=base_url, timeout=5.0) as client:
-            # 1. Index HTML & healthz
-            html_res = client.get("/")
-            assert html_res.status_code == 200
-            assert 'closedby="any"' in html_res.text
-            assert "需求追踪矩阵" in html_res.text
-            assert "交付验收" in html_res.text
-            assert 'href="/static/tokens.css"' in html_res.text
-            assert 'href="/static/style.css"' in html_res.text
-            assert 'src="/static/ui.js"' in html_res.text
-            assert 'src="/static/app.js"' in html_res.text
+    with TestClient(create_fastapi_app(app)) as client:
+        # 1. Index HTML & healthz
+        html_res = client.get("/")
+        assert html_res.status_code == 200
+        assert 'closedby="any"' in html_res.text
+        assert "需求追踪矩阵" in html_res.text
+        assert "交付验收" in html_res.text
+        assert 'href="/static/tokens.css"' in html_res.text
+        assert 'href="/static/style.css"' in html_res.text
+        assert 'src="/static/ui.js"' in html_res.text
+        assert 'src="/static/app.js"' in html_res.text
 
-            # 1b. Static assets are served with the right MIME types and no caching
-            tokens_res = client.get("/static/tokens.css")
-            assert tokens_res.status_code == 200
-            assert tokens_res.headers["content-type"].startswith("text/css")
-            assert tokens_res.headers["cache-control"] == "no-store"
-            assert "--surface-bg" in tokens_res.text
+        # 1b. Static assets are served with the right MIME types and no caching
+        tokens_res = client.get("/static/tokens.css")
+        assert tokens_res.status_code == 200
+        assert tokens_res.headers["content-type"].startswith("text/css")
+        assert tokens_res.headers["cache-control"] == "no-store"
+        assert "--surface-bg" in tokens_res.text
 
-            css_res = client.get("/static/style.css")
-            assert css_res.status_code == 200
-            assert css_res.headers["content-type"].startswith("text/css")
-            assert css_res.headers["cache-control"] == "no-store"
-            assert "scrollbar-color" in css_res.text
+        css_res = client.get("/static/style.css")
+        assert css_res.status_code == 200
+        assert css_res.headers["content-type"].startswith("text/css")
+        assert css_res.headers["cache-control"] == "no-store"
+        assert "scrollbar-color" in css_res.text
 
-            ui_res = client.get("/static/ui.js")
-            assert ui_res.status_code == 200
-            assert "javascript" in ui_res.headers["content-type"]
-            assert "function watchSlots(" in ui_res.text
+        ui_res = client.get("/static/ui.js")
+        assert ui_res.status_code == 200
+        assert "javascript" in ui_res.headers["content-type"]
+        assert "function watchSlots(" in ui_res.text
 
-            app_res = client.get("/static/app.js")
-            assert app_res.status_code == 200
-            assert "javascript" in app_res.headers["content-type"]
-            assert "watchSlots();" in app_res.text
+        app_res = client.get("/static/app.js")
+        assert app_res.status_code == 200
+        assert "javascript" in app_res.headers["content-type"]
+        assert "watchSlots();" in app_res.text
 
-            # 1c. The pre-built Graph Island loads offline from the same static root.
-            assert 'href="/static/graph/ariadne-graph.css"' in html_res.text
-            graph_at = html_res.text.find('src="/static/graph/ariadne-graph.js"')
-            assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
-            assert 'id="dag-graph"' in html_res.text
-            assert 'id="dag-svg"' not in html_res.text
-            assert 'id="workflow-graph"' in html_res.text
-            assert 'id="workflow-svg"' not in html_res.text
-            graph_js = client.get("/static/graph/ariadne-graph.js")
-            assert graph_js.status_code == 200
-            assert "javascript" in graph_js.headers["content-type"]
-            assert "window.AriadneGraph" in graph_js.text or "AriadneGraph=" in graph_js.text
-            graph_css = client.get("/static/graph/ariadne-graph.css")
-            assert graph_css.status_code == 200
-            assert graph_css.headers["content-type"].startswith("text/css")
-            assert ".ag-task-card" in graph_css.text
-            assert ".ag-wf-card" in graph_css.text
+        # 1c. The pre-built Graph Island loads offline from the same static root.
+        assert 'href="/static/graph/ariadne-graph.css"' in html_res.text
+        graph_at = html_res.text.find('src="/static/graph/ariadne-graph.js"')
+        assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
+        assert 'id="dag-graph"' in html_res.text
+        assert 'id="dag-svg"' not in html_res.text
+        assert 'id="workflow-graph"' in html_res.text
+        assert 'id="workflow-svg"' not in html_res.text
+        graph_js = client.get("/static/graph/ariadne-graph.js")
+        assert graph_js.status_code == 200
+        assert "javascript" in graph_js.headers["content-type"]
+        assert "window.AriadneGraph" in graph_js.text or "AriadneGraph=" in graph_js.text
+        graph_css = client.get("/static/graph/ariadne-graph.css")
+        assert graph_css.status_code == 200
+        assert graph_css.headers["content-type"].startswith("text/css")
+        assert ".ag-task-card" in graph_css.text
+        assert ".ag-wf-card" in graph_css.text
 
-            assert client.get("/static/missing.css").status_code == 404
-            assert client.get("/static/..%2fserver.py").status_code == 404
+        assert client.get("/static/missing.css").status_code == 404
+        assert client.get("/static/..%2fserver.py").status_code == 404
 
-            health = client.get("/healthz").json()
-            assert health["ok"] is True
+        health = client.get("/healthz").json()
+        assert health["ok"] is True
 
-            # 2. List runs & get projection
-            runs_res = client.get("/api/runs").json()
-            assert runs_res["default_run_id"] == "run-campus-waitlist"
-            demo = client.get("/api/runs/run-delivery-acceptance").json()["projection"]
-            acceptance = demo["delivery_acceptance"]
-            assert acceptance["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
-            passed, failed, unverified = acceptance["criteria"]
-            assert "Ready" in passed["evidence"]["log"]
-            assert failed["reason"] and failed["evidence"]
-            assert unverified["risk_accepted"] and "人工接受风险" in unverified["reason"]
-            assert unverified["evidence"] is None
-            seq = passed["evidence"]["event_seq"]
-            full_log = client.get(f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/1")
-            assert full_log.status_code == 200
-            assert full_log.headers["content-type"].startswith("text/plain")
-            assert "--- stdout ---\nReady\n" in full_log.text
-            assert client.get(
-                f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/3"
-            ).status_code == 404
+        # 2. List runs & get projection
+        runs_res = client.get("/api/runs").json()
+        assert runs_res["default_run_id"] == "run-campus-waitlist"
+        demo = client.get("/api/runs/run-delivery-acceptance").json()["projection"]
+        acceptance = demo["delivery_acceptance"]
+        assert acceptance["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
+        passed, failed, unverified = acceptance["criteria"]
+        assert "Ready" in passed["evidence"]["log"]
+        assert failed["reason"] and failed["evidence"]
+        assert unverified["risk_accepted"] and "人工接受风险" in unverified["reason"]
+        assert unverified["evidence"] is None
+        seq = passed["evidence"]["event_seq"]
+        full_log = client.get(f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/1")
+        assert full_log.status_code == 200
+        assert full_log.headers["content-type"].startswith("text/plain")
+        assert "--- stdout ---\nReady\n" in full_log.text
+        assert client.get(
+            f"/api/runs/run-delivery-acceptance/delivery-log/{seq}/3"
+        ).status_code == 404
 
-            run_res = client.get("/api/runs/run-campus-waitlist").json()
-            assert run_res["ok"] is True
-            rev0 = int(run_res["projection"]["state_revision"])
+        run_res = client.get("/api/runs/run-campus-waitlist").json()
+        assert run_res["ok"] is True
+        rev0 = int(run_res["projection"]["state_revision"])
 
-            # 2b. The projection powers toolRow / subPane / receiptBlock / waterfall
-            proj0 = run_res["projection"]
-            t03r1 = next(n for n in proj0["dag"]["nodes"] if n["task_id"] == "T03-R1")
-            assert t03r1["subagent_stream"][0]["tool"] == "read_file"
-            assert t03r1["receipt"]["turn_id"] == "turn-t03-r1-a2"
-            assert "MANIFEST — T03-R1" in t03r1["manifest_md"]
-            assert len(t03r1["terminal_lines"]) <= 4
-            assert proj0["waterfall_turns"][0]["actor"] == "Align"
-            assert any(turn["actor"] == "Argus" for turn in proj0["waterfall_turns"])
+        # 2b. The projection powers toolRow / subPane / receiptBlock / waterfall
+        proj0 = run_res["projection"]
+        t03r1 = next(n for n in proj0["dag"]["nodes"] if n["task_id"] == "T03-R1")
+        assert t03r1["subagent_stream"][0]["tool"] == "read_file"
+        assert t03r1["receipt"]["turn_id"] == "turn-t03-r1-a2"
+        assert "MANIFEST — T03-R1" in t03r1["manifest_md"]
+        assert len(t03r1["terminal_lines"]) <= 4
+        assert proj0["waterfall_turns"][0]["actor"] == "Align"
+        assert any(turn["actor"] == "Argus" for turn in proj0["waterfall_turns"])
 
-            # 3. SSE stream (once=1)
-            sse_res = client.get("/api/runs/run-campus-waitlist/stream?after_seq=0&once=1")
-            assert sse_res.status_code == 200
-            assert "text/event-stream" in sse_res.headers["content-type"]
-            assert "event: state" in sse_res.text
+        # 3. SSE stream (once=1)
+        sse_res = client.get("/api/runs/run-campus-waitlist/stream?after_seq=0&once=1")
+        assert sse_res.status_code == 200
+        assert "text/event-stream" in sse_res.headers["content-type"]
+        assert "event: state" in sse_res.text
 
-            # 4. Pause & idempotency check
-            pause_body = {
-                "operation_id": "op-pause-1",
-                "action": "pause",
+        # 4. Pause & idempotency check
+        pause_body = {
+            "operation_id": "op-pause-1",
+            "action": "pause",
+            "expected_state_revision": rev0,
+            "actor": "zeus",
+        }
+        p1 = client.post("/api/runs/run-campus-waitlist/command", json=pause_body)
+        assert p1.status_code == 200
+        rev1 = int(p1.json()["projection"]["state_revision"])
+        assert rev1 == rev0 + 1
+        assert p1.json()["projection"]["status"] == "paused"
+
+        # Re-sending identical operation_id returns cached response without bumping revision
+        p1_dup = client.post("/api/runs/run-campus-waitlist/command", json=pause_body)
+        assert p1_dup.status_code == 200
+        assert int(p1_dup.json()["projection"]["state_revision"]) == rev1
+
+        # Stale state_revision with a new operation_id is rejected with 409 Conflict
+        stale_res = client.post(
+            "/api/runs/run-campus-waitlist/command",
+            json={
+                "operation_id": "op-stale-99",
+                "action": "resume",
                 "expected_state_revision": rev0,
-                "actor": "zeus",
-            }
-            p1 = client.post("/api/runs/run-campus-waitlist/command", json=pause_body)
-            assert p1.status_code == 200
-            rev1 = int(p1.json()["projection"]["state_revision"])
-            assert rev1 == rev0 + 1
-            assert p1.json()["projection"]["status"] == "paused"
+            },
+        )
+        assert stale_res.status_code == 409
 
-            # Re-sending identical operation_id returns cached response without bumping revision
-            p1_dup = client.post("/api/runs/run-campus-waitlist/command", json=pause_body)
-            assert p1_dup.status_code == 200
-            assert int(p1_dup.json()["projection"]["state_revision"]) == rev1
+        # 5. Reject accept_risk without reason
+        bad_risk = client.post(
+            "/api/runs/run-campus-waitlist/command",
+            json={
+                "operation_id": "op-bad-risk",
+                "action": "accept_risk",
+                "task_id": "T03-R1",
+                "reason": "   ",
+                "expected_state_revision": rev1,
+            },
+        )
+        assert bad_risk.status_code == 400
 
-            # Stale state_revision with a new operation_id is rejected with 409 Conflict
-            stale_res = client.post(
-                "/api/runs/run-campus-waitlist/command",
-                json={
-                    "operation_id": "op-stale-99",
-                    "action": "resume",
-                    "expected_state_revision": rev0,
-                },
-            )
-            assert stale_res.status_code == 409
+        # 6. Test accept_risk distinguishing unverified_risk_accepted from verified
+        risk_res = client.post(
+            "/api/runs/run-campus-waitlist/command",
+            json={
+                "operation_id": "op-accept-risk-t03r1",
+                "action": "accept_risk",
+                "task_id": "T03-R1",
+                "reason": "首期单管理员手动取消，接受并发风险放行",
+                "expected_state_revision": rev1,
+            },
+        )
+        assert risk_res.status_code == 200
+        proj_after_risk = risk_res.json()["projection"]
+        t03_node = next(n for n in proj_after_risk["dag"]["nodes"] if n["task_id"] == "T03-R1")
+        assert t03_node["status"] == TaskStatus.ACCEPTED.value
+        assert t03_node["accepted_risk_reason"] == "首期单管理员手动取消，接受并发风险放行"
+        assert proj_after_risk["progress"]["accepted_tasks"] == 5
+        assert proj_after_risk["progress"]["verified_tasks"] == 4
 
-            # 5. Reject accept_risk without reason
-            bad_risk = client.post(
-                "/api/runs/run-campus-waitlist/command",
-                json={
-                    "operation_id": "op-bad-risk",
-                    "action": "accept_risk",
-                    "task_id": "T03-R1",
-                    "reason": "   ",
-                    "expected_state_revision": rev1,
-                },
-            )
-            assert bad_risk.status_code == 400
-
-            # 6. Test accept_risk distinguishing unverified_risk_accepted from verified
-            risk_res = client.post(
-                "/api/runs/run-campus-waitlist/command",
-                json={
-                    "operation_id": "op-accept-risk-t03r1",
-                    "action": "accept_risk",
-                    "task_id": "T03-R1",
-                    "reason": "首期单管理员手动取消，接受并发风险放行",
-                    "expected_state_revision": rev1,
-                },
-            )
-            assert risk_res.status_code == 200
-            proj_after_risk = risk_res.json()["projection"]
-            t03_node = next(n for n in proj_after_risk["dag"]["nodes"] if n["task_id"] == "T03-R1")
-            assert t03_node["status"] == TaskStatus.ACCEPTED.value
-            assert t03_node["accepted_risk_reason"] == "首期单管理员手动取消，接受并发风险放行"
-            assert proj_after_risk["progress"]["accepted_tasks"] == 5
-            assert proj_after_risk["progress"]["verified_tasks"] == 4
-
-            # Mark T06 & T08 accepted to verify FR-003/FR-004 show unverified_risk_accepted
-            snap = store.get_run("run-campus-waitlist")
-            plan = snap["plan"]
-            assert plan is not None
-            updated_tasks = [
-                t.model_copy(update={"status": TaskStatus.ACCEPTED})
-                if t.task_id in ("T06", "T08")
-                else t
-                for t in plan.tasks
-            ]
-            store.save_plan(
-                "run-campus-waitlist",
-                plan.model_copy(update={"tasks": updated_tasks}),
-                actor="test",
-            )
-            final_proj = client.get("/api/runs/run-campus-waitlist").json()["projection"]
-            matrix = {r["requirement_id"]: r for r in final_proj["traceability_matrix"]}
-            assert matrix["FR-003"]["verification_status"] == "unverified_risk_accepted"
-            assert matrix["FR-003"]["verification_label"] == "未验证 · 人工接受"
-            assert "首期单管理员手动取消" in matrix["FR-003"]["evidence_note"]
-            risk_review = proj_after_risk["delivery_acceptance"]
-            assert risk_review["counts"] == {"passed": 0, "failed": 0, "unverified": 5}
-            risk_row = next(
-                row for row in risk_review["criteria"] if row["requirement_id"] == "FR-003"
-            )
-            assert risk_row["risk_accepted"] and risk_row["evidence"] is None
-            assert t03_node["accepted_risk_reason"] in risk_row["reason"]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=2.0)
+        # Mark T06 & T08 accepted to verify FR-003/FR-004 show unverified_risk_accepted
+        snap = store.get_run("run-campus-waitlist")
+        plan = snap["plan"]
+        assert plan is not None
+        updated_tasks = [
+            t.model_copy(update={"status": TaskStatus.ACCEPTED})
+            if t.task_id in ("T06", "T08")
+            else t
+            for t in plan.tasks
+        ]
+        store.save_plan(
+            "run-campus-waitlist",
+            plan.model_copy(update={"tasks": updated_tasks}),
+            actor="test",
+        )
+        final_proj = client.get("/api/runs/run-campus-waitlist").json()["projection"]
+        matrix = {r["requirement_id"]: r for r in final_proj["traceability_matrix"]}
+        assert matrix["FR-003"]["verification_status"] == "unverified_risk_accepted"
+        assert matrix["FR-003"]["verification_label"] == "未验证 · 人工接受"
+        assert "首期单管理员手动取消" in matrix["FR-003"]["evidence_note"]
+        risk_review = proj_after_risk["delivery_acceptance"]
+        assert risk_review["counts"] == {"passed": 0, "failed": 0, "unverified": 5}
+        risk_row = next(
+            row for row in risk_review["criteria"] if row["requirement_id"] == "FR-003"
+        )
+        assert risk_row["risk_accepted"] and risk_row["evidence"] is None
+        assert t03_node["accepted_risk_reason"] in risk_row["reason"]
 
 
 def test_projection_workflow_traceability_and_triage(tmp_path: Path) -> None:
@@ -1157,13 +1138,8 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
     run_id = _seed_gated_run(store)
     app = AriadneApp(store=store, workspace_root=tmp_path)
 
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{port}"
     try:
-        with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        with TestClient(create_fastapi_app(app)) as client:
             # 1. Every v3 workbench control is present in the shell
             html = client.get("/").text
             for marker in (
@@ -1314,9 +1290,6 @@ def test_ariadne_v3_workbench_http_flow(tmp_path: Path) -> None:
             )
     finally:
         app.supervisor.shutdown()
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=2.0)
 
 
 def test_direct_design_spec_projection_pipeline_and_matrix(tmp_path: Path) -> None:
@@ -1649,13 +1622,8 @@ def test_clarify_settles_gate_sync_and_409_returns_projection(tmp_path: Path) ->
     )
 
     app = AriadneApp(store=store, workspace_root=tmp_path)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base_url = f"http://127.0.0.1:{port}"
     try:
-        with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        with TestClient(create_fastapi_app(app)) as client:
             initial = client.get(f"/api/runs/{run_id}").json()["projection"]
 
             # Default clarify (auto_advance omitted -> True, sync omitted -> False)
@@ -1712,8 +1680,6 @@ def test_clarify_settles_gate_sync_and_409_returns_projection(tmp_path: Path) ->
             assert sse_res.status_code == 200
             assert sse_res.headers.get("connection") == "close"
     finally:
-        httpd.shutdown()
-        httpd.server_close()
         app.supervisor.shutdown()
 
 

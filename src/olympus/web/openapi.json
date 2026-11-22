@@ -1,0 +1,6410 @@
+{
+  "components": {
+    "schemas": {
+      "AcceptRiskCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "accept_risk",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "task_id",
+          "reason"
+        ],
+        "title": "AcceptRiskCommand",
+        "type": "object"
+      },
+      "AcceptanceCheck": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "description": {
+            "minLength": 1,
+            "title": "Description",
+            "type": "string"
+          },
+          "evidence_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Ref"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CheckKind"
+          },
+          "passed": {
+            "default": false,
+            "title": "Passed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "description"
+        ],
+        "title": "AcceptanceCheck",
+        "type": "object"
+      },
+      "AcceptanceCriterion": {
+        "additionalProperties": false,
+        "description": "One EARS-pattern acceptance criterion with a deterministic rendering.",
+        "properties": {
+          "condition": {
+            "default": "",
+            "title": "Condition",
+            "type": "string"
+          },
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "outcome": {
+            "minLength": 1,
+            "title": "Outcome",
+            "type": "string"
+          },
+          "pattern": {
+            "$ref": "#/components/schemas/EarsPattern"
+          }
+        },
+        "required": [
+          "id",
+          "pattern",
+          "outcome"
+        ],
+        "title": "AcceptanceCriterion",
+        "type": "object"
+      },
+      "AmbiguityItem": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "blocking": {
+            "default": true,
+            "title": "Blocking",
+            "type": "boolean"
+          },
+          "default_assumption": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Assumption"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "impact": {
+            "title": "Impact",
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "question",
+          "impact"
+        ],
+        "title": "AmbiguityItem",
+        "type": "object"
+      },
+      "ApprovalReview": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {
+            "enum": [
+              "spec",
+              "design",
+              "plan"
+            ],
+            "title": "Artifact",
+            "type": "string"
+          },
+          "baseline": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline"
+          },
+          "comparison_gap": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comparison Gap"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewSection"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "target_hash": {
+            "title": "Target Hash",
+            "type": "string"
+          },
+          "unchanged_sections": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ReviewSection"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unchanged Sections"
+          }
+        },
+        "required": [
+          "artifact",
+          "target_hash",
+          "sections"
+        ],
+        "title": "ApprovalReview",
+        "type": "object"
+      },
+      "ApproveDesignCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "approve_design",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ApproveDesignCommand",
+        "type": "object"
+      },
+      "ApprovePlanCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "approve_plan",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ApprovePlanCommand",
+        "type": "object"
+      },
+      "ApproveSpecCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "accept_risk": {
+            "default": false,
+            "title": "Accept Risk",
+            "type": "boolean"
+          },
+          "action": {
+            "const": "approve_spec",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ApproveSpecCommand",
+        "type": "object"
+      },
+      "AttemptArtifactsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "$ref": "#/components/schemas/RecordedAttemptArtifacts"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "artifacts"
+        ],
+        "title": "AttemptArtifactsResponse",
+        "type": "object"
+      },
+      "BudgetSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "calls_reserved": {
+            "title": "Calls Reserved",
+            "type": "integer"
+          },
+          "calls_used": {
+            "title": "Calls Used",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "max_calls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Calls"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "unknown_outcome_calls": {
+            "title": "Unknown Outcome Calls",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls_used",
+          "calls_reserved",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "unknown_outcome_calls"
+        ],
+        "title": "BudgetSummary",
+        "type": "object"
+      },
+      "CheckKind": {
+        "enum": [
+          "command",
+          "independent_review",
+          "human"
+        ],
+        "title": "CheckKind",
+        "type": "string"
+      },
+      "ClarifyCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "clarify",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "answers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Answers",
+            "type": "object"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "out_of_scope": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Out Of Scope",
+            "type": "array"
+          },
+          "resolutions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Resolutions",
+            "type": "object"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ClarifyCommand",
+        "type": "object"
+      },
+      "CommandResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "command_result": {
+            "$ref": "#/components/schemas/CommandResult"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "projection": {
+            "$ref": "#/components/schemas/RunProjection"
+          }
+        },
+        "required": [
+          "command_result",
+          "projection"
+        ],
+        "title": "CommandResponse",
+        "type": "object"
+      },
+      "CommandResult": {
+        "additionalProperties": true,
+        "description": "Union of every recorded HITL command result.\n\nCommand handlers record different result shapes; the common fields are\ntyped and unknown handler-specific keys pass through unchanged.",
+        "properties": {
+          "approval_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "budget_max_calls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Max Calls"
+          },
+          "deduplicated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deduplicated"
+          },
+          "from_workflow": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Workflow"
+          },
+          "remaining_blockers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Blockers"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "spec_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Hash"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Revision"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunResult"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow"
+          }
+        },
+        "title": "CommandResult",
+        "type": "object"
+      },
+      "ConflictResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "conflict": {
+            "const": true,
+            "default": true,
+            "title": "Conflict",
+            "type": "boolean"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "ok": {
+            "const": false,
+            "default": false,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunProjection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ConflictResponse",
+        "type": "object"
+      },
+      "CreateRunRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "auto_approve": {
+            "default": false,
+            "title": "Auto Approve",
+            "type": "boolean"
+          },
+          "constraints": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Constraints"
+          },
+          "demo_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Demo Id"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal"
+          },
+          "monitor_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monitor Model"
+          },
+          "provider_config": {
+            "additionalProperties": true,
+            "title": "Provider Config",
+            "type": "object"
+          },
+          "raw_input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Input"
+          },
+          "reviewer_driver": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Driver"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "worker_driver": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Driver"
+          },
+          "workflow_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Name"
+          },
+          "workspace_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Root"
+          }
+        },
+        "title": "CreateRunRequest",
+        "type": "object"
+      },
+      "CreateRunResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "coalesced": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coalesced"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PauseInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Revision"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "stop_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop After"
+          },
+          "topology": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topology"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "CreateRunResponse",
+        "type": "object"
+      },
+      "CritiqueNote": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence Refs",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "perspective": {
+            "$ref": "#/components/schemas/CritiquePerspective"
+          },
+          "resolution_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Note"
+          },
+          "resolved": {
+            "default": false,
+            "title": "Resolved",
+            "type": "boolean"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/CritiqueSeverity"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "perspective",
+          "severity",
+          "summary"
+        ],
+        "title": "CritiqueNote",
+        "type": "object"
+      },
+      "CritiquePerspective": {
+        "enum": [
+          "product",
+          "engineering",
+          "qa"
+        ],
+        "title": "CritiquePerspective",
+        "type": "string"
+      },
+      "CritiqueSeverity": {
+        "enum": [
+          "blocking",
+          "warning"
+        ],
+        "title": "CritiqueSeverity",
+        "type": "string"
+      },
+      "CurrentTool": {
+        "additionalProperties": false,
+        "properties": {
+          "step": {
+            "title": "Step",
+            "type": "integer"
+          },
+          "target_hint": {
+            "title": "Target Hint",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "tool",
+          "target_hint"
+        ],
+        "title": "CurrentTool",
+        "type": "object"
+      },
+      "DagEdge": {
+        "additionalProperties": false,
+        "properties": {
+          "blocked_edge": {
+            "title": "Blocked Edge",
+            "type": "boolean"
+          },
+          "critical": {
+            "title": "Critical",
+            "type": "boolean"
+          },
+          "from": {
+            "title": "From",
+            "type": "string"
+          },
+          "to": {
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "critical",
+          "blocked_edge"
+        ],
+        "title": "DagEdge",
+        "type": "object"
+      },
+      "DagNode": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_checks": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptanceCheck"
+            },
+            "title": "Acceptance Checks",
+            "type": "array"
+          },
+          "accepted_risk_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Risk Reason"
+          },
+          "artifacts": {
+            "$ref": "#/components/schemas/TaskArtifacts"
+          },
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "blocked_by": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Blocked By",
+            "type": "array"
+          },
+          "blocker": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskBlocker"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "critical": {
+            "title": "Critical",
+            "type": "boolean"
+          },
+          "deliverables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Deliverables",
+            "type": "array"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "design_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Design Refs",
+            "type": "array"
+          },
+          "diagnostic_attribution": {
+            "title": "Diagnostic Attribution",
+            "type": "string"
+          },
+          "diagnostic_output": {
+            "title": "Diagnostic Output",
+            "type": "string"
+          },
+          "diagnostic_tool": {
+            "title": "Diagnostic Tool",
+            "type": "string"
+          },
+          "executor": {
+            "title": "Executor",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "layer": {
+            "title": "Layer",
+            "type": "integer"
+          },
+          "live_progress": {
+            "$ref": "#/components/schemas/LiveProgress"
+          },
+          "manifest_md": {
+            "title": "Manifest Md",
+            "type": "string"
+          },
+          "max_cycles": {
+            "title": "Max Cycles",
+            "type": "integer"
+          },
+          "objective": {
+            "title": "Objective",
+            "type": "string"
+          },
+          "provider_retry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProviderTimeoutRetry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_retry_history": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderRetryRecord"
+            },
+            "title": "Provider Retry History",
+            "type": "array"
+          },
+          "read_scope": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Read Scope",
+            "type": "array"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/TurnReceipt"
+          },
+          "requirement_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirement Refs",
+            "type": "array"
+          },
+          "review_cycle": {
+            "title": "Review Cycle",
+            "type": "integer"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "subagent_stream": {
+            "items": {
+              "$ref": "#/components/schemas/SubagentStep"
+            },
+            "title": "Subagent Stream",
+            "type": "array"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "terminal_lines": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Terminal Lines",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "write_scope": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Write Scope",
+            "type": "array"
+          }
+        },
+        "required": [
+          "task_id",
+          "title",
+          "objective",
+          "status",
+          "layer",
+          "critical",
+          "attempt",
+          "review_cycle",
+          "max_cycles",
+          "requirement_refs",
+          "design_refs",
+          "role",
+          "kind",
+          "deliverables",
+          "depends_on",
+          "write_scope",
+          "read_scope",
+          "provider_retry_history",
+          "live_progress",
+          "blocked_by",
+          "executor",
+          "diagnostic_tool",
+          "diagnostic_output",
+          "diagnostic_attribution",
+          "acceptance_checks",
+          "subagent_stream",
+          "terminal_lines",
+          "receipt",
+          "manifest_md",
+          "artifacts"
+        ],
+        "title": "DagNode",
+        "type": "object"
+      },
+      "DagView": {
+        "additionalProperties": false,
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/DagEdge"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/DagNode"
+            },
+            "title": "Nodes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges"
+        ],
+        "title": "DagView",
+        "type": "object"
+      },
+      "DataEntity": {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Fields",
+            "type": "array"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "notes": {
+            "default": "",
+            "title": "Notes",
+            "type": "string"
+          },
+          "owner_module_id": {
+            "minLength": 1,
+            "title": "Owner Module Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "fields",
+          "owner_module_id"
+        ],
+        "title": "DataEntity",
+        "type": "object"
+      },
+      "DeliverableKind": {
+        "enum": [
+          "web_app",
+          "rest_api",
+          "cli",
+          "library",
+          "desktop",
+          "multi_surface"
+        ],
+        "title": "DeliverableKind",
+        "type": "string"
+      },
+      "DeliveryAcceptance": {
+        "additionalProperties": false,
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/DeliveryCounts"
+          },
+          "criteria": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryCriterion"
+            },
+            "title": "Criteria",
+            "type": "array"
+          },
+          "spec_hash": {
+            "title": "Spec Hash",
+            "type": "string"
+          },
+          "spec_id": {
+            "title": "Spec Id",
+            "type": "string"
+          },
+          "spec_version": {
+            "title": "Spec Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "spec_id",
+          "spec_version",
+          "spec_hash",
+          "counts",
+          "criteria"
+        ],
+        "title": "DeliveryAcceptance",
+        "type": "object"
+      },
+      "DeliveryCheck": {
+        "additionalProperties": false,
+        "description": "Executable check for a 1-based criterion in the plan's bound GoalSpec.",
+        "properties": {
+          "command": {
+            "pattern": "\\S",
+            "title": "Command",
+            "type": "string"
+          },
+          "criterion_index": {
+            "minimum": 1.0,
+            "title": "Criterion Index",
+            "type": "integer"
+          },
+          "requirement_id": {
+            "minLength": 1,
+            "title": "Requirement Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "criterion_index",
+          "command"
+        ],
+        "title": "DeliveryCheck",
+        "type": "object"
+      },
+      "DeliveryCounts": {
+        "additionalProperties": false,
+        "properties": {
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "integer"
+          },
+          "unverified": {
+            "title": "Unverified",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "passed",
+          "failed",
+          "unverified"
+        ],
+        "title": "DeliveryCounts",
+        "type": "object"
+      },
+      "DeliveryCriterion": {
+        "additionalProperties": false,
+        "properties": {
+          "criterion_index": {
+            "title": "Criterion Index",
+            "type": "integer"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "requirement_id": {
+            "title": "Requirement Id",
+            "type": "string"
+          },
+          "risk_accepted": {
+            "title": "Risk Accepted",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "criterion_index",
+          "text",
+          "status",
+          "reason",
+          "risk_accepted"
+        ],
+        "title": "DeliveryCriterion",
+        "type": "object"
+      },
+      "DeliveryEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "check_position": {
+            "title": "Check Position",
+            "type": "integer"
+          },
+          "delivery_version": {
+            "title": "Delivery Version",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "exit_code": {
+            "title": "Exit Code",
+            "type": "integer"
+          },
+          "log": {
+            "title": "Log",
+            "type": "string"
+          },
+          "log_hash": {
+            "title": "Log Hash",
+            "type": "string"
+          },
+          "receipt_id": {
+            "title": "Receipt Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delivery_version",
+          "event_seq",
+          "receipt_id",
+          "check_position",
+          "log_hash",
+          "exit_code",
+          "log"
+        ],
+        "title": "DeliveryEvidence",
+        "type": "object"
+      },
+      "DemoPreset": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "clarification_hints": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Clarification Hints",
+            "type": "array"
+          },
+          "constraints": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Constraints",
+            "type": "array"
+          },
+          "default_workflow": {
+            "title": "Default Workflow",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "raw_input": {
+            "title": "Raw Input",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "workspace_summary": {
+            "title": "Workspace Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "case_id",
+          "label",
+          "title",
+          "raw_input",
+          "constraints",
+          "default_workflow",
+          "workspace_summary",
+          "clarification_hints"
+        ],
+        "title": "DemoPreset",
+        "type": "object"
+      },
+      "DemosResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "demos": {
+            "items": {
+              "$ref": "#/components/schemas/DemoPreset"
+            },
+            "title": "Demos",
+            "type": "array"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "demos"
+        ],
+        "title": "DemosResponse",
+        "type": "object"
+      },
+      "DesignModule": {
+        "additionalProperties": false,
+        "description": "One white-box module boundary with an exclusive target path scope.",
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "requirement_refs": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Requirement Refs",
+            "type": "array"
+          },
+          "responsibility": {
+            "minLength": 1,
+            "title": "Responsibility",
+            "type": "string"
+          },
+          "target_paths": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Target Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "responsibility",
+          "requirement_refs",
+          "target_paths"
+        ],
+        "title": "DesignModule",
+        "type": "object"
+      },
+      "DesignModuleRef": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "DesignModuleRef",
+        "type": "object"
+      },
+      "DesignSpec": {
+        "additionalProperties": false,
+        "description": "White-box design: invariants, contract seams, modules, data ownership, and strategy.",
+        "properties": {
+          "architecture_summary": {
+            "minLength": 1,
+            "title": "Architecture Summary",
+            "type": "string"
+          },
+          "content_hash": {
+            "default": "",
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "data_models": {
+            "items": {
+              "$ref": "#/components/schemas/DataEntity"
+            },
+            "title": "Data Models",
+            "type": "array"
+          },
+          "design_id": {
+            "title": "Design Id",
+            "type": "string"
+          },
+          "design_tradeoffs": {
+            "description": "Choices and costs affecting the existing system, deployment or rollback.",
+            "items": {
+              "$ref": "#/components/schemas/DesignTradeoff"
+            },
+            "title": "Design Tradeoffs",
+            "type": "array"
+          },
+          "execution_strategy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionStrategy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "interfaces": {
+            "items": {
+              "$ref": "#/components/schemas/InterfaceContract"
+            },
+            "title": "Interfaces",
+            "type": "array"
+          },
+          "modules": {
+            "items": {
+              "$ref": "#/components/schemas/DesignModule"
+            },
+            "minItems": 1,
+            "title": "Modules",
+            "type": "array"
+          },
+          "risks_and_tradeoffs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Risks And Tradeoffs",
+            "type": "array"
+          },
+          "shared_contract_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Shared Contract Paths",
+            "type": "array"
+          },
+          "shared_invariants": {
+            "items": {
+              "$ref": "#/components/schemas/GlobalInvariant"
+            },
+            "title": "Shared Invariants",
+            "type": "array"
+          },
+          "spec_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Hash"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SpecStatus",
+            "default": "draft"
+          },
+          "strategy_rationale": {
+            "default": "",
+            "title": "Strategy Rationale",
+            "type": "string"
+          },
+          "version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "architecture_summary",
+          "modules"
+        ],
+        "title": "DesignSpec",
+        "type": "object"
+      },
+      "DesignTradeoff": {
+        "additionalProperties": false,
+        "description": "A selected design decision and its concrete cost at an approval boundary.",
+        "properties": {
+          "choice": {
+            "minLength": 1,
+            "title": "Choice",
+            "type": "string"
+          },
+          "cost": {
+            "minLength": 1,
+            "title": "Cost",
+            "type": "string"
+          },
+          "impact": {
+            "enum": [
+              "existing_system",
+              "deployment",
+              "rollback"
+            ],
+            "title": "Impact",
+            "type": "string"
+          }
+        },
+        "required": [
+          "impact",
+          "choice",
+          "cost"
+        ],
+        "title": "DesignTradeoff",
+        "type": "object"
+      },
+      "EarsPattern": {
+        "enum": [
+          "ubiquitous",
+          "event_driven",
+          "state_driven",
+          "unwanted_behavior",
+          "optional_feature"
+        ],
+        "title": "EarsPattern",
+        "type": "string"
+      },
+      "ErrorResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "ok": {
+            "const": false,
+            "default": false,
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "EventsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "state_revision": {
+            "title": "State Revision",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "state_revision",
+          "status",
+          "events"
+        ],
+        "title": "EventsResponse",
+        "type": "object"
+      },
+      "ExecutionStrategy": {
+        "description": "Explicit concurrency vs. sequential-handoff verdict for Stage 2 execution.",
+        "enum": [
+          "serial_handoff",
+          "contract_first_parallel"
+        ],
+        "title": "ExecutionStrategy",
+        "type": "string"
+      },
+      "GlobalInvariant": {
+        "additionalProperties": false,
+        "description": "Cross-cutting rule locked before parallel or sequential module implementation.",
+        "properties": {
+          "applies_to": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Applies To",
+            "type": "array"
+          },
+          "category": {
+            "enum": [
+              "error_envelope",
+              "id_format",
+              "time_encoding",
+              "concurrency",
+              "naming_convention",
+              "config",
+              "validation",
+              "security"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "enforcement_hint": {
+            "default": "",
+            "title": "Enforcement Hint",
+            "type": "string"
+          },
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "rule": {
+            "minLength": 1,
+            "title": "Rule",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "category",
+          "rule"
+        ],
+        "title": "GlobalInvariant",
+        "type": "object"
+      },
+      "GoalSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "actors": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Actors",
+            "type": "array"
+          },
+          "agent_high_impact_assumptions": {
+            "description": "Agent-added assumptions affecting scope or acceptance, quoted verbatim.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent High Impact Assumptions",
+            "type": "array"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Assumptions",
+            "type": "array"
+          },
+          "constraints": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Constraints",
+            "type": "array"
+          },
+          "content_hash": {
+            "default": "",
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "deliverable_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliverableKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "goal": {
+            "minLength": 1,
+            "title": "Goal",
+            "type": "string"
+          },
+          "minority_notes": {
+            "items": {
+              "$ref": "#/components/schemas/CritiqueNote"
+            },
+            "title": "Minority Notes",
+            "type": "array"
+          },
+          "observable_surfaces": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Observable Surfaces",
+            "type": "array"
+          },
+          "open_ambiguities": {
+            "items": {
+              "$ref": "#/components/schemas/AmbiguityItem"
+            },
+            "title": "Open Ambiguities",
+            "type": "array"
+          },
+          "out_of_scope": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Out Of Scope",
+            "type": "array"
+          },
+          "requirements": {
+            "items": {
+              "$ref": "#/components/schemas/RequirementItem"
+            },
+            "minItems": 1,
+            "title": "Requirements",
+            "type": "array"
+          },
+          "spec_id": {
+            "title": "Spec Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SpecStatus",
+            "default": "draft"
+          },
+          "version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "goal",
+          "requirements"
+        ],
+        "title": "GoalSpec",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "version"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "HitlBanner": {
+        "additionalProperties": false,
+        "properties": {
+          "actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "affected_task_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Affected Task Ids"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "failed_node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Node"
+          },
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "tone": {
+            "title": "Tone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "tone",
+          "headline",
+          "detail",
+          "actions"
+        ],
+        "title": "HitlBanner",
+        "type": "object"
+      },
+      "InterfaceContract": {
+        "additionalProperties": false,
+        "description": "A named seam between a provider module and its consumers.",
+        "properties": {
+          "consumer_module_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Consumer Module Ids",
+            "type": "array"
+          },
+          "data_entity_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Data Entity Refs",
+            "type": "array"
+          },
+          "error_cases": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Error Cases",
+            "type": "array"
+          },
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "input_schema": {
+            "items": {
+              "$ref": "#/components/schemas/SchemaField"
+            },
+            "title": "Input Schema",
+            "type": "array"
+          },
+          "output_schema": {
+            "items": {
+              "$ref": "#/components/schemas/SchemaField"
+            },
+            "title": "Output Schema",
+            "type": "array"
+          },
+          "protocol": {
+            "default": "http_or_fn",
+            "title": "Protocol",
+            "type": "string"
+          },
+          "provider_module_id": {
+            "minLength": 1,
+            "title": "Provider Module Id",
+            "type": "string"
+          },
+          "signature": {
+            "minLength": 1,
+            "title": "Signature",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "provider_module_id",
+          "signature"
+        ],
+        "title": "InterfaceContract",
+        "type": "object"
+      },
+      "KeyOutputItem": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Hash"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "detail_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Available"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "event_seq",
+          "created_at",
+          "event_type",
+          "key",
+          "kind",
+          "artifact_id",
+          "current",
+          "summary"
+        ],
+        "title": "KeyOutputItem",
+        "type": "object"
+      },
+      "LiveProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "current_tool": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CurrentTool"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "driver_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Driver Name"
+          },
+          "last_event_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Event At"
+          },
+          "preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview"
+          },
+          "recent_tools": {
+            "items": {
+              "$ref": "#/components/schemas/RecentTool"
+            },
+            "title": "Recent Tools",
+            "type": "array"
+          },
+          "steer_count": {
+            "title": "Steer Count",
+            "type": "integer"
+          },
+          "watchdog_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchdog Summary"
+          },
+          "watchdog_verdict": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watchdog Verdict"
+          }
+        },
+        "required": [
+          "recent_tools",
+          "steer_count"
+        ],
+        "title": "LiveProgress",
+        "type": "object"
+      },
+      "PauseCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "pause",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "PauseCommand",
+        "type": "object"
+      },
+      "PauseInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "PauseInfo",
+        "type": "object"
+      },
+      "ProgressSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted_tasks": {
+            "title": "Accepted Tasks",
+            "type": "integer"
+          },
+          "ratio_text": {
+            "title": "Ratio Text",
+            "type": "string"
+          },
+          "total_tasks": {
+            "title": "Total Tasks",
+            "type": "integer"
+          },
+          "verified_tasks": {
+            "title": "Verified Tasks",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted_tasks",
+          "verified_tasks",
+          "total_tasks",
+          "ratio_text"
+        ],
+        "title": "ProgressSummary",
+        "type": "object"
+      },
+      "PromoteToExecuteCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "promote_to_execute",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "max_llm_calls": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Llm Calls"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          },
+          "workflow_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Name"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "PromoteToExecuteCommand",
+        "type": "object"
+      },
+      "ProviderRetryRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "lease_generation": {
+            "minimum": 1.0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
+          "phase": {
+            "enum": [
+              "started",
+              "recovered",
+              "failed"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "retry_id": {
+            "title": "Retry Id",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "retry_id",
+          "task_id",
+          "lease_generation",
+          "phase",
+          "event_seq",
+          "actor"
+        ],
+        "title": "ProviderRetryRecord",
+        "type": "object"
+      },
+      "ProviderStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "default_model": {
+            "title": "Default Model",
+            "type": "string"
+          },
+          "dialect": {
+            "title": "Dialect",
+            "type": "string"
+          },
+          "env_vars": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Env Vars",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "dialect",
+          "default_model",
+          "configured",
+          "env_vars"
+        ],
+        "title": "ProviderStatus",
+        "type": "object"
+      },
+      "ProviderTimeoutRetry": {
+        "additionalProperties": false,
+        "properties": {
+          "lease_generation": {
+            "minimum": 1.0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
+          "phase": {
+            "enum": [
+              "started",
+              "recovered",
+              "failed"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "retry_id": {
+            "title": "Retry Id",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "retry_id",
+          "task_id",
+          "lease_generation",
+          "phase"
+        ],
+        "title": "ProviderTimeoutRetry",
+        "type": "object"
+      },
+      "ProvidersResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderStatus"
+            },
+            "title": "Providers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "title": "ProvidersResponse",
+        "type": "object"
+      },
+      "ReassignHumanCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "reassign_human",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "task_id"
+        ],
+        "title": "ReassignHumanCommand",
+        "type": "object"
+      },
+      "ReceiptArtifacts": {
+        "additionalProperties": false,
+        "properties": {
+          "checks_passed": {
+            "title": "Checks Passed",
+            "type": "integer"
+          },
+          "checks_total": {
+            "title": "Checks Total",
+            "type": "integer"
+          },
+          "diff_added": {
+            "title": "Diff Added",
+            "type": "integer"
+          },
+          "diff_removed": {
+            "title": "Diff Removed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "diff_added",
+          "diff_removed",
+          "checks_passed",
+          "checks_total"
+        ],
+        "title": "ReceiptArtifacts",
+        "type": "object"
+      },
+      "ReceiptLLM": {
+        "additionalProperties": false,
+        "properties": {
+          "calls": {
+            "title": "Calls",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls",
+          "input_tokens",
+          "output_tokens"
+        ],
+        "title": "ReceiptLLM",
+        "type": "object"
+      },
+      "ReceiptTool": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "status",
+          "duration_ms"
+        ],
+        "title": "ReceiptTool",
+        "type": "object"
+      },
+      "RecentTool": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "step": {
+            "title": "Step",
+            "type": "integer"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "tool",
+          "status",
+          "duration_ms"
+        ],
+        "title": "RecentTool",
+        "type": "object"
+      },
+      "RecordedAttemptArtifacts": {
+        "additionalProperties": false,
+        "properties": {
+          "check_logs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Check Logs",
+            "type": "object"
+          },
+          "diff_patch": {
+            "title": "Diff Patch",
+            "type": "string"
+          },
+          "manifest_md": {
+            "title": "Manifest Md",
+            "type": "string"
+          },
+          "verdicts": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewVerdict"
+            },
+            "title": "Verdicts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "diff_patch",
+          "manifest_md",
+          "check_logs",
+          "verdicts"
+        ],
+        "title": "RecordedAttemptArtifacts",
+        "type": "object"
+      },
+      "RequirementItem": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_criteria": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Acceptance Criteria",
+            "type": "array"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "ears_criteria": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptanceCriterion"
+            },
+            "title": "Ears Criteria",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "source_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Ref"
+          }
+        },
+        "required": [
+          "id",
+          "description"
+        ],
+        "title": "RequirementItem",
+        "type": "object"
+      },
+      "ResumeCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "resume",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ResumeCommand",
+        "type": "object"
+      },
+      "RetryTaskCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "retry_task",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "hint": {
+            "default": "",
+            "title": "Hint",
+            "type": "string"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "task_id"
+        ],
+        "title": "RetryTaskCommand",
+        "type": "object"
+      },
+      "RetryWorkflowCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "retry_workflow",
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "auto_advance": {
+            "default": true,
+            "title": "Auto Advance",
+            "type": "boolean"
+          },
+          "expected_state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Revision"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "sync": {
+            "default": false,
+            "title": "Sync",
+            "type": "boolean"
+          },
+          "target_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Hash"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "RetryWorkflowCommand",
+        "type": "object"
+      },
+      "ReviewEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "change": {
+            "anyOf": [
+              {
+                "enum": [
+                  "changed",
+                  "added",
+                  "removed",
+                  "affected"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "enum": [
+                  "agent_high_impact",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          },
+          "related": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Related"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref",
+          "text"
+        ],
+        "title": "ReviewEntry",
+        "type": "object"
+      },
+      "ReviewFinding": {
+        "additionalProperties": false,
+        "properties": {
+          "file_path": {
+            "title": "File Path",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "line": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "message": {
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/ReviewSeverity"
+          },
+          "suggestion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggestion"
+          }
+        },
+        "required": [
+          "id",
+          "severity",
+          "file_path",
+          "message"
+        ],
+        "title": "ReviewFinding",
+        "type": "object"
+      },
+      "ReviewSection": {
+        "additionalProperties": false,
+        "properties": {
+          "empty_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Empty Text"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewEntry"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "entries"
+        ],
+        "title": "ReviewSection",
+        "type": "object"
+      },
+      "ReviewSeverity": {
+        "enum": [
+          "important",
+          "nit",
+          "pre_existing"
+        ],
+        "title": "ReviewSeverity",
+        "type": "string"
+      },
+      "ReviewVerdict": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "checked_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checked Commit"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewFinding"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "incremental_only": {
+            "default": false,
+            "title": "Incremental Only",
+            "type": "boolean"
+          },
+          "passed": {
+            "title": "Passed",
+            "type": "boolean"
+          },
+          "summary": {
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "verdict_id": {
+            "title": "Verdict Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "attempt",
+          "passed",
+          "summary"
+        ],
+        "title": "ReviewVerdict",
+        "type": "object"
+      },
+      "RunEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_seq": {
+            "minimum": 1.0,
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          },
+          "state_revision": {
+            "minimum": 0.0,
+            "title": "State Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_seq",
+          "run_id",
+          "stage",
+          "event_type",
+          "actor",
+          "state_revision"
+        ],
+        "title": "RunEvent",
+        "type": "object"
+      },
+      "RunListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "default_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Run Id"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "title": "Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "title": "RunListResponse",
+        "type": "object"
+      },
+      "RunProgressItem": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "detail_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Available"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To"
+          }
+        },
+        "required": [
+          "event_seq",
+          "created_at",
+          "event_type"
+        ],
+        "title": "RunProgressItem",
+        "type": "object"
+      },
+      "RunProjection": {
+        "additionalProperties": false,
+        "properties": {
+          "approval_reviews": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ApprovalReview"
+            },
+            "title": "Approval Reviews",
+            "type": "object"
+          },
+          "blueprint_completed": {
+            "title": "Blueprint Completed",
+            "type": "boolean"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/BudgetSummary"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "dag": {
+            "$ref": "#/components/schemas/DagView"
+          },
+          "delivery_acceptance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryAcceptance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "design": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DesignSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "design_approved": {
+            "title": "Design Approved",
+            "type": "boolean"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "hitl_banner": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HitlBanner"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_outputs": {
+            "items": {
+              "$ref": "#/components/schemas/KeyOutputItem"
+            },
+            "title": "Key Outputs",
+            "type": "array"
+          },
+          "latest_event_seq": {
+            "title": "Latest Event Seq",
+            "type": "integer"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "plan_approved": {
+            "title": "Plan Approved",
+            "type": "boolean"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/ProgressSummary"
+          },
+          "raw_input": {
+            "title": "Raw Input",
+            "type": "string"
+          },
+          "recent_progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunProgressItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "spec": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "spec_approved": {
+            "title": "Spec Approved",
+            "type": "boolean"
+          },
+          "stage_activity": {
+            "items": {
+              "$ref": "#/components/schemas/StageActivityItem"
+            },
+            "title": "Stage Activity",
+            "type": "array"
+          },
+          "stage_pipeline": {
+            "items": {
+              "$ref": "#/components/schemas/StagePipelineItem"
+            },
+            "title": "Stage Pipeline",
+            "type": "array"
+          },
+          "state_revision": {
+            "title": "State Revision",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "swimlanes": {
+            "items": {
+              "$ref": "#/components/schemas/SwimlaneRow"
+            },
+            "title": "Swimlanes",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "traceability_matrix": {
+            "items": {
+              "$ref": "#/components/schemas/TraceabilityMatrix"
+            },
+            "title": "Traceability Matrix",
+            "type": "array"
+          },
+          "triage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TriageView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "waterfall_turns": {
+            "items": {
+              "$ref": "#/components/schemas/WaterfallTurn"
+            },
+            "title": "Waterfall Turns",
+            "type": "array"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowView"
+          },
+          "workflow_name": {
+            "title": "Workflow Name",
+            "type": "string"
+          },
+          "workspace_root": {
+            "title": "Workspace Root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "title",
+          "raw_input",
+          "workspace_root",
+          "mode",
+          "status",
+          "state_revision",
+          "created_at",
+          "updated_at",
+          "workflow_name",
+          "workflow",
+          "blueprint_completed",
+          "stage_activity",
+          "key_outputs",
+          "spec_approved",
+          "design_approved",
+          "plan_approved",
+          "stage_pipeline",
+          "budget",
+          "progress",
+          "approval_reviews",
+          "dag",
+          "swimlanes",
+          "waterfall_turns",
+          "traceability_matrix",
+          "events",
+          "latest_event_seq"
+        ],
+        "title": "RunProjection",
+        "type": "object"
+      },
+      "RunProjectionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "projection": {
+            "$ref": "#/components/schemas/RunProjection"
+          }
+        },
+        "required": [
+          "projection"
+        ],
+        "title": "RunProjectionResponse",
+        "type": "object"
+      },
+      "RunSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "state_revision": {
+            "title": "State Revision",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workflow_name": {
+            "title": "Workflow Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "title",
+          "mode",
+          "status",
+          "state_revision",
+          "workflow_name",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunSummary",
+        "type": "object"
+      },
+      "SchemaField": {
+        "additionalProperties": false,
+        "description": "Typed parameter or payload field on a module interface seam.",
+        "properties": {
+          "constraints": {
+            "default": "",
+            "title": "Constraints",
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "required": {
+            "default": true,
+            "title": "Required",
+            "type": "boolean"
+          },
+          "type_expr": {
+            "minLength": 1,
+            "title": "Type Expr",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type_expr"
+        ],
+        "title": "SchemaField",
+        "type": "object"
+      },
+      "SeedDemoResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "default_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Run Id"
+          },
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "title": "Runs",
+            "type": "array"
+          },
+          "seeded": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Seeded",
+            "type": "array"
+          }
+        },
+        "required": [
+          "seeded",
+          "runs"
+        ],
+        "title": "SeedDemoResponse",
+        "type": "object"
+      },
+      "SpecStatus": {
+        "enum": [
+          "draft",
+          "awaiting_human",
+          "confirmed",
+          "superseded"
+        ],
+        "title": "SpecStatus",
+        "type": "string"
+      },
+      "StageActivityItem": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "event_seq": {
+            "title": "Event Seq",
+            "type": "integer"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_seq",
+          "stage",
+          "event_type",
+          "actor",
+          "summary"
+        ],
+        "title": "StageActivityItem",
+        "type": "object"
+      },
+      "StagePipelineItem": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status"
+        ],
+        "title": "StagePipelineItem",
+        "type": "object"
+      },
+      "SubagentStep": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "target",
+          "status",
+          "duration_ms"
+        ],
+        "title": "SubagentStep",
+        "type": "object"
+      },
+      "SwimlaneItem": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "attempts": {
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status",
+          "attempts",
+          "summary",
+          "actor"
+        ],
+        "title": "SwimlaneItem",
+        "type": "object"
+      },
+      "SwimlaneRow": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SwimlaneItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "actor",
+          "items"
+        ],
+        "title": "SwimlaneRow",
+        "type": "object"
+      },
+      "TaskArtifacts": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Dir"
+          },
+          "check_logs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Check Logs",
+            "type": "object"
+          },
+          "diff_patch": {
+            "title": "Diff Patch",
+            "type": "string"
+          },
+          "manifest_md": {
+            "title": "Manifest Md",
+            "type": "string"
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallItem"
+            },
+            "title": "Tool Calls",
+            "type": "array"
+          },
+          "verdicts": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewVerdict"
+            },
+            "title": "Verdicts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "diff_patch",
+          "check_logs",
+          "verdicts",
+          "tool_calls",
+          "manifest_md"
+        ],
+        "title": "TaskArtifacts",
+        "type": "object"
+      },
+      "TaskBlocker": {
+        "additionalProperties": false,
+        "properties": {
+          "actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "affected_task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Affected Task Ids",
+            "type": "array"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "headline",
+          "detail",
+          "affected_task_ids",
+          "actions"
+        ],
+        "title": "TaskBlocker",
+        "type": "object"
+      },
+      "TaskKind": {
+        "enum": [
+          "contract",
+          "implement",
+          "test",
+          "integrate"
+        ],
+        "title": "TaskKind",
+        "type": "string"
+      },
+      "TaskNode": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_checks": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptanceCheck"
+            },
+            "minItems": 1,
+            "title": "Acceptance Checks",
+            "type": "array"
+          },
+          "accepted_risk_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Risk Reason"
+          },
+          "attempt": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
+          "deliverables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Deliverables",
+            "type": "array"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "design_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Design Refs",
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind",
+            "default": "implement"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "lease_generation": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
+          "max_cycles": {
+            "default": 3,
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Max Cycles",
+            "type": "integer"
+          },
+          "objective": {
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "read_scope": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Read Scope",
+            "type": "array"
+          },
+          "requirement_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirement Refs",
+            "type": "array"
+          },
+          "review_cycle": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Review Cycle",
+            "type": "integer"
+          },
+          "role": {
+            "default": "engineer",
+            "title": "Role",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "default": "waiting"
+          },
+          "task_id": {
+            "minLength": 1,
+            "title": "Task Id",
+            "type": "string"
+          },
+          "title": {
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "worktree_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worktree Path"
+          },
+          "write_scope": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Write Scope",
+            "type": "array"
+          }
+        },
+        "required": [
+          "task_id",
+          "title",
+          "objective",
+          "write_scope",
+          "acceptance_checks"
+        ],
+        "title": "TaskNode",
+        "type": "object"
+      },
+      "TaskPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "content_hash": {
+            "default": "",
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "delivery_checks": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryCheck"
+            },
+            "title": "Delivery Checks",
+            "type": "array"
+          },
+          "design_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Design Hash"
+          },
+          "design_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Design Id"
+          },
+          "plan_id": {
+            "title": "Plan Id",
+            "type": "string"
+          },
+          "spec_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Hash"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/TaskNode"
+            },
+            "minItems": 1,
+            "title": "Tasks",
+            "type": "array"
+          },
+          "version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tasks"
+        ],
+        "title": "TaskPlan",
+        "type": "object"
+      },
+      "TaskStatus": {
+        "enum": [
+          "waiting",
+          "ready",
+          "running",
+          "verifying",
+          "accepted",
+          "failed",
+          "blocked",
+          "cancelled",
+          "stale"
+        ],
+        "title": "TaskStatus",
+        "type": "string"
+      },
+      "ToolCallItem": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "is_error": {
+            "title": "Is Error",
+            "type": "boolean"
+          },
+          "output_preview": {
+            "title": "Output Preview",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "step": {
+            "title": "Step",
+            "type": "integer"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "tool",
+          "target",
+          "status",
+          "is_error",
+          "duration_ms",
+          "output_preview"
+        ],
+        "title": "ToolCallItem",
+        "type": "object"
+      },
+      "TraceabilityMatrix": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_criteria": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Acceptance Criteria",
+            "type": "array"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "design_module_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Design Module Ids",
+            "type": "array"
+          },
+          "design_modules": {
+            "items": {
+              "$ref": "#/components/schemas/DesignModuleRef"
+            },
+            "title": "Design Modules",
+            "type": "array"
+          },
+          "evidence_note": {
+            "title": "Evidence Note",
+            "type": "string"
+          },
+          "requirement_id": {
+            "title": "Requirement Id",
+            "type": "string"
+          },
+          "source_ref": {
+            "title": "Source Ref",
+            "type": "string"
+          },
+          "task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Task Ids",
+            "type": "array"
+          },
+          "verification_label": {
+            "title": "Verification Label",
+            "type": "string"
+          },
+          "verification_status": {
+            "title": "Verification Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "description",
+          "source_ref",
+          "acceptance_criteria",
+          "design_module_ids",
+          "design_modules",
+          "task_ids",
+          "verification_status",
+          "verification_label",
+          "evidence_note"
+        ],
+        "title": "TraceabilityMatrix",
+        "type": "object"
+      },
+      "TraversedEdge": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "TraversedEdge",
+        "type": "object"
+      },
+      "TriageView": {
+        "additionalProperties": false,
+        "properties": {
+          "has_design": {
+            "default": false,
+            "title": "Has Design",
+            "type": "boolean"
+          },
+          "has_goal": {
+            "default": false,
+            "title": "Has Goal",
+            "type": "boolean"
+          },
+          "maturity": {
+            "title": "Maturity",
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          }
+        },
+        "required": [
+          "maturity",
+          "reasons"
+        ],
+        "title": "TriageView",
+        "type": "object"
+      },
+      "TurnReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "artifacts": {
+            "$ref": "#/components/schemas/ReceiptArtifacts"
+          },
+          "llm": {
+            "$ref": "#/components/schemas/ReceiptLLM"
+          },
+          "one_line": {
+            "title": "One Line",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/ReceiptTool"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "turn_id",
+          "actor",
+          "llm",
+          "tools",
+          "artifacts",
+          "one_line"
+        ],
+        "title": "TurnReceipt",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WaterfallTurn": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "duration_ms": {
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "manifest_md": {
+            "title": "Manifest Md",
+            "type": "string"
+          },
+          "offset_pct": {
+            "title": "Offset Pct",
+            "type": "number"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/TurnReceipt"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "steps": {
+            "title": "Steps",
+            "type": "integer"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          },
+          "width_pct": {
+            "title": "Width Pct",
+            "type": "number"
+          }
+        },
+        "required": [
+          "turn_id",
+          "actor",
+          "title",
+          "status",
+          "summary",
+          "duration_ms",
+          "steps",
+          "offset_pct",
+          "width_pct",
+          "receipt",
+          "manifest_md"
+        ],
+        "title": "WaterfallTurn",
+        "type": "object"
+      },
+      "WorkflowGraph": {
+        "additionalProperties": false,
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowGraphEdge"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowGraphNode"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "routers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Routers",
+            "type": "array"
+          },
+          "start": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Start",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "start",
+          "nodes",
+          "edges",
+          "routers"
+        ],
+        "title": "WorkflowGraph",
+        "type": "object"
+      },
+      "WorkflowGraphEdge": {
+        "additionalProperties": false,
+        "properties": {
+          "conditional": {
+            "title": "Conditional",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "conditional"
+        ],
+        "title": "WorkflowGraphEdge",
+        "type": "object"
+      },
+      "WorkflowGraphNode": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_visits": {
+            "title": "Max Visits",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "on_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "On Error"
+          },
+          "routed": {
+            "title": "Routed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "max_visits",
+          "routed"
+        ],
+        "title": "WorkflowGraphNode",
+        "type": "object"
+      },
+      "WorkflowNodeStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "WorkflowNodeStatus",
+        "type": "object"
+      },
+      "WorkflowPause": {
+        "additionalProperties": false,
+        "properties": {
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "WorkflowPause",
+        "type": "object"
+      },
+      "WorkflowRunResult": {
+        "additionalProperties": false,
+        "properties": {
+          "coalesced": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coalesced"
+          },
+          "deduplicated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deduplicated"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PauseInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "state_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Revision"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "stop_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop After"
+          },
+          "topology": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topology"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow"
+          }
+        },
+        "title": "WorkflowRunResult",
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "gates": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Gates",
+            "type": "object"
+          },
+          "graph": {
+            "$ref": "#/components/schemas/WorkflowGraph"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "stop_after": {
+            "title": "Stop After",
+            "type": "string"
+          },
+          "topology": {
+            "title": "Topology",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "stop_after",
+          "topology",
+          "gates",
+          "graph"
+        ],
+        "title": "WorkflowSummary",
+        "type": "object"
+      },
+      "WorkflowView": {
+        "additionalProperties": false,
+        "properties": {
+          "current_node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Node"
+          },
+          "failed_node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Node"
+          },
+          "finished": {
+            "title": "Finished",
+            "type": "boolean"
+          },
+          "graph": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowGraph"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "node_statuses": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Node Statuses",
+            "type": "object"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowNodeStatus"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowPause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stop_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop After"
+          },
+          "topology": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topology"
+          },
+          "traversed_edges": {
+            "items": {
+              "$ref": "#/components/schemas/TraversedEdge"
+            },
+            "title": "Traversed Edges",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "nodes",
+          "node_statuses",
+          "traversed_edges",
+          "finished"
+        ],
+        "title": "WorkflowView",
+        "type": "object"
+      },
+      "WorkflowsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "const": true,
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Workflows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "workflows"
+        ],
+        "title": "WorkflowsResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Olympus4SWE Ariadne API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/demos": {
+      "get": {
+        "operationId": "list_demos_api_demos_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemosResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "List Demos"
+      }
+    },
+    "/api/providers": {
+      "get": {
+        "operationId": "list_providers_api_providers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvidersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "List Providers"
+      }
+    },
+    "/api/runs": {
+      "get": {
+        "operationId": "list_runs_api_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs"
+      },
+      "post": {
+        "operationId": "create_run_api_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Run"
+      }
+    },
+    "/api/runs/{run_id}": {
+      "get": {
+        "operationId": "get_run_api_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run"
+      }
+    },
+    "/api/runs/{run_id}/command": {
+      "post": {
+        "operationId": "run_command_api_runs__run_id__command_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "accept_risk": "#/components/schemas/AcceptRiskCommand",
+                    "approve_design": "#/components/schemas/ApproveDesignCommand",
+                    "approve_plan": "#/components/schemas/ApprovePlanCommand",
+                    "approve_spec": "#/components/schemas/ApproveSpecCommand",
+                    "clarify": "#/components/schemas/ClarifyCommand",
+                    "pause": "#/components/schemas/PauseCommand",
+                    "promote_to_execute": "#/components/schemas/PromoteToExecuteCommand",
+                    "reassign_human": "#/components/schemas/ReassignHumanCommand",
+                    "resume": "#/components/schemas/ResumeCommand",
+                    "retry_task": "#/components/schemas/RetryTaskCommand",
+                    "retry_workflow": "#/components/schemas/RetryWorkflowCommand"
+                  },
+                  "propertyName": "action"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PauseCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ResumeCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApproveSpecCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApproveDesignCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApprovePlanCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ClarifyCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RetryTaskCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AcceptRiskCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReassignHumanCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RetryWorkflowCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PromoteToExecuteCommand"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Command"
+      }
+    },
+    "/api/runs/{run_id}/delivery-log/{event_seq}/{position}": {
+      "get": {
+        "operationId": "get_delivery_log_api_runs__run_id__delivery_log__event_seq___position__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "event_seq",
+            "required": true,
+            "schema": {
+              "title": "Event Seq",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "position",
+            "required": true,
+            "schema": {
+              "title": "Position",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Delivery Log"
+      }
+    },
+    "/api/runs/{run_id}/events": {
+      "get": {
+        "operationId": "get_run_events_api_runs__run_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_seq",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "After Seq",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run Events"
+      }
+    },
+    "/api/runs/{run_id}/stream": {
+      "get": {
+        "operationId": "stream_run_api_runs__run_id__stream_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_seq",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "After Seq",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "once",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Once",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stream Run"
+      }
+    },
+    "/api/runs/{run_id}/task-artifacts/{task_id}/{attempt}": {
+      "get": {
+        "operationId": "get_task_artifacts_api_runs__run_id__task_artifacts__task_id___attempt__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "attempt",
+            "required": true,
+            "schema": {
+              "title": "Attempt",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttemptArtifactsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task Artifacts"
+      }
+    },
+    "/api/seed-demo": {
+      "post": {
+        "operationId": "seed_demo_api_seed_demo_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeedDemoResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          }
+        },
+        "summary": "Seed Demo"
+      }
+    },
+    "/api/workflows": {
+      "get": {
+        "operationId": "list_workflows_api_workflows_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          }
+        },
+        "summary": "List Workflows"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz"
+      }
+    }
+  }
+}

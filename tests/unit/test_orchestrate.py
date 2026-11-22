@@ -14,8 +14,8 @@ from threading import Event, Thread
 from threading import enumerate as enumerate_threads
 from typing import Any
 
-import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from olympus.core.contracts import (
     ApprovalDecision,
@@ -51,7 +51,7 @@ from olympus.providers.base import (
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
 from olympus.web.projection import build_run_projection
-from olympus.web.server import AriadneApp, create_http_server
+from olympus.web.server import AriadneApp, create_fastapi_app
 
 Responder = Callable[[Sequence[ChatMessage], Sequence[ToolSpec]], LLMResponse]
 
@@ -1487,25 +1487,20 @@ def test_live_worker_milestones_reach_ariadne_before_receipt(tmp_path: Path) -> 
             worker_trace = Path(node["artifacts"]["attempt_dir"]) / "worker.jsonl"
             assert '"event": "text_delta"' in worker_trace.read_text(encoding="utf-8")
 
-            httpd = create_http_server(app, host="127.0.0.1", port=0)
-            thread = Thread(target=httpd.serve_forever, daemon=True)
-            thread.start()
-            try:
-                response = httpx.get(
-                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+            with TestClient(create_fastapi_app(app)) as client:
+                response = client.get(
+                    f"/api/runs/{run_id}/stream"
                     f"?once=1&after_seq={milestones[0]['event_seq']}",
-                    timeout=3,
                 )
                 assert response.status_code == 200
                 sse = json.loads(response.text.split("data: ", 1)[1])
                 assert [e for e in sse["events"] if e["event_type"].startswith("agent.")] == (
                     milestones[1:]
                 )
-                with httpx.stream(
+                with client.stream(
                     "GET",
-                    f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/{run_id}/stream"
+                    f"/api/runs/{run_id}/stream"
                     f"?after_seq={milestones[-1]['event_seq']}",
-                    timeout=3,
                 ) as stream:
                     lines = stream.iter_lines()
                     for line in lines:
@@ -1515,10 +1510,6 @@ def test_live_worker_milestones_reach_ariadne_before_receipt(tmp_path: Path) -> 
                     else:
                         raise AssertionError("Expected an activity-only SSE event")
                 assert activity["previews"]["T1"] == {"attempt": 1, "preview": "writing feature.py"}
-            finally:
-                httpd.shutdown()
-                thread.join()
-                httpd.server_close()
         finally:
             release_tool.set()
             release_turn.set()

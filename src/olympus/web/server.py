@@ -1,16 +1,21 @@
-"""Lightweight stdlib HTTP + SSE server for the Ariadne Web Console (Milestone 4)."""
+"""FastAPI + uvicorn backend for the Ariadne Web Console (Milestone 4)."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import threading
-import time
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import olympus.web.acceptance as delivery_review
 from olympus.core.contracts import new_id
@@ -19,6 +24,24 @@ from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.loader import load_workflow
 from olympus.web.demos import list_benchmark_presets, materialize_benchmark_demo, seed_demo_runs
 from olympus.web.projection import build_run_projection, read_recorded_attempt
+from olympus.web.schemas import (
+    AttemptArtifactsResponse,
+    CommandRequest,
+    CommandResponse,
+    ConflictResponse,
+    CreateRunRequest,
+    CreateRunResponse,
+    DemosResponse,
+    ErrorResponse,
+    EventsResponse,
+    HealthResponse,
+    ProvidersResponse,
+    RunListResponse,
+    RunProjection,
+    RunProjectionResponse,
+    SeedDemoResponse,
+    WorkflowsResponse,
+)
 from olympus.web.supervisor import RunSupervisor
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -78,13 +101,18 @@ class AriadneApp:
     def _workspace_for(self, run_id: str) -> Path:
         return self.supervisor.resolve_workspace(run_id)
 
-    def get_run_payload(self, run_id: str) -> dict[str, Any]:
+    def _projection_payload(self, run_id: str) -> dict[str, Any]:
+        """Build and validate one projection before it crosses the HTTP seam."""
         proj = build_run_projection(
             self.store,
             self._workspace_for(run_id),
             run_id,
             artifacts_root=self.artifacts_root,
         )
+        return RunProjection.model_validate(proj).model_dump(mode="json")
+
+    def get_run_payload(self, run_id: str) -> dict[str, Any]:
+        proj = self._projection_payload(run_id)
         if proj["status"] == "running":
             previews = self.supervisor.live_activity.snapshot(run_id)
             for task in proj["dag"]["nodes"]:
@@ -122,7 +150,6 @@ class AriadneApp:
         operation_id = str(body.get("operation_id") or new_id("op"))
         actor = str(body.get("actor") or "zeus")
         snap = self.store.get_run(run_id)
-        ws = self._workspace_for(run_id)
         expected_rev_raw = body.get("expected_state_revision")
         expected_rev = (
             int(expected_rev_raw) if expected_rev_raw is not None else int(snap["state_revision"])
@@ -332,12 +359,7 @@ class AriadneApp:
                 "workflow": self.supervisor.resume_run(run_id, sync=sync_flag),
             }
 
-        projection = build_run_projection(
-            self.store,
-            ws,
-            run_id,
-            artifacts_root=self.artifacts_root,
-        )
+        projection = self._projection_payload(run_id)
         return {
             "ok": True,
             "command_result": cmd_result,
@@ -345,361 +367,378 @@ class AriadneApp:
         }
 
 
-def create_http_server(
-    app: AriadneApp,
-    *,
-    host: str = "127.0.0.1",
-    port: int = 8765,
-) -> ThreadingHTTPServer:
-    """Create a ThreadingHTTPServer bound to (host, port) serving the Ariadne console."""
+class _NoStoreJSONResponse(JSONResponse):
+    """JSON response that never allows a browser or proxy to cache API state."""
 
-    class AriadneRequestHandler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+    def __init__(
+        self,
+        content: Any,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+        background: Any = None,
+    ) -> None:
+        merged = dict(headers or {})
+        merged.setdefault("Cache-Control", "no-store")
+        super().__init__(
+            content=content,
+            status_code=status_code,
+            headers=merged,
+            media_type=media_type,
+            background=background,
+        )
 
-        def log_message(self, format: str, *args: Any) -> None:
-            return
 
-        def _send_json(self, status: int, payload: dict[str, Any]) -> None:
-            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(raw)
+def _error_response(status_code: int, message: str) -> _NoStoreJSONResponse:
+    return _NoStoreJSONResponse(
+        status_code=status_code,
+        content=ErrorResponse(error=message).model_dump(mode="json"),
+    )
 
-        def _send_bytes(self, content_type: str, body: bytes) -> None:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
 
-        def _send_html(self, html_bytes: bytes) -> None:
-            self._send_bytes("text/html; charset=utf-8", html_bytes)
+def _validation_summary(exc: RequestValidationError) -> str:
+    errors = exc.errors()
+    if not errors:
+        return "Invalid request payload"
+    first = errors[0]
+    location = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
+    message = str(first.get("msg") or "Invalid request payload")
+    return f"Invalid request: {location}: {message}" if location else f"Invalid request: {message}"
 
-        def _serve_static(self, relpath: str) -> None:
-            """Serve one whitelisted asset from static/, refusing any escape of the root."""
-            root = _STATIC_DIR.resolve()
-            requested = unquote(relpath)
-            try:
-                candidate: Path | None = (root / requested).resolve()
-            except (OSError, ValueError):
-                candidate = None
+
+def _sse_frame(event_name: str, data: dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _serve_static(relpath: str) -> Response:
+    """Serve one whitelisted asset from static/, refusing any escape of the root."""
+    root = _STATIC_DIR.resolve()
+    try:
+        candidate: Path | None = (root / relpath).resolve()
+    except (OSError, ValueError):
+        candidate = None
+    if candidate is None or not candidate.is_relative_to(root) or not candidate.is_file():
+        raise NotFoundError(f"Unknown static asset: {relpath}")
+    content_type = _STATIC_MIME_TYPES.get(candidate.suffix.lower())
+    if content_type is None:
+        raise NotFoundError(f"Unsupported static type: {candidate.suffix}")
+    return Response(
+        content=candidate.read_bytes(),
+        headers={"Content-Type": content_type, "Cache-Control": "no-store"},
+    )
+
+
+def _index_response() -> Response:
+    index_file = _STATIC_DIR / "index.html"
+    if not index_file.exists():
+        raise NotFoundError("Console static/index.html not found")
+    return Response(
+        content=index_file.read_bytes(),
+        headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+    )
+
+
+def create_fastapi_app(app: AriadneApp) -> FastAPI:
+    """Create the ASGI application serving the Ariadne console over one service layer."""
+    service = app
+    api = FastAPI(
+        title="Olympus4SWE Ariadne API",
+        version="0.1.0",
+        default_response_class=_NoStoreJSONResponse,
+        redirect_slashes=False,
+    )
+
+    @api.exception_handler(RequestValidationError)
+    async def _handle_request_validation(
+        request: Request, exc: RequestValidationError
+    ) -> _NoStoreJSONResponse:
+        return _error_response(400, _validation_summary(exc))
+
+    @api.exception_handler(ValidationError)
+    async def _handle_validation_error(
+        request: Request, exc: ValidationError
+    ) -> _NoStoreJSONResponse:
+        # Internal projection/contract violations are server bugs, not client errors.
+        return _error_response(500, str(exc))
+
+    @api.exception_handler(NotFoundError)
+    async def _handle_not_found(request: Request, exc: NotFoundError) -> _NoStoreJSONResponse:
+        return _error_response(404, str(exc))
+
+    @api.exception_handler(FileNotFoundError)
+    async def _handle_file_not_found(
+        request: Request, exc: FileNotFoundError
+    ) -> _NoStoreJSONResponse:
+        return _error_response(400, str(exc))
+
+    @api.exception_handler(ConcurrencyConflictError)
+    async def _handle_conflict(
+        request: Request, exc: ConcurrencyConflictError
+    ) -> _NoStoreJSONResponse:
+        projection: dict[str, Any] | None = None
+        parts = [part for part in request.url.path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "runs":
+            with contextlib.suppress(Exception):
+                projection = service.get_run_payload(parts[2])["projection"]
+        payload = ConflictResponse(
+            error=str(exc),
+            projection=(
+                RunProjection.model_validate(projection) if projection is not None else None
+            ),
+        )
+        return _NoStoreJSONResponse(
+            status_code=409,
+            content=payload.model_dump(mode="json"),
+        )
+
+    @api.exception_handler(ValueError)
+    async def _handle_value_error(request: Request, exc: ValueError) -> _NoStoreJSONResponse:
+        return _error_response(400, str(exc))
+
+    @api.exception_handler(Exception)
+    async def _handle_unexpected(request: Request, exc: Exception) -> _NoStoreJSONResponse:
+        return _error_response(500, str(exc))
+
+    @api.exception_handler(StarletteHTTPException)
+    async def _handle_http_exception(
+        request: Request, exc: StarletteHTTPException
+    ) -> _NoStoreJSONResponse:
+        message = (
+            f"Unknown route: {request.url.path}"
+            if exc.status_code == 404
+            else str(exc.detail)
+        )
+        return _error_response(exc.status_code, message)
+
+    error_responses: dict[int | str, dict[str, Any]] = {400: {"model": ErrorResponse}}
+    read_responses: dict[int | str, dict[str, Any]] = {
+        **error_responses,
+        404: {"model": ErrorResponse},
+    }
+    write_responses: dict[int | str, dict[str, Any]] = {
+        **read_responses,
+        409: {"model": ConflictResponse},
+    }
+
+    @api.get("/healthz", response_model=HealthResponse)
+    def healthz() -> dict[str, Any]:
+        return {"ok": True, "service": "olympus-ariadne", "version": "0.1.0"}
+
+    @api.get("/api/runs", response_model=RunListResponse, responses=error_responses)
+    def list_runs(limit: int = 50) -> dict[str, Any]:
+        return service.list_runs_payload(limit=limit)
+
+    @api.get("/api/providers", response_model=ProvidersResponse, responses=error_responses)
+    def list_providers() -> dict[str, Any]:
+        return {"ok": True, "providers": service.supervisor.list_providers_status()}
+
+    @api.get("/api/workflows", response_model=WorkflowsResponse, responses=error_responses)
+    def list_workflows() -> dict[str, Any]:
+        return {"ok": True, "workflows": service.supervisor.list_workflows()}
+
+    @api.get("/api/demos", response_model=DemosResponse, responses=error_responses)
+    def list_demos() -> dict[str, Any]:
+        return {"ok": True, "demos": list_benchmark_presets()}
+
+    @api.get(
+        "/api/runs/{run_id}",
+        response_model=RunProjectionResponse,
+        responses=read_responses,
+    )
+    def get_run(run_id: str) -> dict[str, Any]:
+        return service.get_run_payload(run_id)
+
+    @api.get(
+        "/api/runs/{run_id}/events",
+        response_model=EventsResponse,
+        responses=read_responses,
+    )
+    def get_run_events(run_id: str, after_seq: int = 0) -> dict[str, Any]:
+        return service.get_events_payload(run_id, after_seq=after_seq)
+
+    @api.get(
+        "/api/runs/{run_id}/task-artifacts/{task_id}/{attempt}",
+        response_model=AttemptArtifactsResponse,
+        responses=read_responses,
+    )
+    def get_task_artifacts(run_id: str, task_id: str, attempt: int) -> dict[str, Any]:
+        return service.get_attempt_payload(run_id, task_id, attempt)
+
+    @api.get("/api/runs/{run_id}/delivery-log/{event_seq}/{position}", responses=read_responses)
+    def get_delivery_log(run_id: str, event_seq: str, position: str) -> Response:
+        projection = service.get_run_payload(run_id)["projection"]
+        review = projection["delivery_acceptance"] or {}
+        for row in review.get("criteria", []):
+            evidence = row["evidence"]
             if (
-                candidate is None
-                or not candidate.is_relative_to(root)
-                or not candidate.is_file()
+                evidence
+                and str(evidence["event_seq"]) == event_seq
+                and str(evidence["check_position"]) == position
             ):
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"ok": False, "error": f"Unknown static asset: {requested}"},
-                )
-                return
-            content_type = _STATIC_MIME_TYPES.get(candidate.suffix.lower())
-            if content_type is None:
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"ok": False, "error": f"Unsupported static type: {candidate.suffix}"},
-                )
-                return
-            self._send_bytes(content_type, candidate.read_bytes())
-
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            path = parsed.path.rstrip("/") or "/"
-            qs = parse_qs(parsed.query)
-
-            try:
-                if path.startswith("/static/"):
-                    self._serve_static(path[len("/static/") :])
-                    return
-
-                if path in ("/", "/index.html"):
-                    index_file = _STATIC_DIR / "index.html"
-                    if not index_file.exists():
-                        self._send_json(
-                            HTTPStatus.NOT_FOUND,
-                            {"ok": False, "error": "Console static/index.html not found"},
-                        )
-                        return
-                    self._send_html(index_file.read_bytes())
-                    return
-
-                if path == "/favicon.ico":
-                    self._send_bytes("image/x-icon", b"")
-                    return
-
-                if path == "/healthz":
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "service": "olympus-ariadne", "version": "0.1.0"},
-                    )
-                    return
-
-                if path == "/api/runs":
-                    limit = int(qs.get("limit", ["50"])[0])
-                    self._send_json(HTTPStatus.OK, app.list_runs_payload(limit=limit))
-                    return
-
-                if path == "/api/providers":
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "providers": app.supervisor.list_providers_status()},
-                    )
-                    return
-
-                if path == "/api/workflows":
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "workflows": app.supervisor.list_workflows()},
-                    )
-                    return
-
-                if path == "/api/demos":
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "demos": list_benchmark_presets()},
-                    )
-                    return
-
-                if path.startswith("/api/runs/"):
-                    parts = [p for p in path.split("/") if p]
-                    # parts: ['api', 'runs', '<run_id>', ...]
-                    if len(parts) == 3:
-                        run_id = parts[2]
-                        self._send_json(HTTPStatus.OK, app.get_run_payload(run_id))
-                        return
-                    if len(parts) == 4 and parts[3] == "events":
-                        run_id = parts[2]
-                        after_seq = int(qs.get("after_seq", ["0"])[0])
-                        self._send_json(
-                            HTTPStatus.OK,
-                            app.get_events_payload(run_id, after_seq=after_seq),
-                        )
-                        return
-                    if len(parts) == 6 and parts[3] == "delivery-log":
-                        run_id, event_seq, position = parts[2], parts[4], parts[5]
-                        projection = app.get_run_payload(run_id)["projection"]
-                        review = projection["delivery_acceptance"] or {}
-                        for row in review.get("criteria", []):
-                            evidence = row["evidence"]
-                            if (
-                                evidence
-                                and str(evidence["event_seq"]) == event_seq
-                                and str(evidence["check_position"]) == position
-                            ):
-                                log = delivery_review.read_delivery_log(
-                                    app.artifacts_root / run_id, evidence
-                                )
-                                if log is not None:
-                                    self._send_bytes("text/plain; charset=utf-8", log)
-                                    return
-                        raise NotFoundError("No matching current delivery evidence")
-                    if len(parts) == 4 and parts[3] == "stream":
-                        run_id = parts[2]
-                        after_seq = int(qs.get("after_seq", ["0"])[0])
-                        once = qs.get("once", ["0"])[0] == "1"
-                        self._handle_sse(run_id, after_seq=after_seq, once=once)
-                        return
-                    if len(parts) == 6 and parts[3] == "task-artifacts" and parts[5].isdigit():
-                        self._send_json(
-                            HTTPStatus.OK,
-                            app.get_attempt_payload(parts[2], unquote(parts[4]), int(parts[5])),
-                        )
-                        return
-
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"ok": False, "error": f"Unknown route: {path}"},
-                )
-            except NotFoundError as exc:
-                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"ok": False, "error": str(exc)},
-                )
-
-        def _handle_sse(self, run_id: str, *, after_seq: int = 0, once: bool = False) -> None:
-            # Validate run exists before starting stream
-            payload = app.get_events_payload(run_id, after_seq=after_seq)
-            self.close_connection = True
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-
-            def _write_sse(event_name: str, data: dict[str, Any]) -> None:
-                chunk = f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
-
-            try:
-                _write_sse("state", payload)
-                if once:
-                    return
-
-                last_rev = int(payload["state_revision"])
-                events = payload["events"]
-                cur_seq = int(events[-1]["event_seq"]) if events else after_seq
-                last_previews: dict[str, dict[str, Any]] = {}
-                ticks = 0
-                while True:
-                    time.sleep(0.5)
-                    ticks += 1
-                    nxt = app.get_events_payload(run_id, after_seq=cur_seq)
-                    if int(nxt["state_revision"]) != last_rev or nxt["events"]:
-                        last_rev = int(nxt["state_revision"])
-                        if nxt["events"]:
-                            cur_seq = int(nxt["events"][-1]["event_seq"])
-                        _write_sse("state", nxt)
-                    elif ticks % 10 == 0:
-                        self.wfile.write(b": heartbeat\n\n")
-                        self.wfile.flush()
-                    previews = (
-                        app.supervisor.live_activity.snapshot(run_id)
-                        if nxt["status"] == "running" else {}
-                    )
-                    if previews != last_previews:
-                        _write_sse("activity", {"run_id": run_id, "previews": previews})
-                        last_previews = previews
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                return
-            finally:
-                self.close_connection = True
-
-        def do_POST(self) -> None:
-            parsed = urlparse(self.path)
-            path = parsed.path.rstrip("/")
-            try:
-                content_len = int(self.headers.get("Content-Length", "0"))
-                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
-                body = json.loads(raw_body.decode("utf-8") or "{}")
-
-                if path == "/api/seed-demo":
-                    seeded = seed_demo_runs(
-                        app.store,
-                        app.workspace_root,
-                        artifacts_root=app.artifacts_root,
-                    )
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {
-                            "ok": True,
-                            "seeded": seeded,
-                            **app.list_runs_payload(),
+                log = delivery_review.read_delivery_log(service.artifacts_root / run_id, evidence)
+                if log is not None:
+                    return Response(
+                        content=log,
+                        headers={
+                            "Content-Type": "text/plain; charset=utf-8",
+                            "Cache-Control": "no-store",
                         },
                     )
-                    return
+        raise NotFoundError("No matching current delivery evidence")
 
-                parts = [p for p in path.split("/") if p]
-                if len(parts) == 2 and parts[0] == "api" and parts[1] == "runs":
-                    demo_id = str(body.get("demo_id") or "").strip()
-                    preset: dict[str, Any] | None = None
-                    resolved_ws: Path | str | None = body.get("workspace_root")
-                    if demo_id:
-                        preset, demo_ws = materialize_benchmark_demo(
-                            demo_id,
-                            workspace_parent=app.workspace_root / ".olympus" / "workspaces",
-                        )
-                        if not resolved_ws:
-                            resolved_ws = demo_ws
-                    elif resolved_ws:
-                        ws_candidate = Path(str(resolved_ws)).resolve()
-                        if not ws_candidate.is_dir():
-                            raise FileNotFoundError(
-                                f"workspace_root not found: {resolved_ws}"
-                            )
-                        resolved_ws = ws_candidate
+    @api.post(
+        "/api/runs",
+        response_model=CreateRunResponse,
+        responses=write_responses,
+    )
+    def create_run(payload: CreateRunRequest) -> dict[str, Any]:
+        demo_id = (payload.demo_id or "").strip()
+        preset: dict[str, Any] | None = None
+        resolved_ws: Path | str | None = payload.workspace_root
+        if demo_id:
+            preset, demo_ws = materialize_benchmark_demo(
+                demo_id,
+                workspace_parent=service.workspace_root / ".olympus" / "workspaces",
+            )
+            if not resolved_ws:
+                resolved_ws = demo_ws
+        elif resolved_ws:
+            ws_candidate = Path(str(resolved_ws)).resolve()
+            if not ws_candidate.is_dir():
+                raise FileNotFoundError(f"workspace_root not found: {resolved_ws}")
+            resolved_ws = ws_candidate
 
-                    default_goal = str(preset["raw_input"]) if preset else ""
-                    raw_input = str(
-                        body.get("raw_input") or body.get("goal") or default_goal
-                    ).strip()
-                    if not raw_input:
-                        self._send_json(
-                            HTTPStatus.BAD_REQUEST,
-                            {
-                                "ok": False,
-                                "error": "POST /api/runs requires a non-empty 'raw_input'",
-                            },
-                        )
-                        return
-                    raw_constraints = body.get("constraints")
-                    if isinstance(raw_constraints, list):
-                        constraints = [
-                            str(item).strip()
-                            for item in raw_constraints
-                            if str(item).strip()
-                        ]
-                    elif preset:
-                        constraints = list(preset.get("constraints") or [])
-                    else:
-                        constraints = []
-                    default_title = str(preset["title"]) if preset else raw_input[:60]
-                    default_workflow = (
-                        str(preset["default_workflow"]) if preset else "product_blueprint"
-                    )
-                    started = app.supervisor.start_run(
-                        title=str(body.get("title") or default_title),
-                        raw_input=raw_input,
-                        workflow_name=str(body.get("workflow_name") or default_workflow),
-                        provider_config=dict(body.get("provider_config") or {}),
-                        worker_driver=body.get("worker_driver"),
-                        reviewer_driver=body.get("reviewer_driver"),
-                        monitor_model=body.get("monitor_model"),
-                        auto_approve=bool(body.get("auto_approve", False)),
-                        sync=bool(body.get("sync", False)),
-                        constraints=constraints,
-                        workspace_root=resolved_ws,
-                    )
-                    self._send_json(HTTPStatus.OK, {"ok": True, **started})
-                    return
+        default_goal = str(preset["raw_input"]) if preset else ""
+        raw_input = str(payload.raw_input or payload.goal or default_goal).strip()
+        if not raw_input:
+            raise ValueError("POST /api/runs requires a non-empty 'raw_input'")
+        if payload.constraints is not None:
+            constraints = [item.strip() for item in payload.constraints if item.strip()]
+        elif preset:
+            constraints = list(preset.get("constraints") or [])
+        else:
+            constraints = []
+        default_title = str(preset["title"]) if preset else raw_input[:60]
+        default_workflow = str(preset["default_workflow"]) if preset else "product_blueprint"
+        started = service.supervisor.start_run(
+            title=str(payload.title or default_title),
+            raw_input=raw_input,
+            workflow_name=str(payload.workflow_name or default_workflow),
+            provider_config=dict(payload.provider_config or {}),
+            worker_driver=payload.worker_driver,
+            reviewer_driver=payload.reviewer_driver,
+            monitor_model=payload.monitor_model,
+            auto_approve=payload.auto_approve,
+            sync=payload.sync,
+            constraints=constraints,
+            workspace_root=resolved_ws,
+        )
+        return {"ok": True, **started}
 
-                if (
-                    len(parts) == 4
-                    and parts[0] == "api"
-                    and parts[1] == "runs"
-                    and parts[3] == "command"
-                ):
-                    run_id = parts[2]
-                    res = app.execute_command(run_id, body)
-                    self._send_json(HTTPStatus.OK, res)
-                    return
+    @api.post(
+        "/api/runs/{run_id}/command",
+        response_model=CommandResponse,
+        responses=write_responses,
+    )
+    def run_command(run_id: str, payload: CommandRequest) -> dict[str, Any]:
+        body = payload.model_dump(mode="json", exclude_unset=True)
+        return service.execute_command(run_id, body)
 
-                self._send_json(
-                    HTTPStatus.NOT_FOUND,
-                    {"ok": False, "error": f"Unknown POST route: {path}"},
-                )
-            except NotFoundError as exc:
-                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
-            except FileNotFoundError as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
-            except ConcurrencyConflictError as exc:
-                conflict_payload: dict[str, Any] = {
-                    "ok": False,
-                    "conflict": True,
-                    "error": str(exc),
-                }
-                req_parts = [p for p in path.split("/") if p]
-                if len(req_parts) == 4 and req_parts[0] == "api" and req_parts[1] == "runs":
-                    with contextlib.suppress(Exception):
-                        conflict_payload["projection"] = app.get_run_payload(
-                            req_parts[2]
-                        )["projection"]
-                self._send_json(HTTPStatus.CONFLICT, conflict_payload)
-            except ValueError as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {"ok": False, "error": str(exc)},
-                )
+    @api.post("/api/seed-demo", response_model=SeedDemoResponse, responses=write_responses)
+    def seed_demo() -> dict[str, Any]:
+        seeded = seed_demo_runs(
+            service.store,
+            service.workspace_root,
+            artifacts_root=service.artifacts_root,
+        )
+        return {"ok": True, "seeded": seeded, **service.list_runs_payload()}
 
-    return ThreadingHTTPServer((host, port), AriadneRequestHandler)
+    @api.get("/api/runs/{run_id}/stream", responses=read_responses)
+    async def stream_run(
+        run_id: str, request: Request, after_seq: int = 0, once: int = 0
+    ) -> StreamingResponse:
+        initial = service.get_events_payload(run_id, after_seq=after_seq)
+        stream = _sse_stream(
+            service,
+            request,
+            run_id,
+            initial=initial,
+            after_seq=after_seq,
+            once=once == 1,
+        )
+        return StreamingResponse(
+            stream,
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @api.get("/static/{relpath:path}", include_in_schema=False)
+    def static_asset(relpath: str) -> Response:
+        return _serve_static(relpath)
+
+    @api.get("/", include_in_schema=False)
+    @api.get("/index.html", include_in_schema=False)
+    def index() -> Response:
+        return _index_response()
+
+    @api.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> Response:
+        return Response(
+            content=b"",
+            headers={"Content-Type": "image/x-icon", "Cache-Control": "no-store"},
+        )
+
+    return api
+
+
+def _sse_stream(
+    service: AriadneApp,
+    request: Request,
+    run_id: str,
+    *,
+    initial: dict[str, Any],
+    after_seq: int,
+    once: bool,
+) -> AsyncIterator[str]:
+    """Async SSE frames matching the legacy wire contract exactly."""
+
+    async def frames() -> AsyncIterator[str]:
+        yield _sse_frame("state", initial)
+        if once:
+            return
+
+        last_rev = int(initial["state_revision"])
+        events = initial["events"]
+        cur_seq = int(events[-1]["event_seq"]) if events else after_seq
+        last_previews: dict[str, Any] = {}
+        ticks = 0
+        while True:
+            await asyncio.sleep(0.5)
+            if await request.is_disconnected():
+                return
+            ticks += 1
+            nxt = await asyncio.to_thread(service.get_events_payload, run_id, after_seq=cur_seq)
+            if int(nxt["state_revision"]) != last_rev or nxt["events"]:
+                last_rev = int(nxt["state_revision"])
+                if nxt["events"]:
+                    cur_seq = int(nxt["events"][-1]["event_seq"])
+                yield _sse_frame("state", nxt)
+            elif ticks % 10 == 0:
+                yield ": heartbeat\n\n"
+            previews = (
+                service.supervisor.live_activity.snapshot(run_id)
+                if nxt["status"] == "running"
+                else {}
+            )
+            if previews != last_previews:
+                yield _sse_frame("activity", {"run_id": run_id, "previews": previews})
+                last_previews = previews
+
+    return frames()
 
 
 def serve_ariadne(
@@ -710,16 +749,17 @@ def serve_ariadne(
     port: int = 8765,
     seed_demo: bool = False,
 ) -> None:
-    """Run the Ariadne console HTTP server in the foreground."""
+    """Run the Ariadne console uvicorn server in the foreground."""
     ws = Path(workspace_root).resolve()
     if seed_demo:
         seed_demo_runs(store, ws)
     app = AriadneApp(store=store, workspace_root=ws)
     app.supervisor.recover_orphaned_runs()
-    httpd = create_http_server(app, host=host, port=port)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        httpd.server_close()
+    uvicorn.run(create_fastapi_app(app), host=host, port=port)
+
+
+__all__ = [
+    "AriadneApp",
+    "create_fastapi_app",
+    "serve_ariadne",
+]

@@ -3,10 +3,12 @@
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -24,7 +26,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.store import RunStore
 from olympus.web.demos import seed_demo_runs
-from olympus.web.server import AriadneApp, create_http_server
+from olympus.web.server import AriadneApp, create_fastapi_app
 
 playwright = pytest.importorskip("playwright.sync_api")
 
@@ -35,15 +37,28 @@ def workbench(tmp_path):
     run_id = "run-campus-waitlist"
     assert run_id in seed_demo_runs(store, tmp_path)
     app = AriadneApp(store=store, workspace_root=tmp_path)
-    httpd = create_http_server(app, host="127.0.0.1", port=0)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_fastapi_app(app),
+            host="127.0.0.1",
+            port=0,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
+    deadline = time.monotonic() + 10.0
+    while not server.started:
+        if time.monotonic() > deadline:
+            raise RuntimeError("uvicorn server did not start within 10s")
+        time.sleep(0.01)
+    assert server.servers
+    port = server.servers[0].sockets[0].getsockname()[1]
     try:
-        yield store, run_id, f"http://127.0.0.1:{httpd.server_port}"
+        yield store, run_id, f"http://127.0.0.1:{port}"
     finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join()
+        server.should_exit = True
+        thread.join(timeout=10.0)
 
 
 @pytest.fixture

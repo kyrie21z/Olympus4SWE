@@ -1,6 +1,6 @@
 # ADR-0001: Adopt React Flow + ELK Pre-Built Graph Island for Ariadne Flowcharts
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR-0003](0003-pragmatic-foundation-fastapi-react-sdks.md)
 - **Date**: 2026-11-21
 - **Tracking**: #56 (Task Dependency Graph cut-over), #57 (Orchestration Workflow cut-over)
 

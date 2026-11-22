@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import SimpleQueue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from threading import enumerate as enumerate_threads
 from typing import Any
 
@@ -21,6 +21,7 @@ from olympus.core.contracts import (
     ApprovalDecision,
     ApprovalRecord,
     ApprovalTarget,
+    BudgetPolicy,
     CheckKind,
     DesignSpec,
     ExecutionStrategy,
@@ -67,10 +68,15 @@ def _init_repo(root: Path) -> None:
 
 
 def _confirmed_run(
-    tmp_path: Path, *, criteria: list[str] | None = None
+    tmp_path: Path,
+    *,
+    criteria: list[str] | None = None,
+    budget_policy: BudgetPolicy | None = None,
 ) -> tuple[RunStore, str]:
     store = RunStore(tmp_path / ".olympus" / "olympus.db")
-    run_id = store.create_run(title="Manifest run", mode=RunMode.SIMULATION)
+    run_id = store.create_run(
+        title="Manifest run", mode=RunMode.SIMULATION, budget_policy=budget_policy
+    )
     spec = GoalSpec(
         spec_id="spec-manifest",
         goal="Add a feature flag module",
@@ -2409,6 +2415,218 @@ def test_agent_loop_supports_unlimited_max_steps() -> None:
     assert res.stop_reason == "final_response"
     assert res.steps_taken == 26
     assert res.final_content == "finished after 26 steps"
+
+
+class _GatedDriver:
+    """Hold each worker turn until released, recording lifecycle ordering per task."""
+
+    name = "gated"
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self._files = files
+        self._lock = Lock()
+        self.started = {task_id: Event() for task_id in files}
+        self.finished = {task_id: Event() for task_id in files}
+        self.release = {task_id: Event() for task_id in files}
+        self.start_times: dict[str, float] = {}
+        self.end_times: dict[str, float] = {}
+        self.prompts: dict[str, str] = {}
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        task_id = request.task_id
+        assert task_id is not None and task_id in self._files
+        with self._lock:
+            self.start_times[task_id] = time.monotonic()
+            self.prompts[task_id] = request.user_prompt
+        self.started[task_id].set()
+        assert self.release[task_id].wait(10), f"{task_id} was never released"
+        target = request.workspace_path / self._files[task_id]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{task_id}\n", encoding="utf-8")
+        with self._lock:
+            self.end_times[task_id] = time.monotonic()
+        self.finished[task_id].set()
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content=f"{task_id} done",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _parallel_plan(spec: GoalSpec, *, scopes: dict[str, list[str]]) -> TaskPlan:
+    return TaskPlan.model_validate(
+        {
+            "plan_id": "plan-continuous",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": task_id,
+                    "title": f"Run {task_id}",
+                    "objective": f"Execute {task_id} independently",
+                    "requirement_refs": ["R1"],
+                    "write_scope": write_scope,
+                    "acceptance_checks": [
+                        {
+                            "id": f"{task_id}-REV",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Cold review",
+                        }
+                    ],
+                }
+                for task_id, write_scope in scopes.items()
+            ],
+        }
+    )
+
+
+def _passing_reviewer(
+    messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+) -> LLMResponse:
+    del messages, tools
+    return LLMResponse(
+        content=json.dumps(
+            {"task_id": "T1", "attempt": 1, "passed": True, "summary": "ok", "findings": []}
+        )
+    )
+
+
+def _start_stage(
+    stage: OrchestrateStage, run_id: str, **kwargs: Any
+) -> tuple[Thread, list[dict[str, Any]], list[Exception]]:
+    results: list[dict[str, Any]] = []
+    errors: list[Exception] = []
+
+    def execute() -> None:
+        try:
+            results.append(stage.run_execution(run_id=run_id, **kwargs))
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = Thread(target=execute, daemon=True)
+    thread.start()
+    return thread, results, errors
+
+
+def test_continuous_dispatch_refills_slots_without_barrier_sync(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={task_id: [f"{task_id.lower()}.txt"] for task_id in ("T1", "T2", "T3", "T4")},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver(
+        {task_id: f"{task_id.lower()}.txt" for task_id in ("T1", "T2", "T3", "T4")}
+    )
+    driver.release["T1"].set()
+    driver.release["T3"].set()
+    driver.release["T4"].set()
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id)
+    try:
+        assert driver.started["T2"].wait(5), "blocked task never started"
+        assert driver.started["T3"].wait(5), "Task C did not start while Task B was blocked"
+        assert driver.finished["T3"].wait(5), "Task C did not finish while Task B was blocked"
+        assert driver.finished["T4"].wait(5), "Task D did not finish while Task B was blocked"
+        assert not driver.release["T2"].is_set()
+    finally:
+        driver.release["T2"].set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T3"] < driver.end_times["T2"]
+
+
+def test_continuous_dispatch_serializes_overlapping_write_scopes(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={"T1": ["shared/"], "T2": ["shared/"]},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver({"T1": "shared/t1.txt", "T2": "shared/t2.txt"})
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id)
+    assert driver.started["T1"].wait(5)
+    assert not driver.started["T2"].wait(0.3), "overlapping write_scope ran concurrently"
+    driver.release["T1"].set()
+    assert driver.finished["T1"].wait(5)
+    assert driver.started["T2"].wait(5)
+    driver.release["T2"].set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T1"] < driver.start_times["T2"]
+
+
+def test_serial_execution_stays_sequential_and_keeps_handoff_context(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"],
+        scopes={"T1": ["t1.txt"], "T2": ["t2.txt"]},
+    )
+    _approve_plan(store, run_id, plan)
+    driver = _GatedDriver({"T1": "t1.txt", "T2": "t2.txt"})
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+
+    thread, results, errors = _start_stage(stage, run_id, serial_execution=True)
+    assert driver.started["T1"].wait(5)
+    assert not driver.started["T2"].wait(0.3), "serial execution ran two tasks together"
+    driver.release["T1"].set()
+    assert driver.finished["T1"].wait(5)
+    assert driver.started["T2"].wait(5)
+    driver.release["T2"].set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert driver.end_times["T1"] < driver.start_times["T2"]
+    assert "Prior Accepted Handoff Summary (serial_handoff)" in driver.prompts["T2"]
+    assert "T1" in driver.prompts["T2"]
+    status_events = [
+        event
+        for event in store.list_events(run_id)
+        if event.event_type == "run.status_changed"
+    ]
+    assert any(event.payload.get("serial_execution") is True for event in status_events)
 
 
 

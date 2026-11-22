@@ -6,7 +6,7 @@ import json
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
@@ -34,6 +34,7 @@ from olympus.core.control import RunControl, is_plan_bound_to_upstream
 from olympus.core.dag import (
     PlanValidationError,
     compute_dispatchable_tasks,
+    scopes_overlap,
     validate_plan,
 )
 from olympus.core.store import ConcurrencyConflictError, RunStore
@@ -1399,158 +1400,185 @@ class OrchestrateStage:
             for peer in peers:
                 peer.cancel(reason="run_paused")
 
-        while True:
-            snap = self.store.get_run(run_id)
-            if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
-                return snap
-            if interrupted.is_set():
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        RunStatus.AWAITING_HUMAN,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={"reason": "turn_cancelled"},
-                    )
-                except ConcurrencyConflictError:
-                    continue
-                return self.store.get_run(run_id)
-            design = snap.get("design")
-            plan = snap["plan"]
-            assert plan is not None
-            policy = snap["budget_policy"]
+        limit = (
+            1
+            if effective_serial
+            else self.store.get_run(run_id)["budget_policy"].max_concurrent_tasks
+        )
+        in_flight: dict[Future[TaskNode], TaskNode] = {}
 
-            ready = compute_dispatchable_tasks(
-                plan,
-                max_concurrent=1 if effective_serial else policy.max_concurrent_tasks,
-            )
-            if not ready:
-                all_done = all(
-                    t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED) for t in plan.tasks
-                )
-                if (
-                    all_done
-                    and plan.delivery_checks
-                    and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
-                    and snap["spec"] is not None
-                    and snap["spec"].content_hash == spec.content_hash
-                    and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
-                    and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
-                    and self.store.is_approved(
-                        run_id=run_id,
-                        target=ApprovalTarget.GOAL_SPEC,
-                        target_id=spec.spec_id,
-                        target_hash=spec.content_hash,
-                    )
-                    and self.store.is_approved(
-                        run_id=run_id,
-                        target=ApprovalTarget.TASK_PLAN,
-                        target_id=plan.plan_id,
-                        target_hash=plan.content_hash,
-                    )
-                ):
-                    run_dir = self._run_dir(run_id)
-                    receipt = run_delivery_checks(
-                        plan,
-                        workspace_root=self.workspace_root,
-                        overlay_dir=run_dir / "accepted_overlay",
-                        run_dir=run_dir,
-                    )
+        def pick_dispatchable(ready: Sequence[TaskNode], capacity: int) -> list[TaskNode]:
+            occupied = list(in_flight.values())
+            occupied_ids = {task.task_id for task in occupied}
+            occupied_scopes = [scope for task in occupied for scope in task.write_scope]
+            picked: list[TaskNode] = []
+            for task in ready:
+                if task.task_id in occupied_ids:
+                    continue
+                if scopes_overlap(task.write_scope, occupied_scopes):
+                    continue
+                picked.append(task)
+                occupied_scopes.extend(task.write_scope)
+                if len(picked) == capacity:
+                    break
+            return picked
+
+        def drain_in_flight() -> None:
+            for future in list(in_flight):
+                in_flight.pop(future)
+                future.result()
+
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            while True:
+                snap = self.store.get_run(run_id)
+                if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                    if in_flight:
+                        drain_in_flight()
+                        continue
+                    return snap
+                if interrupted.is_set():
+                    if in_flight:
+                        drain_in_flight()
+                        continue
                     try:
-                        self.store.append_event(
-                            run_id=run_id,
-                            stage="verify",
-                            event_type=DELIVERY_EVENT,
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.AWAITING_HUMAN,
+                            expected_revision=int(snap["state_revision"]),
                             actor="chronos",
-                            payload=receipt,
-                            expected_state_revision=snap["state_revision"],
+                            stage="orchestrate",
+                            detail={"reason": "turn_cancelled"},
                         )
                     except ConcurrencyConflictError:
                         continue
-                target_status = RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        target_status,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={
-                            "accepted": sum(
-                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                            ),
-                            "total": len(plan.tasks),
-                        },
-                    )
-                except ConcurrencyConflictError:
-                    continue
-                return self.store.get_run(run_id)
+                    return self.store.get_run(run_id)
+                design = snap.get("design")
+                plan = snap["plan"]
+                assert plan is not None
+                policy = snap["budget_policy"]
 
-            if not snap["budget_ledger"].can_reserve(policy):
-                try:
-                    self.store.set_run_status(
-                        run_id,
-                        RunStatus.AWAITING_HUMAN,
-                        expected_revision=int(snap["state_revision"]),
-                        actor="chronos",
-                        stage="orchestrate",
-                        detail={
-                            "reason": "budget_exhausted",
-                            "accepted": sum(
-                                1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
-                            ),
-                            "total": len(plan.tasks),
-                        },
-                    )
-                except ConcurrencyConflictError:
+                ready: list[TaskNode] = []
+                capacity = limit - len(in_flight)
+                if capacity > 0:
+                    ready = compute_dispatchable_tasks(plan, max_concurrent=limit)
+                    candidates = pick_dispatchable(ready, capacity)
+                    if candidates and snap["budget_ledger"].can_reserve(policy):
+                        for task in candidates:
+                            handoff = (
+                                _format_handoff_context(plan, current_task_id=task.task_id)
+                                if effective_serial
+                                else ""
+                            )
+                            future = pool.submit(
+                                self._execute_single_task,
+                                run_id=run_id,
+                                spec=spec,
+                                task_id=task.task_id,
+                                mode=snap["mode"],
+                                apply_to_workspace=apply_to_workspace,
+                                worker_max_steps=worker_max_steps,
+                                worker=worker,
+                                monitor_factory=monitor_factory,
+                                reviewer=reviewer,
+                                interrupted=interrupted,
+                                design=design,
+                                handoff_context=handoff,
+                                on_handle_registered=register_wave_handle,
+                                on_handle_finished=unregister_wave_handle,
+                                on_run_paused=cancel_wave_peers,
+                            )
+                            in_flight[future] = task
+                if in_flight:
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        in_flight.pop(future)
+                        future.result()
                     continue
-                return self.store.get_run(run_id)
 
-            if len(ready) == 1:
-                handoff = (
-                    _format_handoff_context(plan, current_task_id=ready[0].task_id)
-                    if effective_serial
-                    else ""
-                )
-                self._execute_single_task(
-                    run_id=run_id,
-                    spec=spec,
-                    task_id=ready[0].task_id,
-                    mode=snap["mode"],
-                    apply_to_workspace=apply_to_workspace,
-                    worker_max_steps=worker_max_steps,
-                    worker=worker,
-                    monitor_factory=monitor_factory,
-                    reviewer=reviewer,
-                    interrupted=interrupted,
-                    design=design,
-                    handoff_context=handoff,
-                )
-            else:
-                with ThreadPoolExecutor(max_workers=len(ready)) as pool:
-                    futures = [
-                        pool.submit(
-                            self._execute_single_task,
+                if not ready:
+                    all_done = all(
+                        t.status in (TaskStatus.ACCEPTED, TaskStatus.CANCELLED)
+                        for t in plan.tasks
+                    )
+                    if (
+                        all_done
+                        and plan.delivery_checks
+                        and any(t.status == TaskStatus.ACCEPTED for t in plan.tasks)
+                        and snap["spec"] is not None
+                        and snap["spec"].content_hash == spec.content_hash
+                        and (plan.spec_id, plan.spec_hash) == (spec.spec_id, spec.content_hash)
+                        and not validate_plan(plan, spec=spec, workspace_root=self.workspace_root)
+                        and self.store.is_approved(
                             run_id=run_id,
-                            spec=spec,
-                            task_id=t.task_id,
-                            mode=snap["mode"],
-                            apply_to_workspace=apply_to_workspace,
-                            worker_max_steps=worker_max_steps,
-                            worker=worker,
-                            monitor_factory=monitor_factory,
-                            reviewer=reviewer,
-                            interrupted=interrupted,
-                            design=design,
-                            on_handle_registered=register_wave_handle,
-                            on_handle_finished=unregister_wave_handle,
-                            on_run_paused=cancel_wave_peers,
+                            target=ApprovalTarget.GOAL_SPEC,
+                            target_id=spec.spec_id,
+                            target_hash=spec.content_hash,
                         )
-                        for t in ready
-                    ]
-                    for fut in futures:
-                        fut.result()
+                        and self.store.is_approved(
+                            run_id=run_id,
+                            target=ApprovalTarget.TASK_PLAN,
+                            target_id=plan.plan_id,
+                            target_hash=plan.content_hash,
+                        )
+                    ):
+                        run_dir = self._run_dir(run_id)
+                        receipt = run_delivery_checks(
+                            plan,
+                            workspace_root=self.workspace_root,
+                            overlay_dir=run_dir / "accepted_overlay",
+                            run_dir=run_dir,
+                        )
+                        try:
+                            self.store.append_event(
+                                run_id=run_id,
+                                stage="verify",
+                                event_type=DELIVERY_EVENT,
+                                actor="chronos",
+                                payload=receipt,
+                                expected_state_revision=snap["state_revision"],
+                            )
+                        except ConcurrencyConflictError:
+                            continue
+                    target_status = (
+                        RunStatus.COMPLETED if all_done else RunStatus.AWAITING_HUMAN
+                    )
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            target_status,
+                            expected_revision=int(snap["state_revision"]),
+                            actor="chronos",
+                            stage="orchestrate",
+                            detail={
+                                "accepted": sum(
+                                    1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                                ),
+                                "total": len(plan.tasks),
+                            },
+                        )
+                    except ConcurrencyConflictError:
+                        continue
+                    return self.store.get_run(run_id)
+
+                if not snap["budget_ledger"].can_reserve(policy):
+                    try:
+                        self.store.set_run_status(
+                            run_id,
+                            RunStatus.AWAITING_HUMAN,
+                            expected_revision=int(snap["state_revision"]),
+                            actor="chronos",
+                            stage="orchestrate",
+                            detail={
+                                "reason": "budget_exhausted",
+                                "accepted": sum(
+                                    1 for t in plan.tasks if t.status == TaskStatus.ACCEPTED
+                                ),
+                                "total": len(plan.tasks),
+                            },
+                        )
+                    except ConcurrencyConflictError:
+                        continue
+                    return self.store.get_run(run_id)
 
     def retry_blocked_task(
         self,

@@ -10,7 +10,6 @@ from typing import Any, Literal, cast
 import httpx
 import openai
 from openai.types.chat import (
-    ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageParam,
     ChatCompletionToolUnionParam,
 )
@@ -90,15 +89,6 @@ class OpenAIChatDialect:
         temperature: float = 0.0,
         timeout: float = 180.0,
     ) -> LLMResponse:
-        url = f"{endpoint.base_url.rstrip('/')}/chat/completions"
-        client = openai.OpenAI(
-            api_key=endpoint.api_key or _KEYLESS_PLACEHOLDER,
-            base_url=endpoint.base_url,
-            default_headers=dict(endpoint.headers),
-            timeout=timeout,
-            max_retries=0,
-            http_client=self.http_client,
-        )
         request_kwargs: dict[str, Any] = {
             "model": model,
             "messages": cast(
@@ -114,7 +104,6 @@ class OpenAIChatDialect:
             )
         if self.max_tokens is not None and self.compat.max_tokens_field is not None:
             request_kwargs[self.compat.max_tokens_field] = self.max_tokens
-        # ``extra_body`` must never override explicitly serialized fields.
         passthrough = {
             key: value
             for key, value in self.compat.extra_body.items()
@@ -122,36 +111,80 @@ class OpenAIChatDialect:
         }
         if passthrough:
             request_kwargs["extra_body"] = passthrough
-        if not endpoint.api_key and not any(
-            key.lower() == "authorization" for key in endpoint.headers
-        ):
-            request_kwargs["extra_headers"] = {"Authorization": openai.Omit()}
+
+        explicit_auth: str | None = None
+        default_headers: dict[str, str] = {}
+        has_org = False
+        has_project = False
+        for key, value in endpoint.headers.items():
+            lowered = key.lower()
+            if lowered == "authorization":
+                explicit_auth = value
+                continue
+            if lowered == "openai-organization":
+                has_org = True
+            elif lowered == "openai-project":
+                has_project = True
+            default_headers[key] = value
+
+        extra_headers: dict[str, Any] = {}
+        if not has_org:
+            extra_headers["OpenAI-Organization"] = openai.Omit()
+        if not has_project:
+            extra_headers["OpenAI-Project"] = openai.Omit()
+        if not endpoint.api_key:
+            extra_headers["Authorization"] = (
+                explicit_auth if explicit_auth is not None else openai.Omit()
+            )
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
+
+        owned_client = (
+            httpx.Client(timeout=timeout, follow_redirects=False)
+            if self.http_client is None
+            else None
+        )
+        client = openai.OpenAI(
+            api_key=endpoint.api_key or _KEYLESS_PLACEHOLDER,
+            base_url=endpoint.base_url,
+            default_headers=default_headers,
+            timeout=timeout,
+            max_retries=0,
+            http_client=self.http_client if self.http_client is not None else owned_client,
+        )
 
         try:
-            completion = client.chat.completions.create(**request_kwargs)
+            raw = client.chat.completions.with_raw_response.create(**request_kwargs)
         except openai.APIStatusError as exc:
-            raise HttpStatusError(exc.status_code, url, exc.response.text[:500]) from exc
+            raise HttpStatusError(
+                exc.status_code, str(exc.request.url), exc.response.text[:500]
+            ) from exc
+        except openai.APIConnectionError as exc:
+            if isinstance(exc.__cause__, httpx.HTTPError):
+                raise exc.__cause__ from exc
+            raise
         finally:
-            if self.http_client is None:
-                client.close()
+            if owned_client is not None:
+                owned_client.close()
 
-        choice = completion.choices[0].message
+        data = raw.http_response.json()
+        choice = data["choices"][0]["message"]
         parsed_calls: list[ToolCall] = []
-        for raw_tc in choice.tool_calls or []:
-            if not isinstance(raw_tc, ChatCompletionMessageFunctionToolCall):
-                continue
-            args = json.loads(raw_tc.function.arguments or "{}")
-            parsed_calls.append(ToolCall(id=raw_tc.id, name=raw_tc.function.name, arguments=args))
+        for raw_tc in choice.get("tool_calls") or []:
+            fn = raw_tc["function"]
+            raw_args = fn.get("arguments") or "{}"
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            parsed_calls.append(ToolCall(id=raw_tc["id"], name=fn["name"], arguments=args))
 
-        usage = completion.usage
+        usage = data.get("usage") or {}
         return LLMResponse(
-            content=choice.content or "",
+            content=choice.get("content") or "",
             tool_calls=tuple(parsed_calls),
             usage=UsageStats(
-                input_tokens=usage.prompt_tokens if usage is not None else 0,
-                output_tokens=usage.completion_tokens if usage is not None else 0,
+                input_tokens=int(usage.get("prompt_tokens") or 0),
+                output_tokens=int(usage.get("completion_tokens") or 0),
             ),
-            raw_model=completion.model or model,
+            raw_model=str(data.get("model") or model),
         )
 
     def _serialize_messages(self, messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:

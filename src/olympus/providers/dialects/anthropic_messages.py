@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import anthropic
 import httpx
-from anthropic.types import MessageParam, TextBlock, ToolUnionParam, ToolUseBlock
+from anthropic.types import MessageParam, ToolUnionParam
 
 from olympus.providers.auth import EndpointTarget
 from olympus.providers.types import (
@@ -40,70 +40,99 @@ class AnthropicMessagesDialect:
         temperature: float = 0.0,
         timeout: float = 180.0,
     ) -> LLMResponse:
-        conversation, system_text = self._serialize_messages(messages)
-        url = f"{endpoint.base_url.rstrip('/')}/v1/messages"
-        client = anthropic.Anthropic(
-            api_key=endpoint.api_key,
-            base_url=endpoint.base_url,
-            default_headers=dict(endpoint.headers),
-            timeout=timeout,
-            max_retries=0,
-            http_client=self.http_client,
-        )
+        conversation, system_parts = self._serialize_messages(messages)
         request_kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": self.max_tokens,
             "messages": cast(Sequence[MessageParam], conversation),
             "temperature": temperature,
         }
-        if system_text:
-            request_kwargs["system"] = system_text
+        if system_parts:
+            request_kwargs["system"] = "\n\n".join(system_parts)
         if tools:
             request_kwargs["tools"] = cast(
                 Sequence[ToolUnionParam],
                 self._serialize_tools(tools),
             )
-        if not endpoint.api_key and not any(
-            key.lower() == "x-api-key" for key in endpoint.headers
-        ):
-            request_kwargs["extra_headers"] = {"X-Api-Key": anthropic.Omit()}
+
+        explicit_key: str | None = None
+        has_auth = False
+        default_headers: dict[str, str] = {}
+        for key, value in endpoint.headers.items():
+            lowered = key.lower()
+            if lowered == "x-api-key":
+                explicit_key = value
+                continue
+            if lowered == "authorization":
+                has_auth = True
+            default_headers[key] = value
+
+        effective_key = explicit_key if explicit_key is not None else endpoint.api_key
+        extra_headers: dict[str, Any] = {}
+        if not effective_key:
+            extra_headers["X-Api-Key"] = anthropic.Omit()
+        if not has_auth:
+            extra_headers["Authorization"] = anthropic.Omit()
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
+
+        owned_client = (
+            httpx.Client(timeout=timeout, follow_redirects=False)
+            if self.http_client is None
+            else None
+        )
+        client = anthropic.Anthropic(
+            api_key=effective_key,
+            base_url=endpoint.base_url,
+            default_headers=default_headers,
+            timeout=timeout,
+            max_retries=0,
+            http_client=self.http_client if self.http_client is not None else owned_client,
+        )
 
         try:
-            message = client.messages.create(**request_kwargs)
+            raw = client.messages.with_raw_response.create(**request_kwargs)
         except anthropic.APIStatusError as exc:
-            raise HttpStatusError(exc.status_code, url, exc.response.text[:500]) from exc
+            raise HttpStatusError(
+                exc.status_code, str(exc.request.url), exc.response.text[:500]
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            if isinstance(exc.__cause__, httpx.HTTPError):
+                raise exc.__cause__ from exc
+            raise
         finally:
-            if self.http_client is None:
-                client.close()
+            if owned_client is not None:
+                owned_client.close()
 
+        data = raw.http_response.json()
         texts: list[str] = []
         parsed_calls: list[ToolCall] = []
-        for block in message.content or []:
-            if isinstance(block, TextBlock):
-                texts.append(block.text)
-            elif isinstance(block, ToolUseBlock):
+        for block in data.get("content") or []:
+            if block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
                 parsed_calls.append(
                     ToolCall(
-                        id=block.id,
-                        name=block.name,
-                        arguments=cast(dict[str, Any], block.input),
+                        id=block["id"],
+                        name=block["name"],
+                        arguments=block.get("input") or {},
                     )
                 )
 
-        usage = message.usage
+        usage = data.get("usage") or {}
         return LLMResponse(
             content="\n".join(texts),
             tool_calls=tuple(parsed_calls),
             usage=UsageStats(
-                input_tokens=usage.input_tokens if usage is not None else 0,
-                output_tokens=usage.output_tokens if usage is not None else 0,
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
             ),
-            raw_model=message.model or model,
+            raw_model=str(data.get("model") or model),
         )
 
     def _serialize_messages(
         self, messages: Sequence[ChatMessage]
-    ) -> tuple[list[dict[str, Any]], str]:
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         system_parts: list[str] = []
         conversation: list[dict[str, Any]] = []
         for msg in messages:
@@ -138,7 +167,7 @@ class AnthropicMessagesDialect:
                 )
             else:
                 conversation.append({"role": "user", "content": msg.content})
-        return conversation, "\n\n".join(system_parts)
+        return conversation, system_parts
 
     def _serialize_tools(self, tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
         return [

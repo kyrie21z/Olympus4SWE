@@ -474,10 +474,8 @@ def test_pooled_provider_sticky_failover_across_endpoints() -> None:
     assert first.usage.input_tokens == 10
     assert first.raw_model == "wire-model"
     assert pool.active_index == 2
-    # max_retries=0: each exhausted endpoint is attempted exactly once.
     assert len(calls) == 3
 
-    # Sticky: the next call starts at the working endpoint, not the exhausted ones.
     second = provider.complete(messages=[ChatMessage(role="user", content="again")])
     assert second.content == "OK"
     assert len(calls) == 4
@@ -547,7 +545,6 @@ def test_pooled_provider_does_not_failover_on_client_errors(status: int) -> None
     with pytest.raises(HttpStatusError) as excinfo:
         provider.complete(messages=[ChatMessage(role="user", content="hi")])
     assert excinfo.value.status_code == status
-    # max_retries=0: a retryable 500 is propagated after a single attempt.
     assert len(attempts) == 1
     assert pool.active_index == 0
 
@@ -984,3 +981,146 @@ def test_convenience_providers_build_expected_dialects() -> None:
     assert anthropic_provider.pool.endpoints == (
         EndpointTarget(api_key="sk-anthropic", base_url="https://anthropic.example.com"),
     )
+
+
+def test_dialects_preserve_credential_precedence_and_suppress_env_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_ORG_ID", "env-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "env-project")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
+
+    seen: list[tuple[list[str], list[str], str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.headers.get_list("authorization"),
+                request.headers.get_list("x-api-key"),
+                request.headers.get("openai-organization"),
+                request.headers.get("openai-project"),
+            )
+        )
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = _mock_client(handler)
+    OpenAIChatDialect(http_client=client).send(
+        EndpointTarget("", "https://gateway.invalid", {"authorization": "Bearer explicit"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    OpenAIChatDialect(http_client=client).send(
+        EndpointTarget("sk-endpoint", "https://gateway.invalid", {"Authorization": "Bearer other"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    AnthropicMessagesDialect(http_client=client).send(
+        EndpointTarget("sk-endpoint", "https://gateway.invalid", {"x-api-key": "explicit"}),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert seen == [
+        (["Bearer explicit"], [], None, None),
+        (["Bearer sk-endpoint"], [], None, None),
+        ([], ["explicit"], None, None),
+    ]
+
+
+def test_dialects_handle_gateway_quirks_and_unwrap_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def openai_quirks(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "t1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": {"x": 1}},
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": "3"},
+            },
+        )
+
+    openai_resp = OpenAIChatDialect(http_client=_mock_client(openai_quirks)).send(
+        EndpointTarget("sk-test", "https://gateway.invalid"),
+        model="m",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert openai_resp.tool_calls[0].arguments == {"x": 1}
+    assert openai_resp.usage.input_tokens == 3
+    assert openai_resp.usage.output_tokens == 0
+
+    captured_system: list[Any] = []
+
+    def anthropic_quirks(request: httpx.Request) -> httpx.Response:
+        captured_system.append(json.loads(request.content).get("system"))
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "other"},
+                    {"type": "text", "text": "ok"},
+                    {"type": "tool_use", "id": "t2", "name": "g"},
+                ],
+                "usage": {"input_tokens": "4"},
+            },
+        )
+
+    anthropic_resp = AnthropicMessagesDialect(http_client=_mock_client(anthropic_quirks)).send(
+        EndpointTarget("sk-test", "https://gateway.invalid"),
+        model="m",
+        messages=[ChatMessage(role="system", content=""), ChatMessage(role="user", content="hi")],
+    )
+    assert captured_system == [""]
+    assert anthropic_resp.content == "ok"
+    assert anthropic_resp.tool_calls[0].arguments == {}
+    assert anthropic_resp.usage.input_tokens == 4
+    assert anthropic_resp.usage.output_tokens == 0
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(httpx.ReadTimeout):
+        OpenAIChatDialect(http_client=_mock_client(timeout_handler)).send(
+            EndpointTarget("sk-test", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+    with pytest.raises(httpx.ReadTimeout):
+        AnthropicMessagesDialect(http_client=_mock_client(timeout_handler)).send(
+            EndpointTarget("sk-test", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+
+    hosts: list[str] = []
+
+    def redirect_handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(307, headers={"Location": "https://other.invalid/v1/messages"})
+
+    monkeypatch.setattr(
+        httpx.Client,
+        "_transport_for_url",
+        lambda self, url: httpx.MockTransport(redirect_handler),
+    )
+    with pytest.raises(HttpStatusError) as excinfo:
+        AnthropicMessagesDialect().send(
+            EndpointTarget("sk-secret", "https://gateway.invalid"),
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+    assert excinfo.value.status_code == 307
+    assert hosts == ["gateway.invalid"]

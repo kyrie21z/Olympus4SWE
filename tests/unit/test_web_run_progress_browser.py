@@ -1,6 +1,7 @@
 """Run with uv run --with playwright pytest tests/unit/test_web_run_progress_browser.py."""
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -1026,6 +1027,38 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(stalled_css.locator("#workflow-graph .ag-island")).to_be_visible()
     _assert_graph_stylesheet_applied(stalled_css, allow_retry=True)
     stalled_css.close()
+
+    held_init = []
+    held_retry_css = []
+    late_js = browser.new_page()
+    initial_bundle_re = re.compile(r"/static/assets/ariadne-graph\.(?:js|css)$")
+    retry_css_re = re.compile(r"/static/assets/ariadne-graph\.css\?retry=")
+    late_js.route(initial_bundle_re, lambda route: held_init.append(route))
+    late_js.route(retry_css_re, lambda route: held_retry_css.append(route))
+    late_js.goto(f"{url}/?run={run_id}")
+    expect(late_js.locator("#dag-graph")).to_contain_text(
+        "任务依赖图组件未能加载", timeout=7000
+    )
+    late_js.locator("#thread-list .thread-item").nth(1).click()
+    late_js.wait_for_function(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
+    )
+    for route in held_init:
+        route.continue_()
+    late_js.unroute(initial_bundle_re)
+    late_js.wait_for_timeout(100)
+    assert late_js.evaluate(
+        "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
+        ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
+    )
+    for route in held_retry_css:
+        route.continue_()
+    late_js.unroute(retry_css_re)
+    expect(late_js.locator("#dag-graph .ag-island")).to_be_visible()
+    expect(late_js.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(late_js, allow_retry=True)
+    late_js.close()
 
 
 # ---------------------------------------------------------------------------

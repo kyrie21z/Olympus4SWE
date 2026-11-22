@@ -132,6 +132,7 @@ function loadGraphModule(): Promise<GraphModule> {
 
     importPromise
       .then(async (mod) => {
+        if (settled) return;
         await ensureGraphStylesheet(attempt);
         if (settled) return;
         settled = true;

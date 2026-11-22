@@ -754,16 +754,27 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert app_res.status_code == 200
         assert "javascript" in app_res.headers["content-type"]
         assert app_res.headers["cache-control"] == "no-store"
-        # Regression #79: the lazy graph import must pass a non-empty __vite__mapDeps list
-        # containing assets/ariadne-graph.css, otherwise React Flow renders unstyled on first load.
-        assert re.search(
-            r'\[[^\]]*[`"\']assets/ariadne-graph\.css[`"\'][^\]]*\]',
+        # Regression #79: verify the preload index list passed with import("./ariadne-graph.js")
+        # resolves through __vite__mapDeps to assets/ariadne-graph.css (not [] or [0]).
+        deps_table_match = re.search(
+            r"__vite__mapDeps\s*=\s*\([^)]*\[([^\]]+)\]",
             app_res.text,
         )
-        assert re.search(
-            r'import\([`"\']\./ariadne-graph\.js[`"\']\)\s*,\s*__vite__mapDeps\(\[\d+(?:,\d+)*\]\)',
+        assert deps_table_match is not None, "__vite__mapDeps table missing from ariadne.js"
+        deps_table = [
+            item.strip().strip("`\"'")
+            for item in deps_table_match.group(1).split(",")
+            if item.strip()
+        ]
+        preload_match = re.search(
+            r'import\([`"\']\./ariadne-graph\.js[`"\']\)\s*,\s*__vite__mapDeps\(\[([0-9,\s]+)\]\)',
             app_res.text,
         )
+        assert preload_match is not None, "ariadne-graph.js import has no __vite__mapDeps indices"
+        preloaded_assets = [
+            deps_table[int(idx.strip())] for idx in preload_match.group(1).split(",") if idx.strip()
+        ]
+        assert "assets/ariadne-graph.css" in preloaded_assets, preloaded_assets
 
         graph_js = client.get("/static/assets/ariadne-graph.js")
         assert graph_js.status_code == 200

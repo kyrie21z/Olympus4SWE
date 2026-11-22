@@ -1028,12 +1028,17 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     _assert_graph_stylesheet_applied(stalled_css, allow_retry=True)
     stalled_css.close()
 
-    held_init = []
+    held_js = []
     held_retry_css = []
     late_js = browser.new_page()
-    initial_bundle_re = re.compile(r"/static/assets/ariadne-graph\.(?:js|css)$")
+    initial_js_re = re.compile(r"/static/assets/ariadne-graph\.js$")
+    initial_css_re = re.compile(r"/static/assets/ariadne-graph\.css$")
     retry_css_re = re.compile(r"/static/assets/ariadne-graph\.css\?retry=")
-    late_js.route(initial_bundle_re, lambda route: held_init.append(route))
+    late_js.route(
+        initial_css_re,
+        lambda route: route.fulfill(status=200, content_type="text/css", body=""),
+    )
+    late_js.route(initial_js_re, lambda route: held_js.append(route))
     late_js.route(retry_css_re, lambda route: held_retry_css.append(route))
     late_js.goto(f"{url}/?run={run_id}")
     expect(late_js.locator("#dag-graph")).to_contain_text(
@@ -1044,10 +1049,14 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
         "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
         ".some((node) => node.href.includes('ariadne-graph.css?retry='))"
     )
-    for route in held_init:
-        route.continue_()
-    late_js.unroute(initial_bundle_re)
-    late_js.wait_for_timeout(100)
+    late_js.unroute(initial_css_re)
+    with late_js.expect_response(initial_js_re):
+        for route in held_js:
+            route.continue_()
+    late_js.unroute(initial_js_re)
+    late_js.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
     assert late_js.evaluate(
         "() => Array.from(document.querySelectorAll('link[rel=\"stylesheet\"]'))"
         ".some((node) => node.href.includes('ariadne-graph.css?retry='))"

@@ -51,6 +51,7 @@ from olympus.providers.base import (
 )
 from olympus.stages.align import AlignStage
 from olympus.stages.orchestrate import OrchestrateStage
+from olympus.tools.aci import build_sandbox_env
 from olympus.web.projection import build_run_projection
 from olympus.web.server import AriadneApp, create_fastapi_app
 
@@ -1052,7 +1053,8 @@ def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_pa
     responder, state = _scope_gate_responder(
         [
             _bash_action("printf 'tampered\\n' >> docs/notes.md"),
-            _write_action("feature.py", "FLAG = True\n"),
+            # The sandbox is retained, so the retry repairs the stray edit in place.
+            _bash_action("git checkout -- docs/notes.md && printf 'FLAG = True\\n' > feature.py"),
         ]
     )
     orch = OrchestrateStage(
@@ -1283,7 +1285,8 @@ def test_diff_gate_validates_non_git_sandbox_without_crashing(tmp_path: Path) ->
     responder, state = _scope_gate_responder(
         [
             _bash_action("printf 'x\\n' > stray.py"),
-            _write_action("feature.py", "FLAG = True\n"),
+            # The retained sandbox keeps stray.py on disk, so the retry removes it in place.
+            _bash_action("rm stray.py && printf 'FLAG = True\\n' > feature.py"),
         ]
     )
     orch = OrchestrateStage(
@@ -1354,6 +1357,354 @@ def test_diff_gate_rejects_deleted_and_renamed_paths_outside_write_scope(
     assert (docs / "notes.md").is_file()
     assert (docs / "legacy.txt").is_file()
     assert not (docs / "notes-renamed.md").exists()
+
+
+AttemptAction = Callable[[int, Path, str], None]
+
+
+class _AttemptWorker:
+    """Deterministic driver replaying one scripted action per leased attempt."""
+
+    name = "attempt-scripted"
+    supports_steer = False
+
+    def __init__(self, script: Sequence[AttemptAction]) -> None:
+        self._script = list(script)
+        self.sandboxes: list[Path] = []
+        self.prompts: list[str] = []
+
+    def steer(self, guidance: str, *, source: str) -> bool:
+        del guidance, source
+        return False
+
+    def cancel(self, *, reason: str) -> None:
+        del reason
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        self.sandboxes.append(request.workspace_path)
+        self.prompts.append(request.user_prompt)
+        action = self._script[min(len(self.sandboxes) - 1, len(self._script) - 1)]
+        action(len(self.sandboxes), request.workspace_path, request.user_prompt)
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content="done",
+            steps_taken=1,
+            driver_name=self.name,
+        )
+
+
+def _retained_stage(
+    store: RunStore,
+    tmp_path: Path,
+    worker: _AttemptWorker,
+    *,
+    provider: MockLLMProvider | None = None,
+) -> OrchestrateStage:
+    return OrchestrateStage(
+        store=store,
+        provider=provider or _capturing_reviewer({}),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver=worker.name),
+        driver_registry=DriverRegistry({worker.name: worker}),
+    )
+
+
+def _empty_dir(path: Path) -> bool:
+    return not path.exists() or not any(path.iterdir())
+
+
+def test_retained_sandbox_enables_in_place_repair_on_diff_gate_retry(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Feature module exposes the new flag",
+                    "command": "python3 -c 'import feature; assert feature.FLAG == 2'",
+                }
+            ],
+        ),
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        assert (ws / "scratch.db").is_file()
+        assert "IN-PLACE REPAIR" in prompt
+        (ws / "scratch.db").unlink()
+        (ws / "feature.py").write_text("FLAG = 2\n", encoding="utf-8")
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.ACCEPTED
+    assert task.attempt == 2
+    assert len(worker.sandboxes) == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    rejections = _gate_rejections(store, run_id)
+    assert [(e.payload["attempt"], e.payload["violating_paths"]) for e in rejections] == [
+        (1, ["scratch.db"])
+    ]
+    assert _empty_dir(tmp_path / ".olympus" / "sandboxes")
+    assert _empty_dir(tmp_path / ".olympus" / "sandbox_tmp")
+
+
+def test_retained_sandbox_never_rebaselines_out_of_scope_violations(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+
+    def leave_stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        assert (ws / "scratch.db").is_file()
+
+    worker = _AttemptWorker([stray, leave_stray])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    task = snap["plan"].tasks[0]
+    assert task.status == TaskStatus.BLOCKED
+    assert task.review_cycle == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    assert [(e.payload["attempt"], e.payload["violating_paths"])
+            for e in _gate_rejections(store, run_id)] == [
+        (1, ["scratch.db"]),
+        (2, ["scratch.db"]),
+    ]
+    assert worker.sandboxes[0].is_dir()
+
+
+def test_command_check_failure_reuses_retained_sandbox_for_repair(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-1",
+                    "kind": CheckKind.COMMAND.value,
+                    "description": "Feature flag must be 2",
+                    "command": "python3 -c 'import feature; assert feature.FLAG == 2'",
+                }
+            ],
+        ),
+    )
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        (ws / "feature.py").write_text("FLAG = 2  # repaired\n", encoding="utf-8")
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(store, tmp_path, worker).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    check_events = [
+        e for e in store.list_events(run_id) if e.event_type == "check.command_completed"
+    ]
+    assert [e.payload["passed"] for e in check_events] == [False, True]
+
+
+def test_argus_rejection_reuses_retained_sandbox_for_targeted_repair(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[
+                {
+                    "id": "CHK-REV",
+                    "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                    "description": "Audit the flag implementation",
+                }
+            ],
+        ),
+    )
+    review_passes = [False, True]
+
+    def responder(
+        messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
+    ) -> LLMResponse:
+        del tools
+        assert "Independent Verifier" in messages[0].content
+        passed = review_passes.pop(0)
+        findings = [] if passed else [{
+            "id": "F1",
+            "severity": "important",
+            "file_path": "feature.py",
+            "line": 1,
+            "message": "Missing audit flag",
+        }]
+        return LLMResponse(content=json.dumps({
+            "task_id": "T1",
+            "attempt": 1,
+            "passed": passed,
+            "summary": "ok" if passed else "Missing audit flag",
+            "findings": findings,
+        }))
+
+    def repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        (ws / "feature.py").write_text(
+            "FLAG = True\nAUDIT = True\n", encoding="utf-8"
+        )
+
+    worker = _AttemptWorker([repair])
+    snap = _retained_stage(
+        store, tmp_path, worker, provider=MockLLMProvider(responder=responder)
+    ).run_execution(run_id=run_id)
+
+    assert snap["status"] == RunStatus.COMPLETED
+    assert snap["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert snap["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    reviews = [e for e in store.list_events(run_id) if e.event_type == "review.verdict_recorded"]
+    assert [e.payload["attempt"] for e in reviews] == [1, 2]
+
+
+def test_resume_after_pause_reuses_retained_sandbox(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=3,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def pause_then_repair(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            store.set_run_status(run_id, RunStatus.PAUSED, actor="zeus")
+            return
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = 1\n"
+        (ws / "feature.py").write_text("FLAG = 2\n", encoding="utf-8")
+
+    worker = _AttemptWorker([pause_then_repair])
+    stage = _retained_stage(store, tmp_path, worker)
+    paused = stage.run_execution(run_id=run_id)
+
+    assert paused["status"] == RunStatus.PAUSED
+    sandbox = worker.sandboxes[0]
+    assert sandbox.is_dir()
+    assert (sandbox / "feature.py").is_file()
+
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="zeus")
+    resumed = stage.run_execution(run_id=run_id)
+
+    assert resumed["status"] == RunStatus.COMPLETED
+    assert resumed["plan"].tasks[0].status == TaskStatus.ACCEPTED
+    assert resumed["plan"].tasks[0].attempt == 2
+    assert worker.sandboxes[0] == worker.sandboxes[1]
+    assert _empty_dir(tmp_path / ".olympus" / "sandboxes")
+
+
+def test_run_cancellation_reclaims_retained_sandbox_and_temp_dir(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=spec,
+            write_scope=["feature.py"],
+            max_cycles=1,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def stray(attempt: int, ws: Path, prompt: str) -> None:
+        del attempt, prompt
+        build_sandbox_env(ws, host_root=tmp_path)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "scratch.db").write_text("stray\n", encoding="utf-8")
+
+    worker = _AttemptWorker([stray])
+    stage = _retained_stage(store, tmp_path, worker)
+    snap = stage.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.AWAITING_HUMAN
+    sandbox = worker.sandboxes[0]
+    tmp_dir = tmp_path / ".olympus" / "sandbox_tmp" / sandbox.name
+    assert sandbox.is_dir()
+    assert tmp_dir.is_dir()
+
+    store.set_run_status(run_id, RunStatus.CANCELLED, actor="zeus")
+    cancelled = stage.run_execution(run_id=run_id)
+
+    assert cancelled["status"] == RunStatus.CANCELLED
+    assert not sandbox.exists()
+    assert not tmp_dir.exists()
 
 
 def test_execution_routes_role_drivers_and_repairs_external_review(tmp_path: Path) -> None:
@@ -1801,16 +2152,17 @@ def test_watchdog_pause_preserves_work_and_skips_review(
     assert json.loads((attempt / "watchdog.json").read_text())["summary"] == task.last_error
     events = store.list_events(run_id)
     paused, = [event for event in events if event.event_type == "watchdog.paused"]
+    # A paused attempt keeps its sandbox on disk so retry_task can resume in place.
+    assert task.worktree_path == paused.payload["retained_sandbox"]
+    retained = Path(task.worktree_path)
+    assert retained.is_dir()
+    assert (retained / "feature.py").read_bytes() == b"\x00unfinished\n"
     if archive_fails:
         assert paused.payload["archive_error"] == "PermissionError"
-        assert task.worktree_path == paused.payload["retained_sandbox"]
-        assert (Path(task.worktree_path) / "feature.py").read_bytes() == b"\x00unfinished\n"
     else:
-        assert not task.worktree_path
         patch = attempt / "diff.patch"
         assert "GIT binary patch" in patch.read_text(encoding="utf-8")
         subprocess.run(["git", "apply", "--check", str(patch)], cwd=tmp_path, check=True)
-        assert not list((tmp_path / ".olympus" / "sandboxes").iterdir())
     assert any(e.event_type == "run.paused" for e in events)
     progress = AriadneApp(store=store, workspace_root=tmp_path).get_run_payload(run_id)[
         "projection"

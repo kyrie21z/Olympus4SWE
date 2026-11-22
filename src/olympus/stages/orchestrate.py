@@ -56,12 +56,17 @@ from olympus.harness.native import NativeDriver
 from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
+    absorb_verification_artifacts,
     archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
     create_sandbox,
+    load_sandbox_baseline,
+    remove_run_sandboxes,
     remove_sandbox,
+    save_sandbox_baseline,
     snapshot_sandbox_state,
+    sync_upstream_files,
 )
 from olympus.providers.base import LLMProvider
 from olympus.providers.factory import build_provider
@@ -953,23 +958,49 @@ class OrchestrateStage:
         art_dir = self._run_dir(run_id) / "artifacts" / leased.task_id / f"attempt-{leased.attempt}"
         art_dir.mkdir(parents=True, exist_ok=True)
         overlay_dir = self._run_dir(run_id) / "accepted_overlay"
-        sandbox = create_sandbox(
-            self.workspace_root,
-            label=f"{run_id}-{leased.task_id}-a{leased.attempt}",
-        )
-        _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
+        label = f"{run_id}-{leased.task_id}"
+        sandbox = create_sandbox(self.workspace_root, label=label, reuse=leased.attempt > 1)
+        if sandbox.reused and load_sandbox_baseline(sandbox) is None:
+            # A retained workspace without its Attempt-1 baseline cannot be audited safely.
+            remove_sandbox(sandbox)
+            sandbox = create_sandbox(self.workspace_root, label=label)
 
-        archive_failed = False
+        retain_sandbox = False
+
+        def retain(node: TaskNode) -> TaskNode:
+            nonlocal retain_sandbox
+            retain_sandbox = True
+            return node
+
         try:
-            worker_baseline = snapshot_sandbox_state(sandbox)
             forbidden_contracts = (
                 design.shared_contract_paths
                 if design is not None and leased.kind != TaskKind.CONTRACT
                 else ()
             )
+            if sandbox.reused:
+                task_baseline = load_sandbox_baseline(sandbox)
+                assert task_baseline is not None
+                task_baseline = sync_upstream_files(
+                    sandbox, overlay_dir, task_baseline, write_scope=leased.write_scope
+                )
+            else:
+                _copy_matching_scope(overlay_dir, sandbox.workspace_path, write_scope=None)
+                task_baseline = snapshot_sandbox_state(sandbox)
+            save_sandbox_baseline(sandbox, task_baseline)
             rework_ctx = (
                 f"\n\n[PRIOR REJECTION / ERROR TO FIX]\n{leased.last_error}\n"
                 if leased.last_error
+                else ""
+            )
+            repair_ctx = (
+                "\n\n[IN-PLACE REPAIR]\n"
+                "This sandbox was retained from your previous attempt: the files you already "
+                "changed are still present on disk. Inspect their current contents and apply "
+                "targeted edits that resolve the reported rejection instead of rewriting "
+                "unrelated files from scratch. Remove or relocate any paths the rejection "
+                "reports as outside write_scope; nothing was reverted for you.\n"
+                if sandbox.reused
                 else ""
             )
             checks_json = json.dumps(
@@ -1000,6 +1031,7 @@ class OrchestrateStage:
                 f"{handoff_block}"
                 f"Out of scope: {json.dumps(spec.out_of_scope, ensure_ascii=False)}\n"
                 f"Acceptance checks: {checks_json}"
+                f"{repair_ctx}"
                 f"{rework_ctx}"
             )
             driver, model = worker
@@ -1055,7 +1087,6 @@ class OrchestrateStage:
                 worker_error = type(exc).__name__
 
             if watchdog is not None and watchdog.pause_diagnosis is not None:
-                archive_failed = True
                 diagnosis = dict(watchdog.pause_diagnosis)
                 if worker_error is not None:
                     diagnosis["worker_error"] = worker_error
@@ -1067,18 +1098,22 @@ class OrchestrateStage:
                     archive_sandbox_recovery(sandbox, art_dir)
                 except (OSError, subprocess.SubprocessError) as exc:
                     diagnosis["archive_error"] = type(exc).__name__
-                else:
-                    archive_failed = False
+                retained = (
+                    str(sandbox.workspace_path) if sandbox.workspace_path.exists() else None
+                )
+                retain_sandbox = retained is not None
                 paused_task = RunControl(self.store).pause_for_watchdog(
                     run_id, task=leased, diagnosis=diagnosis,
-                    retained_sandbox=str(sandbox.workspace_path) if archive_failed else None,
+                    retained_sandbox=retained,
                 )
                 if on_run_paused is not None:
                     on_run_paused()
                 return paused_task
 
-            if self.store.get_run(run_id)["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+            run_status = self.store.get_run(run_id)["status"]
+            if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
                 interrupted.set()
+                retain_sandbox = run_status == RunStatus.PAUSED
                 return self._return_interrupted_task(run_id, leased)
 
             # Transition lease to VERIFYING before running checks/review
@@ -1096,7 +1131,7 @@ class OrchestrateStage:
                 event_type="task.verifying",
             )
 
-            diff_text = capture_sandbox_diff(sandbox, worker_baseline)
+            diff_text = capture_sandbox_diff(sandbox, task_baseline)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
 
@@ -1114,16 +1149,18 @@ class OrchestrateStage:
                 )
                 if loop_res.stop_reason == "cancelled":
                     interrupted.set()
-                    return self._return_interrupted_task(run_id, verifying)
-                return self._pause_for_budget(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    return retain(self._return_interrupted_task(run_id, verifying))
+                return retain(
+                    self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {loop_res.stop_reason}",
+                    )
                 )
 
             gate = run_diff_gate(
                 sandbox,
-                worker_baseline,
+                task_baseline,
                 allowed_write_scope=verifying.write_scope,
                 forbidden_globs=forbidden_contracts,
             )
@@ -1158,11 +1195,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=gate.rejection_message(),
-                    checks=verifying.acceptance_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=gate.rejection_message(),
+                        checks=verifying.acceptance_checks,
+                    )
                 )
 
             if not loop_res.completed and not (
@@ -1176,11 +1215,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Worker did not complete cleanly: {loop_res.stop_reason}",
-                    checks=verifying.acceptance_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Worker did not complete cleanly: {loop_res.stop_reason}",
+                        checks=verifying.acceptance_checks,
+                    )
                 )
 
             updated_checks, cmd_failures = self._run_command_checks(
@@ -1189,6 +1230,10 @@ class OrchestrateStage:
                 sandbox=sandbox,
                 art_dir=art_dir,
             )
+            task_baseline = absorb_verification_artifacts(
+                sandbox, task_baseline, write_scope=verifying.write_scope
+            )
+            save_sandbox_baseline(sandbox, task_baseline)
             if cmd_failures:
                 _write_manifest_md(
                     art_dir=art_dir,
@@ -1198,11 +1243,13 @@ class OrchestrateStage:
                     verdict=None,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason="\n".join(cmd_failures),
-                    checks=updated_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason="\n".join(cmd_failures),
+                        checks=updated_checks,
+                    )
                 )
 
             # Run cold-start independent review if check or default policy requires it
@@ -1223,10 +1270,12 @@ class OrchestrateStage:
                     design=design,
                 )
             except BudgetExhaustedError as exc:
-                return self._pause_for_budget(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=f"Paused due to budget limit: {exc}",
+                return retain(
+                    self._pause_for_budget(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=f"Paused due to budget limit: {exc}",
+                    )
                 )
             except (_ReviewCancelled, _ReviewOutputError) as exc:
                 _write_manifest_md(
@@ -1239,9 +1288,11 @@ class OrchestrateStage:
                 )
                 if isinstance(exc, _ReviewCancelled):
                     interrupted.set()
-                    return self._return_interrupted_task(run_id, verifying)
-                return self._fail_or_requeue(
-                    run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
+                    return retain(self._return_interrupted_task(run_id, verifying))
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id, task=verifying, reason=str(exc), checks=updated_checks
+                    )
                 )
             if not verdict.passed:
                 important_lines = [
@@ -1258,11 +1309,13 @@ class OrchestrateStage:
                     verdict=verdict,
                     receipt=loop_res.receipt,
                 )
-                return self._fail_or_requeue(
-                    run_id=run_id,
-                    task=verifying,
-                    reason=err_msg,
-                    checks=updated_checks,
+                return retain(
+                    self._fail_or_requeue(
+                        run_id=run_id,
+                        task=verifying,
+                        reason=err_msg,
+                        checks=updated_checks,
+                    )
                 )
 
             verdict_path = str(art_dir / f"verdict-cycle-{verifying.review_cycle + 1}.json")
@@ -1290,11 +1343,10 @@ class OrchestrateStage:
                     reject_if_run_inactive=True,
                 )
             except ConcurrencyConflictError:
-                if self.store.get_run(run_id)["status"] in (
-                    RunStatus.PAUSED,
-                    RunStatus.CANCELLED,
-                ):
+                run_status = self.store.get_run(run_id)["status"]
+                if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
                     interrupted.set()
+                    retain_sandbox = run_status == RunStatus.PAUSED
                     return self._return_interrupted_task(run_id, verifying)
                 raise
 
@@ -1313,7 +1365,7 @@ class OrchestrateStage:
             )
             return accepted
         finally:
-            if not archive_failed:
+            if not retain_sandbox:
                 remove_sandbox(sandbox)
 
     def _fail_or_requeue(
@@ -1423,6 +1475,8 @@ class OrchestrateStage:
         while True:
             snap = self.store.get_run(run_id)
             if snap["status"] in (RunStatus.PAUSED, RunStatus.CANCELLED):
+                if snap["status"] == RunStatus.CANCELLED:
+                    remove_run_sandboxes(self.workspace_root, run_id)
                 return snap
             design: DesignSpec | None = snap.get("design")
             plan: TaskPlan | None = snap["plan"]
@@ -1514,6 +1568,8 @@ class OrchestrateStage:
                     if in_flight:
                         drain_in_flight()
                         continue
+                    if snap["status"] == RunStatus.CANCELLED:
+                        remove_run_sandboxes(self.workspace_root, run_id)
                     return snap
                 if interrupted.is_set():
                     if in_flight:
@@ -1637,6 +1693,8 @@ class OrchestrateStage:
                         )
                     except ConcurrencyConflictError:
                         continue
+                    if target_status == RunStatus.COMPLETED:
+                        remove_run_sandboxes(self.workspace_root, run_id)
                     return self.store.get_run(run_id)
 
                 if not snap["budget_ledger"].can_reserve(policy):

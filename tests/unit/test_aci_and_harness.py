@@ -14,10 +14,15 @@ from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
 from olympus.harness.worktree import (
+    absorb_verification_artifacts,
     capture_sandbox_diff,
+    collect_sandbox_changes,
     create_sandbox,
+    load_sandbox_baseline,
     remove_sandbox,
+    save_sandbox_baseline,
     snapshot_sandbox_state,
+    sync_upstream_files,
 )
 from olympus.providers.base import (
     ChatMessage,
@@ -153,6 +158,117 @@ def test_baseline_scoped_diff_only_emits_paths_mutated_since_baseline(tmp_path: 
 
         unscoped = capture_sandbox_diff(handle)
         assert "stable.py" in unscoped and "STABLE = True" in unscoped
+    finally:
+        remove_sandbox(handle)
+
+
+def _init_git_repo(root: Path) -> Path:
+    repo = (root / "repo").resolve()
+    repo.mkdir()
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+def test_build_sandbox_env_isolates_temp_dirs_outside_the_git_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-tmp")
+    expected = repo / ".olympus" / "sandbox_tmp" / "task-tmp"
+    try:
+        envs = (
+            build_sandbox_env(handle.workspace_path, host_root=repo),
+            build_sandbox_env(handle.workspace_path),
+        )
+        for env in envs:
+            for name in ("TMPDIR", "TEMP", "TMP", "SQLITE_TMPDIR"):
+                assert env[name] == str(expected)
+            assert expected.is_dir()
+            assert not expected.is_relative_to(handle.workspace_path)
+    finally:
+        remove_sandbox(handle)
+    assert not expected.exists()
+    assert not handle.workspace_path.exists()
+
+
+def test_retained_sandbox_reuses_work_and_original_baseline(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    first = create_sandbox(repo, label="task-retain")
+    assert first.reused is False
+    baseline = snapshot_sandbox_state(first)
+    save_sandbox_baseline(first, baseline)
+    (first.workspace_path / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+    (first.workspace_path / "scratch.db").write_text("stray\n", encoding="utf-8")
+    try:
+        reused = create_sandbox(repo, label="task-retain", reuse=True)
+        assert reused.reused is True
+        assert reused.workspace_path == first.workspace_path
+        assert (reused.workspace_path / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        assert load_sandbox_baseline(reused) == baseline
+        assert collect_sandbox_changes(reused, baseline) == ["feature.py", "scratch.db"]
+        remove_sandbox(reused)
+        assert not first.workspace_path.exists()
+        assert load_sandbox_baseline(first) is None
+
+        fresh = create_sandbox(repo, label="task-retain")
+        try:
+            assert fresh.reused is False
+            assert not (fresh.workspace_path / "feature.py").exists()
+        finally:
+            remove_sandbox(fresh)
+    finally:
+        if first.workspace_path.exists():
+            remove_sandbox(first)
+
+
+def test_sync_upstream_files_updates_only_synced_baseline_entries(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-sync")
+    try:
+        ws = handle.workspace_path
+        (ws / "shared.py").write_text("VALUE = 1\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "shared.py").write_text("VALUE = 2\n", encoding="utf-8")
+        (overlay / "feature.py").write_text("UPSTREAM = True\n", encoding="utf-8")
+        (overlay / "new_upstream.py").write_text("NEW = True\n", encoding="utf-8")
+
+        synced = sync_upstream_files(handle, overlay, baseline, write_scope=["feature.py"])
+
+        assert (ws / "shared.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+        assert (ws / "feature.py").read_text(encoding="utf-8") == "FLAG = True\n"
+        assert (ws / "new_upstream.py").read_text(encoding="utf-8") == "NEW = True\n"
+        assert collect_sandbox_changes(handle, synced) == ["feature.py"]
+        assert collect_sandbox_changes(handle, baseline) == [
+            "feature.py",
+            "new_upstream.py",
+            "shared.py",
+        ]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_absorb_verification_artifacts_hides_only_out_of_scope_side_effects(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    handle = create_sandbox(repo, label="task-checks")
+    try:
+        ws = handle.workspace_path
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
+        (ws / "check-ran.txt").write_text("ran\n", encoding="utf-8")
+
+        absorbed = absorb_verification_artifacts(handle, baseline, write_scope=["feature.py"])
+
+        assert collect_sandbox_changes(handle, absorbed) == ["feature.py"]
     finally:
         remove_sandbox(handle)
 

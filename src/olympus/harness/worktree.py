@@ -44,6 +44,7 @@ class SandboxBaseline:
 
     is_git: bool
     entries: tuple[tuple[str, str | None], ...]
+    base_commit: str | None = None
 
     def mapping(self) -> dict[str, str | None]:
         return dict(self.entries)
@@ -69,15 +70,20 @@ def _safe_label(label: str) -> str:
 
 
 def _open_retained_sandbox(root: Path, sandbox_dir: Path) -> SandboxHandle | None:
-    """Reopen an existing sandbox so a retried attempt keeps its in-progress work."""
     if is_git_repo(root):
         if not is_git_repo(sandbox_dir):
             return None
-        head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
-        if head_proc.returncode != 0:
-            return None
+        probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
+        saved = load_sandbox_baseline(probe)
+        if saved is not None and saved.base_commit is not None:
+            base_commit = saved.base_commit
+        else:
+            head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
+            if head_proc.returncode != 0:
+                return None
+            base_commit = head_proc.stdout.strip()
         return SandboxHandle(
-            root, sandbox_dir, head_proc.stdout.strip(), is_git_worktree=True, reused=True
+            root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
         )
     return SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
 
@@ -141,7 +147,11 @@ def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
-            {"is_git": baseline.is_git, "entries": [list(e) for e in baseline.entries]},
+            {
+                "is_git": baseline.is_git,
+                "base_commit": baseline.base_commit,
+                "entries": [list(e) for e in baseline.entries],
+            },
         ),
         encoding="utf-8",
     )
@@ -155,7 +165,13 @@ def load_sandbox_baseline(handle: SandboxHandle) -> SandboxBaseline | None:
             (str(rel), None if fingerprint is None else str(fingerprint))
             for rel, fingerprint in payload["entries"]
         )
-        return SandboxBaseline(is_git=bool(payload["is_git"]), entries=entries)
+        raw_commit = payload.get("base_commit")
+        base_commit = str(raw_commit) if isinstance(raw_commit, str) and raw_commit else None
+        return SandboxBaseline(
+            is_git=bool(payload["is_git"]),
+            entries=entries,
+            base_commit=base_commit,
+        )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 
@@ -170,12 +186,12 @@ def capture_sandbox_diff(
     files never leak into a downstream task's diff. Without a baseline the
     legacy ``HEAD`` + untracked behavior is preserved for direct callers.
     """
+    if baseline is not None:
+        return _baseline_scoped_diff(handle, baseline)
     ws = handle.workspace_path
     if not is_git_repo(ws):
         return "(non-git sandbox; inspect modified files directly)"
-    if baseline is None:
-        return _head_scoped_diff(ws)
-    return _baseline_scoped_diff(handle, baseline)
+    return _head_scoped_diff(ws)
 
 
 def _head_scoped_diff(ws: Path) -> str:
@@ -199,27 +215,58 @@ def _read_text(path: Path) -> str:
         return "<binary file>"
 
 
-def _prefixed_content(path: Path) -> str:
+def _prefixed_content(path: Path) -> tuple[str, int]:
     text = _read_text(path)
     lines = text.splitlines()
     if not lines:
-        return ""
-    return "\n".join(f"+{line}" for line in lines) + "\n"
+        return "", 0
+    return "\n".join(f"+{line}" for line in lines) + "\n", len(lines)
 
 
-def _new_file_block(ws: Path, rel: str) -> str:
+def _is_tracked_at_base(ws: Path, base_commit: str | None, rel: str) -> bool:
+    if base_commit is None or not is_git_repo(ws):
+        return False
+    return _run_git(ws, "cat-file", "-e", f"{base_commit}:{rel}").returncode == 0
+
+
+def _no_index_new_file_diff(ws: Path, rel: str) -> str:
+    proc = _run_git(
+        ws,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-index",
+        "--",
+        "/dev/null",
+        rel,
+    )
+    if proc.returncode in (0, 1) and proc.stdout.strip():
+        lines = proc.stdout.rstrip().splitlines()
+        if lines and lines[0].startswith("diff --git "):
+            lines[0] = f"diff --git a/{rel} b/{rel}"
+        return "\n".join(lines)
+    body, count = _prefixed_content(ws / rel)
+    hunk = f"@@ -0,0 +1,{count} @@\n{body}" if count else ""
     return (
         f"diff --git a/{rel} b/{rel}\n"
         "new file mode 100644\n"
         f"--- /dev/null\n+++ b/{rel}\n"
-        f"{_prefixed_content(ws / rel)}"
-    )
+        f"{hunk}"
+    ).rstrip()
 
 
-def _deleted_file_block(ws: Path, rel: str) -> str:
-    tracked = _run_git(ws, "diff", "HEAD", "--", rel).stdout.rstrip()
-    if tracked:
-        return tracked
+def _new_file_block(ws: Path, rel: str) -> str:
+    return _no_index_new_file_diff(ws, rel)
+
+
+def _deleted_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
+    if base_commit is not None and is_git_repo(ws):
+        tracked = _run_git(
+            ws, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", rel
+        ).stdout.rstrip()
+        if tracked:
+            return tracked
     return (
         f"diff --git a/{rel} b/{rel}\n"
         "deleted file mode 100644\n"
@@ -227,22 +274,31 @@ def _deleted_file_block(ws: Path, rel: str) -> str:
     )
 
 
-def _modified_file_block(ws: Path, rel: str) -> str:
-    tracked = _run_git(ws, "ls-files", "--error-unmatch", "--", rel)
-    if tracked.returncode == 0:
-        return _run_git(ws, "diff", "HEAD", "--", rel).stdout.rstrip()
-    # Baseline-only (overlay) file: no recorded baseline content, so show the full
-    # current file as added lines rather than dropping the mutation from review.
+def _overlay_file_block(ws: Path, rel: str) -> str:
+    body, count = _prefixed_content(ws / rel)
+    hunk = f"@@ -0,0 +1,{count} @@\n{body}" if count else ""
     return (
         f"diff --git a/{rel} b/{rel}\n"
         f"--- a/{rel}\n+++ b/{rel}\n"
-        f"{_prefixed_content(ws / rel)}"
-    )
+        f"{hunk}"
+    ).rstrip()
+
+
+def _modified_file_block(ws: Path, rel: str, base_commit: str | None) -> str:
+    if _is_tracked_at_base(ws, base_commit, rel):
+        assert base_commit is not None
+        diff_out = _run_git(
+            ws, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", rel
+        ).stdout.rstrip()
+        if diff_out:
+            return diff_out
+    return _overlay_file_block(ws, rel)
 
 
 def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> str:
     ws = handle.workspace_path
     before = baseline.mapping()
+    base_commit = baseline.base_commit or handle.base_commit
     changed = collect_sandbox_changes(handle, baseline)
     if not changed:
         return "(no changes)"
@@ -251,13 +307,21 @@ def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> s
         candidate = ws / rel
         return candidate.is_file() or candidate.is_symlink()
 
-    added = {rel for rel in changed if rel not in before and present(rel)}
-    deleted = {rel for rel in changed if rel in before and not present(rel)}
+    added = {
+        rel
+        for rel in changed
+        if rel not in before and not _is_tracked_at_base(ws, base_commit, rel) and present(rel)
+    }
+    deleted = {
+        rel
+        for rel in changed
+        if (rel in before or _is_tracked_at_base(ws, base_commit, rel)) and not present(rel)
+    }
     modified = set(changed) - added - deleted
 
     renames: dict[str, str] = {}
     for old in sorted(deleted):
-        fingerprint = before[old]
+        fingerprint = before.get(old)
         if fingerprint is None:
             continue
         match = next(
@@ -282,9 +346,9 @@ def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> s
         elif rel in added:
             blocks.append(_new_file_block(ws, rel))
         elif rel in deleted:
-            blocks.append(_deleted_file_block(ws, rel))
+            blocks.append(_deleted_file_block(ws, rel, base_commit))
         elif rel in modified:
-            blocks.append(_modified_file_block(ws, rel))
+            blocks.append(_modified_file_block(ws, rel, base_commit))
     return "\n\n".join(blocks) if blocks else "(no changes)"
 
 
@@ -293,7 +357,7 @@ def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
     patch = attempt_dir / "diff.patch"
     if handle.base_commit is None:
         patch.write_text("Non-git workspace preserved in sandbox/\n", encoding="utf-8")
-        shutil.move(handle.workspace_path, attempt_dir / "sandbox")
+        shutil.copytree(handle.workspace_path, attempt_dir / "sandbox", dirs_exist_ok=True)
         return
 
     ws = handle.workspace_path
@@ -402,17 +466,29 @@ def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
         except RuntimeError:
             entries = _workspace_fingerprints(ws)
             return SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
-        return SandboxBaseline(is_git=True, entries=tuple(sorted(entries.items())))
+        return SandboxBaseline(
+            is_git=True,
+            entries=tuple(sorted(entries.items())),
+            base_commit=handle.base_commit,
+        )
     return SandboxBaseline(
         is_git=False, entries=tuple(sorted(_workspace_fingerprints(ws).items()))
     )
 
 
-def _current_fingerprints(handle: SandboxHandle) -> dict[str, str | None]:
+def _current_fingerprints(
+    handle: SandboxHandle, baseline: SandboxBaseline | None = None
+) -> dict[str, str | None]:
     ws = handle.workspace_path
-    if handle.is_git_worktree and handle.base_commit is not None and is_git_repo(ws):
+    use_git = baseline.is_git if baseline is not None else handle.is_git_worktree
+    base_commit = (
+        baseline.base_commit
+        if baseline is not None and baseline.base_commit is not None
+        else handle.base_commit
+    )
+    if use_git and base_commit is not None and is_git_repo(ws):
         try:
-            return _git_changed_fingerprints(ws, handle.base_commit)
+            return _git_changed_fingerprints(ws, base_commit)
         except RuntimeError:
             # A tampered sandbox (e.g. deleted .git) fails closed: every file looks changed.
             return _workspace_fingerprints(ws)
@@ -421,7 +497,7 @@ def _current_fingerprints(handle: SandboxHandle) -> dict[str, str | None]:
 
 def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
     """Return repo-relative paths mutated since ``baseline`` (adds, edits, deletes, renames)."""
-    current = _current_fingerprints(handle)
+    current = _current_fingerprints(handle, baseline)
     before = baseline.mapping()
     changed = {
         rel
@@ -449,7 +525,10 @@ def sync_upstream_files(
         return baseline
     policy = WorkspacePolicy(allowed_write_scope=list(write_scope))
     merged = baseline.mapping()
+    current_map = _current_fingerprints(handle, baseline)
+    base_commit = baseline.base_commit or handle.base_commit
     ws = handle.workspace_path
+    synced_rels: list[str] = []
     for src in sorted(overlay_dir.rglob("*")):
         if not src.is_file():
             continue
@@ -461,17 +540,32 @@ def sync_upstream_files(
             continue
         if policy.allows_relative_path(rel):
             continue
+        if rel in current_map and current_map[rel] != merged.get(rel):
+            continue
+        if rel in merged and rel not in current_map:
+            continue
         current = _file_fingerprint(ws / rel)
         if rel in merged:
             if current != merged[rel]:
                 continue
-        elif current is not None:
+        elif (current is not None) != _is_tracked_at_base(ws, base_commit, rel):
             continue
         dst = ws / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
-        merged[rel] = _file_fingerprint(dst)
-    return SandboxBaseline(is_git=baseline.is_git, entries=tuple(sorted(merged.items())))
+        synced_rels.append(rel)
+    if synced_rels:
+        updated_map = _current_fingerprints(handle, baseline)
+        for rel in synced_rels:
+            if rel in updated_map:
+                merged[rel] = updated_map[rel]
+            else:
+                merged.pop(rel, None)
+    return SandboxBaseline(
+        is_git=baseline.is_git,
+        entries=tuple(sorted(merged.items())),
+        base_commit=baseline.base_commit,
+    )
 
 
 def absorb_verification_artifacts(
@@ -480,24 +574,28 @@ def absorb_verification_artifacts(
     *,
     write_scope: Sequence[str],
 ) -> SandboxBaseline:
-    """Fold out-of-scope check-command side effects into the retained baseline.
+    """Fold newly created untracked out-of-scope check-command side effects into the baseline.
 
-    Command checks run only after the Diff Gate certified every worker mutation, so any
-    out-of-scope path they add, touch, or delete is verification tooling output rather
-    than a deliverable. Absorbing it keeps the retried attempt from being rejected for
-    artifacts produced by our own checks; in-scope work remains diffed as before.
+    Tracked or pre-existing baseline files modified or deleted by a check command are never
+    absorbed so tampered inputs remain visible to the Diff Gate on retry.
     """
     policy = WorkspacePolicy(allowed_write_scope=list(write_scope))
-    current = _current_fingerprints(handle)
+    current = _current_fingerprints(handle, baseline)
     merged = baseline.mapping()
-    for rel in [
-        rel for rel in merged if rel not in current and not policy.allows_relative_path(rel)
-    ]:
-        del merged[rel]
+    base_commit = baseline.base_commit or handle.base_commit
+    ws = handle.workspace_path
     for rel, fingerprint in current.items():
-        if not policy.allows_relative_path(rel):
+        if policy.allows_relative_path(rel):
+            continue
+        if rel in merged or _is_tracked_at_base(ws, base_commit, rel):
+            continue
+        if fingerprint is not None:
             merged[rel] = fingerprint
-    return SandboxBaseline(is_git=baseline.is_git, entries=tuple(sorted(merged.items())))
+    return SandboxBaseline(
+        is_git=baseline.is_git,
+        entries=tuple(sorted(merged.items())),
+        base_commit=baseline.base_commit,
+    )
 
 
 def remove_sandbox(handle: SandboxHandle) -> None:

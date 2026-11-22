@@ -424,9 +424,15 @@ export interface components {
         };
         /** BudgetSummary */
         BudgetSummary: {
-            /** Cache Read Tokens */
+            /**
+             * Cache Read Tokens
+             * @default 0
+             */
             cache_read_tokens: number;
-            /** Cache Write Tokens */
+            /**
+             * Cache Write Tokens
+             * @default 0
+             */
             cache_write_tokens: number;
             /** Calls Reserved */
             calls_reserved: number;

@@ -533,3 +533,118 @@ def test_default_config_disables_periodic_polling_and_validates_fields() -> None
         WatchdogConfig(compaction_threshold=0)
     with pytest.raises(ValueError):
         WatchdogConfig(error_backoff_seconds=10, max_error_backoff_seconds=5)
+
+
+def test_scope_violation_snapshot_prioritizes_newly_added_paths(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    checked = [Event(), Event()]
+    snapshots: list[list[str]] = []
+
+    class _ManyViolationsDriver:
+        name = "many-violations"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            raise AssertionError(reason)
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            on_handle(self)
+            _write_feature(request)
+            ws = request.workspace_path
+            files = [ws / f"a{idx:02d}.db" for idx in range(24)]
+            for path in files:
+                path.touch()
+            on_event(
+                "agent.tool_finished",
+                {"tool": "bash", "step": 1, "status": "ok", "error_signature": ""},
+            )
+            assert checked[0].wait(3)
+            new_file = ws / "z-new.db"
+            new_file.touch()
+            on_event(
+                "agent.tool_finished",
+                {"tool": "bash", "step": 2, "status": "ok", "error_signature": ""},
+            )
+            assert checked[1].wait(3)
+            for path in [*files, new_file]:
+                path.unlink()
+            return TurnOutcome(True, "final_response", "done", 2)
+
+    def responder(messages: Any, tools: Any) -> LLMResponse:
+        del tools
+        snapshots.append(json.loads(messages[-1].content)["violating_paths"])
+        return LLMResponse(content='{"verdict":"HEALTHY","summary":"Inspecting."}')
+
+    stage = _stage(store, tmp_path, _ManyViolationsDriver(), MockLLMProvider(responder=responder))
+    stage.on_driver_event = lambda kind, _payload: (
+        checked[0 if not checked[0].is_set() else 1].set() if kind == "watchdog.checked" else None
+    )
+    end = stage.run_execution(run_id=run_id)
+    assert end["status"] == RunStatus.COMPLETED
+    assert len(snapshots) == 2
+    assert "z-new.db" in snapshots[1]
+
+
+def test_budget_exhausted_watchdog_emits_single_error_without_spam(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.db")
+    run_id = store.create_run(
+        title="wd-budget",
+        mode=RunMode.SIMULATION,
+        budget_policy=BudgetPolicy(max_llm_calls=1),
+    )
+    store.reserve_llm_call(run_id, actor="worker", purpose="exhaust")
+    store.settle_llm_call(run_id, actor="worker", input_tokens=1, output_tokens=1)
+
+    clock = {"now": 0.0}
+    errors: list[str] = []
+    first_error = Event()
+    ticks = 0
+    enough_ticks = Event()
+
+    def wait(condition: Any, timeout: float) -> None:
+        nonlocal ticks
+        del condition
+        clock["now"] += max(0.0, timeout)
+        ticks += 1
+        if ticks >= 4:
+            enough_ticks.set()
+
+    def emit(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "watchdog.error":
+            errors.append(str(payload.get("error")))
+            first_error.set()
+
+    watchdog = Watchdog(
+        config=WatchdogConfig(
+            silence_seconds=1,
+            error_backoff_seconds=1,
+            max_error_backoff_seconds=2,
+            clock=lambda: clock["now"],
+            wait=wait,
+        ),
+        provider_factory=lambda: MockLLMProvider(),
+        sandbox=SandboxHandle(tmp_path, tmp_path, None, False),
+        objective="Keep going",
+        write_scope=["feature.py"],
+        emit=emit,
+        store=store,
+        run_id=run_id,
+    )
+    watchdog.start(_Handle())
+    try:
+        assert first_error.wait(3)
+        assert enough_ticks.wait(3)
+    finally:
+        watchdog.stop()
+    assert errors == ["BudgetExhausted"]

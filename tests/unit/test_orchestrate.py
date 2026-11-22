@@ -3178,5 +3178,272 @@ def test_serial_execution_stays_sequential_and_keeps_handoff_context(tmp_path: P
     assert any(event.payload.get("serial_execution") is True for event in status_events)
 
 
+def test_retained_sandbox_diff_gate_blocks_worker_committed_out_of_scope_file(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+
+    def worker(attempt: int, ws: Path, prompt: str) -> None:
+        del prompt
+        if attempt == 1:
+            (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+            (ws / "out-of-scope.txt").write_text("leaked\n", encoding="utf-8")
+            subprocess.run(["git", "add", "out-of-scope.txt"], cwd=ws, check=True)
+            subprocess.run(["git", "commit", "-m", "commit leak"], cwd=ws, check=True)
+        else:
+            assert (ws / "out-of-scope.txt").is_file()
+
+    snap = _retained_stage(store, tmp_path, _AttemptWorker([worker])).run_execution(run_id=run_id)
+    rejections = [
+        (event.payload["attempt"], event.payload["violating_paths"])
+        for event in _gate_rejections(store, run_id)
+    ]
+    assert rejections == [(1, ["out-of-scope.txt"]), (2, ["out-of-scope.txt"])]
+    assert snap["plan"].tasks[0].status == TaskStatus.BLOCKED
+
+
+def test_continuous_dispatch_waits_for_upstream_overlay_publish_before_starting_dependent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import olympus.stages.orchestrate as orch_module
+
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    files = {"T1": "t1.txt", "T2": "t2.txt", "T3": "t3.txt"}
+    plan = _parallel_plan(store.get_run(run_id)["spec"], scopes={k: [v] for k, v in files.items()})
+    plan = plan.model_copy(
+        update={
+            "tasks": [
+                *plan.tasks[:2],
+                plan.tasks[2].model_copy(update={"depends_on": ["T1"]}),
+            ]
+        }
+    )
+    _approve_plan(store, run_id, plan)
+    observations: list[bool] = []
+
+    class _ObserveDriver(_GatedDriver):
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            if request.task_id == "T3":
+                observations.append((request.workspace_path / "t1.txt").exists())
+            return super().run_turn(request, on_event=on_event, on_handle=on_handle)
+
+    driver = _ObserveDriver(files)
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="gated"),
+        driver_registry=DriverRegistry({"gated": driver}),
+    )
+    original_copy = orch_module._copy_matching_scope
+    before_publish, allow_publish = Event(), Event()
+
+    def gated_copy(src: Path, dst: Path, write_scope: list[str] | None) -> None:
+        if write_scope == ["t1.txt"] and dst.name == "accepted_overlay":
+            before_publish.set()
+            assert allow_publish.wait(10)
+        original_copy(src, dst, write_scope=write_scope)
+
+    monkeypatch.setattr(orch_module, "_copy_matching_scope", gated_copy)
+    thread, results, errors = _start_stage(stage, run_id)
+    try:
+        assert driver.started["T1"].wait(5) and driver.started["T2"].wait(5)
+        driver.release["T1"].set()
+        assert before_publish.wait(5)
+        driver.release["T2"].set()
+        driver.release["T3"].set()
+        assert not driver.started["T3"].wait(0.3), "T3 started before T1 overlay publish finished"
+        allow_publish.set()
+        assert driver.started["T3"].wait(5)
+    finally:
+        allow_publish.set()
+        for event in driver.release.values():
+            event.set()
+        thread.join(10)
+
+    assert not thread.is_alive() and not errors
+    assert results[0]["status"] == RunStatus.COMPLETED
+    assert observations == [True]
+
+
+def test_watchdog_pause_cancels_late_registering_peer_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(
+        tmp_path, budget_policy=BudgetPolicy(max_concurrent_tasks=2)
+    )
+    plan = _parallel_plan(
+        store.get_run(run_id)["spec"], scopes={"T1": ["one.txt"], "T2": ["two.txt"]}
+    )
+    _approve_plan(store, run_id, plan)
+    peer_entered, pause_processed = Event(), Event()
+    peer_cancelled, source_cancelled = Event(), Event()
+
+    class _Handle:
+        supports_steer = False
+
+        def __init__(self, event: Event) -> None:
+            self._event = event
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            self._event.set()
+
+    class _PeerDriver:
+        name = "late-peer"
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            if request.task_id == "T1":
+                on_handle(_Handle(source_cancelled))
+                assert peer_entered.wait(5)
+                for step in range(3):
+                    on_event(
+                        "agent.tool_finished",
+                        {"step": step, "tool": "write", "status": "error", "error_signature": "r"},
+                    )
+                assert source_cancelled.wait(5)
+                return TurnOutcome(False, "cancelled", "", 1)
+            peer_entered.set()
+            assert pause_processed.wait(5)
+            on_handle(_Handle(peer_cancelled))
+            assert peer_cancelled.wait(2)
+            return TurnOutcome(False, "cancelled", "", 1)
+
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Blocked."})
+                )
+            ]
+        ),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="late-peer"),
+        driver_registry=DriverRegistry({"late-peer": _PeerDriver()}),
+    )
+    orig_exec = stage._execute_single_task
+
+    def coordinated_exec(**kwargs: Any) -> Any:
+        result = orig_exec(**kwargs)
+        if kwargs["task_id"] == "T1":
+            pause_processed.set()
+        return result
+
+    monkeypatch.setattr(stage, "_execute_single_task", coordinated_exec)
+    snap = stage.run_execution(run_id=run_id)
+    assert snap["status"] == RunStatus.PAUSED
+    assert peer_cancelled.is_set()
+
+
+def test_nongit_watchdog_pause_preserves_retained_sandbox_for_retry(tmp_path: Path) -> None:
+    store, run_id = _confirmed_run(tmp_path)
+    _approve_plan(
+        store,
+        run_id,
+        _single_task_plan(
+            spec=store.get_run(run_id)["spec"],
+            write_scope=["feature.py"],
+            max_cycles=2,
+            checks=[_marker_command_check()],
+        ),
+    )
+    cancelled = Event()
+    seen_prior: list[bool] = []
+
+    class _NonGitDriver:
+        name = "nongit"
+        supports_steer = False
+
+        def steer(self, guidance: str, *, source: str) -> bool:
+            del guidance, source
+            return False
+
+        def cancel(self, *, reason: str) -> None:
+            del reason
+            cancelled.set()
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: Any = None,
+            on_handle: Any = None,
+        ) -> TurnOutcome:
+            ws = request.workspace_path
+            on_handle(self)
+            seen_prior.append((ws / "feature.py").exists())
+            if len(seen_prior) == 1:
+                (ws / "feature.py").write_text("FLAG = 1\n", encoding="utf-8")
+                for step in range(3):
+                    on_event(
+                        "agent.tool_finished",
+                        {"step": step, "tool": "write", "status": "error", "error_signature": "e"},
+                    )
+                assert cancelled.wait(3)
+                return TurnOutcome(False, "cancelled", "", 1)
+            return TurnOutcome(True, "final_response", "done", 1)
+
+    stage = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=_passing_reviewer),
+        monitor_provider=MockLLMProvider(
+            responses=[
+                LLMResponse(
+                    content=json.dumps({"verdict": "BLOCKED_EXTERNAL", "summary": "Blocked."})
+                )
+            ]
+        ),
+        workspace_root=tmp_path,
+        execution_drivers=ExecutionDriversConfig(worker_driver="nongit"),
+        driver_registry=DriverRegistry({"nongit": _NonGitDriver()}),
+    )
+    paused = stage.run_execution(run_id=run_id)
+    assert paused["status"] == RunStatus.PAUSED
+    stage.retry_blocked_task(
+        operation_id="retry-nongit",
+        run_id=run_id,
+        task_id="T1",
+        expected_state_revision=paused["state_revision"],
+    )
+    store.set_run_status(run_id, RunStatus.RUNNING, actor="zeus")
+    finished = stage.run_execution(run_id=run_id)
+    assert finished["status"] == RunStatus.COMPLETED
+    assert seen_prior == [False, True]
+
+
+
 
 

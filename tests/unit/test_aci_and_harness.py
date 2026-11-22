@@ -259,16 +259,84 @@ def test_absorb_verification_artifacts_hides_only_out_of_scope_side_effects(
     tmp_path: Path,
 ) -> None:
     repo = _init_git_repo(tmp_path)
+    (repo / "contract.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "contract.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add contract"], cwd=repo, check=True)
     handle = create_sandbox(repo, label="task-checks")
     try:
         ws = handle.workspace_path
         baseline = snapshot_sandbox_state(handle)
         (ws / "feature.py").write_text("FLAG = True\n", encoding="utf-8")
         (ws / "check-ran.txt").write_text("ran\n", encoding="utf-8")
+        (ws / "contract.txt").write_text("", encoding="utf-8")
 
         absorbed = absorb_verification_artifacts(handle, baseline, write_scope=["feature.py"])
 
-        assert collect_sandbox_changes(handle, absorbed) == ["feature.py"]
+        assert collect_sandbox_changes(handle, absorbed) == ["contract.txt", "feature.py"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_sync_upstream_files_never_overwrites_worker_deletion_of_tracked_file(
+    tmp_path: Path,
+) -> None:
+    repo = _init_git_repo(tmp_path)
+    (repo / "upstream.txt").write_text("original\n", encoding="utf-8")
+    subprocess.run(["git", "add", "upstream.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add upstream"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="task-del")
+    try:
+        ws = handle.workspace_path
+        baseline = snapshot_sandbox_state(handle)
+        save_sandbox_baseline(handle, baseline)
+        (ws / "upstream.txt").unlink()
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "upstream.txt").write_text("accepted later\n", encoding="utf-8")
+
+        reopened = create_sandbox(repo, label="task-del", reuse=True)
+        loaded = load_sandbox_baseline(reopened)
+        assert loaded is not None
+        synced = sync_upstream_files(reopened, overlay, loaded, write_scope=["feature.py"])
+
+        assert not (ws / "upstream.txt").exists()
+        assert collect_sandbox_changes(reopened, synced) == ["upstream.txt"]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_capture_sandbox_diff_handles_nongit_binary_and_reverted_overlay(
+    tmp_path: Path,
+) -> None:
+    nongit_root = tmp_path / "plain"
+    nongit_root.mkdir()
+    nongit_handle = create_sandbox(nongit_root, label="plain-diff")
+    try:
+        nongit_baseline = snapshot_sandbox_state(nongit_handle)
+        (nongit_handle.workspace_path / "feature.txt").write_text("hello\n", encoding="utf-8")
+        nongit_diff = capture_sandbox_diff(nongit_handle, nongit_baseline)
+        assert "feature.txt" in nongit_diff
+        assert "+hello" in nongit_diff
+    finally:
+        remove_sandbox(nongit_handle)
+
+    repo = _init_git_repo(tmp_path)
+    (repo / "tracked.txt").write_text("HEAD\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="git-diff-edge")
+    try:
+        ws = handle.workspace_path
+        (ws / "tracked.txt").write_text("accepted overlay\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+        (ws / "tracked.txt").write_text("HEAD\n", encoding="utf-8")
+        (ws / "binary.dat").write_bytes(b"\x00\xff\x01")
+        (ws / "added.txt").write_text("hello\n", encoding="utf-8")
+
+        diff = capture_sandbox_diff(handle, baseline)
+        assert "tracked.txt" in diff
+        assert "GIT binary patch" in diff
+        assert "@@ -0,0 +1 @@" in diff
     finally:
         remove_sandbox(handle)
 

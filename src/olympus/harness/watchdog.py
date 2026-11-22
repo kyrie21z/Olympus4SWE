@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import StringConstraints, field_validator
 
 from olympus.core.contracts import StrictModel
+from olympus.harness.diff_gate import evaluate_sandbox_changes
 from olympus.harness.driver import ActiveTurnHandle, DriverEvent
 from olympus.harness.loop import parse_model_json
 from olympus.harness.worktree import (
@@ -23,7 +24,6 @@ from olympus.harness.worktree import (
     collect_sandbox_changes,
 )
 from olympus.providers.types import ChatMessage, LLMProvider
-from olympus.tools.aci import WorkspacePolicy
 
 if TYPE_CHECKING:
     from olympus.core.store import RunStore
@@ -50,7 +50,7 @@ _MAX_BACKOFF_EXPONENT = 16
 
 
 class _BudgetUnavailable(Exception):
-    """Raised when RunStore refuses to reserve one watchdog L2 call."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -133,19 +133,14 @@ class Watchdog:
         self._store = store
         self._run_id = run_id
         self._baseline = baseline
-        self._policy = (
-            WorkspacePolicy(
-                allowed_write_scope=write_scope,
-                forbidden_write_scope=tuple(forbidden_globs or ()),
-            )
-            if baseline is not None
-            else None
-        )
+        self._allowed_write_scope = tuple(write_scope)
+        self._forbidden_globs = tuple(forbidden_globs or ())
         self._condition = Condition()
         self._tail: deque[dict[str, Any]] = deque(maxlen=12)
         self._thread: Thread | None = None
         self._stopped = False
         self._repeat_due = False
+        self._scope_check_pending = False
         self._scope_due = False
         self._compaction_due = False
         self._pending_violations: tuple[str, ...] = ()
@@ -165,12 +160,6 @@ class Watchdog:
 
     def observe(self, kind: str, fields: dict[str, Any]) -> None:
         """Receive fields already filtered by the live milestone privacy boundary."""
-        scope_check = (
-            self._policy is not None
-            and kind == "agent.tool_finished"
-            and fields.get("tool") in _WRITE_TOOLS
-        )
-        violations = self._scope_violations() if scope_check else []
         with self._condition:
             if self._stopped:
                 return
@@ -183,17 +172,13 @@ class Watchdog:
                 if signature and self._repeat_count >= self._config.repeat_error_threshold:
                     self._repeat_due = True
                     self._repeat_count = 0
+                if self._baseline is not None and fields.get("tool") in _WRITE_TOOLS:
+                    self._scope_check_pending = True
             elif kind == "agent.compaction" and fields.get("phase") == "end":
                 self._compaction_count += 1
                 if self._compaction_count >= self._config.compaction_threshold:
                     self._compaction_count = 0
                     self._compaction_due = True
-            if scope_check:
-                new_violations = set(violations) - self._reported_violations
-                self._reported_violations = set(violations)
-                if new_violations:
-                    self._scope_due = True
-                    self._pending_violations = tuple(violations[:_MAX_SCOPE_PATHS])
             self._condition.notify()
 
     def stop(self) -> None:
@@ -203,25 +188,25 @@ class Watchdog:
         if self._thread is not None:
             self._thread.join(timeout=self._config.stop_join_timeout_seconds)
 
-    def _scope_violations(self) -> list[str]:
-        if self._baseline is None or self._policy is None:
+    def _best_effort_scope_violations(self) -> list[str] | None:
+        if self._baseline is None:
             return []
         try:
             changed = collect_sandbox_changes(self._sandbox, self._baseline)
         except (OSError, RuntimeError):
-            # L1 checks are best-effort; a transient git failure stays zero-token and silent.
-            return []
-        return [
-            path
-            for path in changed
-            if self._policy.forbidden_match(path) is not None
-            or not self._policy.allows_relative_path(path)
-        ]
+            return None
+        gate = evaluate_sandbox_changes(
+            changed,
+            allowed_write_scope=self._allowed_write_scope,
+            forbidden_globs=self._forbidden_globs,
+        )
+        return [violation.path for violation in gate.violations]
 
     def _monitor(self, handle: ActiveTurnHandle) -> None:
         provider: LLMProvider | None = None
         unhealthy = steers = failures = 0
         retry_not_before = 0.0
+        budget_exhausted = False
         config = self._config
         periodic_at = (
             self._started_at + config.interval_seconds
@@ -230,9 +215,32 @@ class Watchdog:
         )
         silence_after = self._started_at
         while True:
+            run_scope_scan = False
             with self._condition:
                 if self._stopped:
                     return
+                if self._scope_check_pending:
+                    self._scope_check_pending = False
+                    run_scope_scan = True
+            if run_scope_scan:
+                violations = self._best_effort_scope_violations()
+                if violations is not None:
+                    with self._condition:
+                        if self._stopped:
+                            return
+                        new_violations = set(violations) - self._reported_violations
+                        old_violations = set(violations) - new_violations
+                        self._reported_violations = set(violations)
+                        if new_violations:
+                            prioritized = [*sorted(new_violations), *sorted(old_violations)]
+                            self._scope_due = True
+                            self._pending_violations = tuple(prioritized[:_MAX_SCOPE_PATHS])
+
+            with self._condition:
+                if self._stopped:
+                    return
+                if self._scope_check_pending:
+                    continue
                 now = config.clock()
                 silence_at = max(self._last_milestone, silence_after) + config.silence_seconds
                 periodic_due = now >= periodic_at
@@ -249,8 +257,11 @@ class Watchdog:
                     trigger = "interval"
                 else:
                     trigger = None
-                if trigger is None:
-                    config.wait(self._condition, min(silence_at, periodic_at) - now)
+                if trigger is None or budget_exhausted:
+                    if budget_exhausted:
+                        config.wait(self._condition, config.silence_seconds)
+                    else:
+                        config.wait(self._condition, min(silence_at, periodic_at) - now)
                     continue
                 if now < retry_not_before:
                     config.wait(self._condition, retry_not_before - now)
@@ -276,6 +287,13 @@ class Watchdog:
                 if provider is None:
                     provider = self._provider_factory()
                 verdict = self._evaluate(provider, tail, violating_paths=violating_paths)
+            except _BudgetUnavailable:
+                budget_exhausted = True
+                with self._condition:
+                    if self._stopped:
+                        return
+                self._emit("watchdog.error", {"error": "BudgetExhausted", "trigger": trigger})
+                continue
             except Exception as exc:  # noqa: BLE001 - isolate the optional evaluator
                 failures += 1
                 backoff = min(
@@ -286,12 +304,7 @@ class Watchdog:
                 with self._condition:
                     if self._stopped:
                         return
-                error = (
-                    "BudgetExhausted"
-                    if isinstance(exc, _BudgetUnavailable)
-                    else type(exc).__name__
-                )
-                self._emit("watchdog.error", {"error": error, "trigger": trigger})
+                self._emit("watchdog.error", {"error": type(exc).__name__, "trigger": trigger})
                 continue
             else:
                 failures = 0

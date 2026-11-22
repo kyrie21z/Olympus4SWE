@@ -1059,3 +1059,41 @@ def test_pi_driver_enforces_budget_and_max_steps_with_honest_ledger(tmp_path: Pa
     assert not any(
         "usage.settle_error" in line for line in trace_path.read_text(encoding="utf-8").splitlines()
     )
+
+
+def test_pi_driver_trace_omits_message_start_turn_end_and_success_responses(
+    tmp_path: Path,
+) -> None:
+    fake = _write_fake_pi(tmp_path, rpc=True)
+    trace_path = tmp_path / "compact.jsonl"
+    deltas: list[str] = []
+    outcome = PiDriver(binary=str(fake)).run_turn(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="test",
+            trace_path=trace_path,
+        ),
+        on_event=lambda kind, payload: (
+            deltas.append(str(payload.get("text", ""))) if kind == "text_delta" else None
+        ),
+    )
+    assert outcome.completed
+    assert deltas
+    raw_records = [
+        entry["record"]
+        for entry in _read_jsonl(trace_path)
+        if entry.get("source") == "pi" and isinstance(entry.get("record"), dict)
+    ]
+    types = {record.get("type") for record in raw_records}
+    assert "message_update" not in types
+    assert "message_start" not in types
+    assert "turn_end" not in types
+    assert not any(
+        record.get("type") == "response" and record.get("success") is True
+        for record in raw_records
+    )
+    assert "message_end" in types
+

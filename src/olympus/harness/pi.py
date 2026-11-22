@@ -36,6 +36,24 @@ _READ_ONLY_TOOLS = "read,grep,find,ls"
 _FORBIDDEN_WRITE_TOOLS = "bash,write,edit,powershell"
 _HELP_PROBE_TIMEOUT_SECONDS = 10.0
 _SCOPE_GUARD_PATH = Path(__file__).with_name("pi_scope_guard.ts")
+_TRACE_MILESTONE_TYPES = frozenset(
+    {
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_end",
+        "compaction_start",
+        "compaction_end",
+        "agent_settled",
+        "extension_error",
+    }
+)
+
+
+def _is_trace_milestone(record: dict[str, Any]) -> bool:
+    record_type = record.get("type")
+    if record_type in _TRACE_MILESTONE_TYPES:
+        return True
+    return record_type == "response" and not bool(record.get("success"))
 
 
 class PiNotAvailableError(RuntimeError):
@@ -540,8 +558,7 @@ class _PiTurn:
                         continue
                     if not isinstance(record, dict):
                         continue
-                    if record.get("type") != "message_update":
-                        # Token deltas stay in LiveActivity; the trace keeps milestones only.
+                    if _is_trace_milestone(record):
                         self._trace.append({"source": "pi", "record": record})
                     self._handle_record(record)
         except (OSError, ValueError) as exc:

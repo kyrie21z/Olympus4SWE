@@ -220,7 +220,6 @@ _INLINE_DIFF_BUDGET = 48_000
 
 
 def _diff_file_blocks(diff_text: str) -> list[str]:
-    """Split a captured diff into per-file blocks, honoring git headers first."""
     if diff_text.startswith("diff --git "):
         blocks: list[str] = []
         current: list[str] = []
@@ -269,13 +268,22 @@ def _diff_summary_lines(diff_text: str) -> list[str]:
 def _bounded_inline_diff(
     diff_text: str, *, budget: int = _INLINE_DIFF_BUDGET
 ) -> tuple[str, bool]:
-    """Return the inline diff capped at ``budget`` characters plus a truncation flag."""
     if len(diff_text) <= budget:
         return diff_text, False
     cut = diff_text.rfind("\n", 0, budget)
     if cut <= 0:
         cut = budget
     return diff_text[:cut].rstrip(), True
+
+
+def _reopen_or_recreate_sandbox(
+    workspace_root: Path, *, label: str, reuse: bool
+) -> SandboxHandle:
+    sandbox = create_sandbox(workspace_root, label=label, reuse=reuse)
+    if sandbox.reused and load_sandbox_baseline(sandbox) is None:
+        remove_sandbox(sandbox)
+        return create_sandbox(workspace_root, label=label)
+    return sandbox
 
 
 def _write_manifest_md(
@@ -959,11 +967,9 @@ class OrchestrateStage:
         art_dir.mkdir(parents=True, exist_ok=True)
         overlay_dir = self._run_dir(run_id) / "accepted_overlay"
         label = f"{run_id}-{leased.task_id}"
-        sandbox = create_sandbox(self.workspace_root, label=label, reuse=leased.attempt > 1)
-        if sandbox.reused and load_sandbox_baseline(sandbox) is None:
-            # A retained workspace without its Attempt-1 baseline cannot be audited safely.
-            remove_sandbox(sandbox)
-            sandbox = create_sandbox(self.workspace_root, label=label)
+        sandbox = _reopen_or_recreate_sandbox(
+            self.workspace_root, label=label, reuse=leased.attempt > 1
+        )
 
         retain_sandbox = False
 
@@ -1522,17 +1528,24 @@ class OrchestrateStage:
 
         wave_lock = Lock()
         wave_handles: set[ActiveTurnHandle] = set()
+        wave_paused = False
 
         def register_wave_handle(handle: ActiveTurnHandle) -> None:
             with wave_lock:
-                wave_handles.add(handle)
+                already_paused = wave_paused
+                if not already_paused:
+                    wave_handles.add(handle)
+            if already_paused:
+                handle.cancel(reason="run_paused")
 
         def unregister_wave_handle(handle: ActiveTurnHandle) -> None:
             with wave_lock:
                 wave_handles.discard(handle)
 
         def cancel_wave_peers() -> None:
+            nonlocal wave_paused
             with wave_lock:
+                wave_paused = True
                 peers = list(wave_handles)
             for peer in peers:
                 peer.cancel(reason="run_paused")
@@ -1551,6 +1564,8 @@ class OrchestrateStage:
             picked: list[TaskNode] = []
             for task in ready:
                 if task.task_id in occupied_ids:
+                    continue
+                if any(dep in occupied_ids for dep in task.depends_on):
                     continue
                 if scopes_overlap(task.write_scope, occupied_scopes):
                     continue

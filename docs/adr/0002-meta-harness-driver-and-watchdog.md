@@ -58,3 +58,10 @@ Position Olympus4SWE as a **Harness of Harnesses** by decoupling the determinist
 - **Positive**: Turns Olympus4SWE into a true Meta-Harness capable of heterogeneous multi-vendor coding and review; closes the silent out-of-scope bug for all drivers; gives operators live progress visibility and semantic stall protection without brittle static token caps.
 - **Negative**: Introduces a thin driver lifecycle layer (process management, RPC framing, and thread-safe `steer`/`cancel` coordination) and optional external CLI dependencies (`pi`, later ACP servers) when external drivers are enabled.
 - **Mitigation**: Keep `NativeDriver` as the default zero-dependency baseline; test `PiDriver` and `Watchdog` deterministically via fake-CLI/mock-provider seams; roll out in two vertical slices (Phase 1 core seam + Diff Gate + live milestones; Phase 2 `PiDriver` + `Watchdog`).
+
+## Amendment (2026-11-22)
+
+Following the BlackNote Dev longitudinal E2E run (tracking #83–#87), two Watchdog & sandbox operational defaults were refined without relaxing ADR-0002's safety invariants:
+
+1. **Anomaly-driven Watchdog default (`interval_seconds = None`)**: Blind periodic L2 polling is disabled by default (remaining opt-in when callers set a positive `interval_seconds`). L1 now triggers L2 strictly on deterministic 0-token anomalies: 3× repeated tool errors, `180s` silence, repeated context compactions (`compaction_threshold = 3`), or newly observed out-of-scope sandbox mutations relative to the task's initial baseline. Every L2 evaluation is settled into `RunStore` `BudgetLedger` (`actor = "watchdog"`).
+2. **Stateful sandbox retention on retry**: Retried attempts reuse the task's sandbox anchored to its persisted Attempt-1 `SandboxBaseline` (including original `base_commit`) for targeted in-place repair rather than wiping valid `write_scope` work. `Diff Gate` still never auto-reverts out-of-scope files.

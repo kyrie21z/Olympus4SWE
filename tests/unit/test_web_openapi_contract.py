@@ -57,6 +57,29 @@ def test_openapi_projection_and_command_contracts_are_concrete() -> None:
     )
     assert "ErrorResponse" in components
     assert "ConflictResponse" in components
+    assert "HTTPValidationError" not in components
+    assert "ProviderConfig" in components
+    assert "anyOf" in components["ApprovalReview"]["properties"]["baseline"]
+
+    for path_item in schema["paths"].values():
+        for operation in path_item.values():
+            assert "422" not in operation.get("responses", {})
+
+    stream_responses = schema["paths"]["/api/runs/{run_id}/stream"]["get"]["responses"]
+    assert set(stream_responses["200"]["content"]) == {"text/event-stream"}
+    assert set(stream_responses["404"]["content"]) == {"application/json"}
+    assert stream_responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "ErrorResponse"
+    )
+
+    log_responses = schema["paths"]["/api/runs/{run_id}/delivery-log/{event_seq}/{position}"][
+        "get"
+    ]["responses"]
+    assert set(log_responses["200"]["content"]) == {"text/plain"}
+    assert set(log_responses["404"]["content"]) == {"application/json"}
+    assert log_responses["404"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "ErrorResponse"
+    )
 
 
 def test_openapi_covers_every_ariadne_route() -> None:

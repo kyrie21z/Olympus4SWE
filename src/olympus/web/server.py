@@ -13,7 +13,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -109,7 +109,7 @@ class AriadneApp:
             run_id,
             artifacts_root=self.artifacts_root,
         )
-        return RunProjection.model_validate(proj).model_dump(mode="json")
+        return RunProjection.model_validate(proj).model_dump(mode="json", by_alias=True)
 
     def get_run_payload(self, run_id: str) -> dict[str, Any]:
         proj = self._projection_payload(run_id)
@@ -438,10 +438,47 @@ def _index_response() -> Response:
     )
 
 
+class _EventStreamResponse(StreamingResponse):
+    media_type = "text/event-stream"
+
+
+class _AriadneFastAPI(FastAPI):
+    def openapi(self) -> dict[str, Any]:
+        if self.openapi_schema is not None:
+            return self.openapi_schema
+        schema = super().openapi()
+        for path_item in schema.get("paths", {}).values():
+            if not isinstance(path_item, dict):
+                continue
+            for operation in path_item.values():
+                if not isinstance(operation, dict):
+                    continue
+                responses = operation.get("responses")
+                if isinstance(responses, dict):
+                    responses.pop("422", None)
+                    for code in ("400", "404", "409"):
+                        err = responses.get(code)
+                        if not isinstance(err, dict):
+                            continue
+                        content = err.get("content")
+                        if (
+                            isinstance(content, dict)
+                            and "application/json" not in content
+                            and len(content) == 1
+                        ):
+                            err["content"] = {"application/json": next(iter(content.values()))}
+        components = schema.get("components", {}).get("schemas")
+        if isinstance(components, dict):
+            components.pop("HTTPValidationError", None)
+            components.pop("ValidationError", None)
+        self.openapi_schema = schema
+        return schema
+
+
 def create_fastapi_app(app: AriadneApp) -> FastAPI:
     """Create the ASGI application serving the Ariadne console over one service layer."""
     service = app
-    api = FastAPI(
+    api = _AriadneFastAPI(
         title="Olympus4SWE Ariadne API",
         version="0.1.0",
         default_response_class=_NoStoreJSONResponse,
@@ -458,7 +495,6 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
     async def _handle_validation_error(
         request: Request, exc: ValidationError
     ) -> _NoStoreJSONResponse:
-        # Internal projection/contract violations are server bugs, not client errors.
         return _error_response(500, str(exc))
 
     @api.exception_handler(NotFoundError)
@@ -488,7 +524,7 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         )
         return _NoStoreJSONResponse(
             status_code=409,
-            content=payload.model_dump(mode="json"),
+            content=payload.model_dump(mode="json", by_alias=True),
         )
 
     @api.exception_handler(ValueError)
@@ -564,7 +600,11 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
     def get_task_artifacts(run_id: str, task_id: str, attempt: int) -> dict[str, Any]:
         return service.get_attempt_payload(run_id, task_id, attempt)
 
-    @api.get("/api/runs/{run_id}/delivery-log/{event_seq}/{position}", responses=read_responses)
+    @api.get(
+        "/api/runs/{run_id}/delivery-log/{event_seq}/{position}",
+        response_class=PlainTextResponse,
+        responses=read_responses,
+    )
     def get_delivery_log(run_id: str, event_seq: str, position: str) -> Response:
         projection = service.get_run_payload(run_id)["projection"]
         review = projection["delivery_acceptance"] or {}
@@ -624,7 +664,7 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
             title=str(payload.title or default_title),
             raw_input=raw_input,
             workflow_name=str(payload.workflow_name or default_workflow),
-            provider_config=dict(payload.provider_config or {}),
+            provider_config=payload.provider_config.model_dump(exclude_none=True),
             worker_driver=payload.worker_driver,
             reviewer_driver=payload.reviewer_driver,
             monitor_model=payload.monitor_model,
@@ -645,7 +685,15 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         return service.execute_command(run_id, body)
 
     @api.post("/api/seed-demo", response_model=SeedDemoResponse, responses=write_responses)
-    def seed_demo() -> dict[str, Any]:
+    async def seed_demo(request: Request) -> dict[str, Any]:
+        raw_body = await request.body()
+        if raw_body.strip():
+            try:
+                parsed = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid JSON payload: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("POST /api/seed-demo expects a JSON object")
         seeded = seed_demo_runs(
             service.store,
             service.workspace_root,
@@ -653,21 +701,30 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
         )
         return {"ok": True, "seeded": seeded, **service.list_runs_payload()}
 
-    @api.get("/api/runs/{run_id}/stream", responses=read_responses)
+    @api.get(
+        "/api/runs/{run_id}/stream",
+        response_class=_EventStreamResponse,
+        responses={
+            200: {
+                "description": "Server-Sent Events stream",
+                "content": {"text/event-stream": {"schema": {"type": "string"}}},
+            },
+            **read_responses,
+        },
+    )
     async def stream_run(
         run_id: str, request: Request, after_seq: int = 0, once: int = 0
-    ) -> StreamingResponse:
+    ) -> _EventStreamResponse:
         initial = service.get_events_payload(run_id, after_seq=after_seq)
-        stream = _sse_stream(
-            service,
-            request,
-            run_id,
-            initial=initial,
-            after_seq=after_seq,
-            once=once == 1,
-        )
-        return StreamingResponse(
-            stream,
+        return _EventStreamResponse(
+            _sse_stream(
+                service,
+                request,
+                run_id,
+                initial=initial,
+                after_seq=after_seq,
+                once=once == 1,
+            ),
             headers={
                 "Content-Type": "text/event-stream; charset=utf-8",
                 "Cache-Control": "no-cache",
@@ -695,7 +752,7 @@ def create_fastapi_app(app: AriadneApp) -> FastAPI:
     return api
 
 
-def _sse_stream(
+async def _sse_stream(
     service: AriadneApp,
     request: Request,
     run_id: str,
@@ -705,40 +762,36 @@ def _sse_stream(
     once: bool,
 ) -> AsyncIterator[str]:
     """Async SSE frames matching the legacy wire contract exactly."""
+    yield _sse_frame("state", initial)
+    if once:
+        return
 
-    async def frames() -> AsyncIterator[str]:
-        yield _sse_frame("state", initial)
-        if once:
+    last_rev = int(initial["state_revision"])
+    events = initial["events"]
+    cur_seq = int(events[-1]["event_seq"]) if events else after_seq
+    last_previews: dict[str, Any] = {}
+    ticks = 0
+    while True:
+        await asyncio.sleep(0.5)
+        if await request.is_disconnected():
             return
-
-        last_rev = int(initial["state_revision"])
-        events = initial["events"]
-        cur_seq = int(events[-1]["event_seq"]) if events else after_seq
-        last_previews: dict[str, Any] = {}
-        ticks = 0
-        while True:
-            await asyncio.sleep(0.5)
-            if await request.is_disconnected():
-                return
-            ticks += 1
-            nxt = await asyncio.to_thread(service.get_events_payload, run_id, after_seq=cur_seq)
-            if int(nxt["state_revision"]) != last_rev or nxt["events"]:
-                last_rev = int(nxt["state_revision"])
-                if nxt["events"]:
-                    cur_seq = int(nxt["events"][-1]["event_seq"])
-                yield _sse_frame("state", nxt)
-            elif ticks % 10 == 0:
-                yield ": heartbeat\n\n"
-            previews = (
-                service.supervisor.live_activity.snapshot(run_id)
-                if nxt["status"] == "running"
-                else {}
-            )
-            if previews != last_previews:
-                yield _sse_frame("activity", {"run_id": run_id, "previews": previews})
-                last_previews = previews
-
-    return frames()
+        ticks += 1
+        nxt = await asyncio.to_thread(service.get_events_payload, run_id, after_seq=cur_seq)
+        if int(nxt["state_revision"]) != last_rev or nxt["events"]:
+            last_rev = int(nxt["state_revision"])
+            if nxt["events"]:
+                cur_seq = int(nxt["events"][-1]["event_seq"])
+            yield _sse_frame("state", nxt)
+        elif ticks % 10 == 0:
+            yield ": heartbeat\n\n"
+        previews = (
+            service.supervisor.live_activity.snapshot(run_id)
+            if nxt["status"] == "running"
+            else {}
+        )
+        if previews != last_previews:
+            yield _sse_frame("activity", {"run_id": run_id, "previews": previews})
+            last_previews = previews
 
 
 def serve_ariadne(

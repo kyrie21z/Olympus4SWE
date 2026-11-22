@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from olympus.core.contracts import (
     AcceptanceCheck,
@@ -33,9 +40,6 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# --------------------------------------------------------------------------- errors
-
-
 class ErrorResponse(StrictModel):
     ok: Literal[False] = False
     error: str
@@ -46,9 +50,6 @@ class ConflictResponse(StrictModel):
     conflict: Literal[True] = True
     error: str
     projection: RunProjection | None = Field(default=None, exclude_if=_omit_none)
-
-
-# --------------------------------------------------------------------------- runs
 
 
 class HealthResponse(StrictModel):
@@ -79,13 +80,22 @@ class PauseInfo(StrictModel):
     reason: str | None = None
 
 
+class ProviderConfig(StrictModel):
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    env_file: str | None = None
+    providers_file: str | None = None
+
+
 class CreateRunRequest(StrictModel):
     raw_input: str | None = None
     goal: str | None = None
     demo_id: str | None = None
     title: str | None = None
     workflow_name: str | None = None
-    provider_config: dict[str, Any] = Field(default_factory=dict)
+    provider_config: ProviderConfig = Field(default_factory=ProviderConfig)
     worker_driver: str | None = None
     reviewer_driver: str | None = None
     monitor_model: str | None = None
@@ -106,6 +116,7 @@ class WorkflowRunResult(StrictModel):
     error: str | None = None
     coalesced: bool | None = None
     deduplicated: bool | None = None
+    complete: bool | None = Field(default=None, exclude_if=_omit_none)
 
 
 class CreateRunResponse(StrictModel):
@@ -119,6 +130,7 @@ class CreateRunResponse(StrictModel):
     paused: PauseInfo | None = None
     error: str | None = Field(default=None, exclude_if=_omit_none)
     coalesced: bool | None = Field(default=None, exclude_if=_omit_none)
+    complete: bool | None = Field(default=None, exclude_if=_omit_none)
 
 
 class SeedDemoResponse(StrictModel):
@@ -139,9 +151,6 @@ class EventsResponse(StrictModel):
 class AttemptArtifactsResponse(StrictModel):
     ok: Literal[True] = True
     artifacts: RecordedAttemptArtifacts
-
-
-# ------------------------------------------------------------------- command payloads
 
 
 def _strip_non_empty(value: str) -> str:
@@ -252,30 +261,38 @@ CommandRequest = Annotated[
 
 
 class CommandResult(StrictModel):
-    """Union of every recorded HITL command result.
-
-    Command handlers record different result shapes; the common fields are
-    typed and unknown handler-specific keys pass through unchanged.
-    """
+    """Union of recorded HITL command results; serializes only fields present in the outcome."""
 
     model_config = ConfigDict(extra="allow")
 
-    run_id: str | None = Field(default=None, exclude_if=_omit_none)
-    status: str | None = Field(default=None, exclude_if=_omit_none)
-    state_revision: int | None = Field(default=None, exclude_if=_omit_none)
-    task_id: str | None = Field(default=None, exclude_if=_omit_none)
-    spec_id: str | None = Field(default=None, exclude_if=_omit_none)
-    spec_hash: str | None = Field(default=None, exclude_if=_omit_none)
-    version: int | None = Field(default=None, exclude_if=_omit_none)
-    remaining_blockers: list[str] | None = Field(default=None, exclude_if=_omit_none)
-    approval_id: str | None = Field(default=None, exclude_if=_omit_none)
-    from_workflow: str | None = Field(default=None, exclude_if=_omit_none)
-    workflow: WorkflowRunResult | str | None = Field(default=None, exclude_if=_omit_none)
-    budget_max_calls: int | None = Field(default=None, exclude_if=_omit_none)
-    deduplicated: bool | None = Field(default=None, exclude_if=_omit_none)
+    run_id: str | None = None
+    status: str | None = None
+    state_revision: int | None = None
+    task_id: str | None = None
+    spec_id: str | None = None
+    spec_hash: str | None = None
+    version: int | None = None
+    remaining_blockers: list[str] | None = None
+    approval_id: str | None = None
+    target: str | None = None
+    target_id: str | None = None
+    target_hash: str | None = None
+    approver: str | None = None
+    decision: str | None = None
+    reason: str | None = None
+    created_at: str | None = None
+    from_workflow: str | None = None
+    workflow: WorkflowRunResult | str | None = None
+    budget_max_calls: int | None = None
+    deduplicated: bool | None = None
 
-
-# -------------------------------------------------------------------- projection tree
+    @model_serializer(mode="wrap")
+    def _serialize_present_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        rendered: dict[str, Any] = dict(handler(self))
+        present = self.model_fields_set | set((self.model_extra or {}).keys())
+        return {key: value for key, value in rendered.items() if key in present}
 
 
 class ReviewEntry(StrictModel):
@@ -303,7 +320,7 @@ class ApprovalReview(StrictModel):
     artifact: Literal["spec", "design", "plan"]
     target_hash: str
     sections: list[ReviewSection]
-    baseline: dict[str, Any] | None = Field(default=None, exclude_if=_omit_none)
+    baseline: GoalSpec | DesignSpec | TaskPlan | None = Field(default=None, exclude_if=_omit_none)
     unchanged_sections: list[ReviewSection] | None = Field(default=None, exclude_if=_omit_none)
     comparison_gap: str | None = Field(default=None, exclude_if=_omit_none)
 
@@ -718,9 +735,6 @@ class CommandResponse(StrictModel):
     projection: RunProjection
 
 
-# ------------------------------------------------------------------ discovery views
-
-
 class ProviderStatus(StrictModel):
     id: str
     dialect: str
@@ -765,7 +779,6 @@ class DemosResponse(StrictModel):
     demos: list[DemoPreset]
 
 
-# SSE activity frame emitted as ``event: activity``.
 class ActivityPreviews(StrictModel):
     attempt: int
     preview: str
@@ -814,6 +827,7 @@ __all__ = [
     "PauseCommand",
     "PauseInfo",
     "PromoteToExecuteCommand",
+    "ProviderConfig",
     "ProviderStatus",
     "ProvidersResponse",
     "ReassignHumanCommand",

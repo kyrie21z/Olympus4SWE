@@ -736,7 +736,6 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
 
 
     with TestClient(create_fastapi_app(app)) as client:
-        # 1. Index HTML & healthz
         html_res = client.get("/")
         assert html_res.status_code == 200
         assert 'closedby="any"' in html_res.text
@@ -747,7 +746,6 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert 'src="/static/ui.js"' in html_res.text
         assert 'src="/static/app.js"' in html_res.text
 
-        # 1b. Static assets are served with the right MIME types and no caching
         tokens_res = client.get("/static/tokens.css")
         assert tokens_res.status_code == 200
         assert tokens_res.headers["content-type"].startswith("text/css")
@@ -770,7 +768,6 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert "javascript" in app_res.headers["content-type"]
         assert "watchSlots();" in app_res.text
 
-        # 1c. The pre-built Graph Island loads offline from the same static root.
         assert 'href="/static/graph/ariadne-graph.css"' in html_res.text
         graph_at = html_res.text.find('src="/static/graph/ariadne-graph.js"')
         assert -1 < graph_at < html_res.text.find('src="/static/app.js"')
@@ -794,9 +791,17 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         health = client.get("/healthz").json()
         assert health["ok"] is True
 
-        # 2. List runs & get projection
         runs_res = client.get("/api/runs").json()
         assert runs_res["default_run_id"] == "run-campus-waitlist"
+        assert client.get("/api/runs?limit=abc").status_code == 400
+        assert (
+            client.post(
+                "/api/seed-demo",
+                content="{",
+                headers={"Content-Type": "application/json"},
+            ).status_code
+            == 400
+        )
         demo = client.get("/api/runs/run-delivery-acceptance").json()["projection"]
         acceptance = demo["delivery_acceptance"]
         assert acceptance["counts"] == {"passed": 1, "failed": 1, "unverified": 1}
@@ -818,7 +823,6 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert run_res["ok"] is True
         rev0 = int(run_res["projection"]["state_revision"])
 
-        # 2b. The projection powers toolRow / subPane / receiptBlock / waterfall
         proj0 = run_res["projection"]
         t03r1 = next(n for n in proj0["dag"]["nodes"] if n["task_id"] == "T03-R1")
         assert t03r1["subagent_stream"][0]["tool"] == "read_file"
@@ -828,13 +832,11 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert proj0["waterfall_turns"][0]["actor"] == "Align"
         assert any(turn["actor"] == "Argus" for turn in proj0["waterfall_turns"])
 
-        # 3. SSE stream (once=1)
         sse_res = client.get("/api/runs/run-campus-waitlist/stream?after_seq=0&once=1")
         assert sse_res.status_code == 200
         assert "text/event-stream" in sse_res.headers["content-type"]
         assert "event: state" in sse_res.text
 
-        # 4. Pause & idempotency check
         pause_body = {
             "operation_id": "op-pause-1",
             "action": "pause",
@@ -847,12 +849,10 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert rev1 == rev0 + 1
         assert p1.json()["projection"]["status"] == "paused"
 
-        # Re-sending identical operation_id returns cached response without bumping revision
         p1_dup = client.post("/api/runs/run-campus-waitlist/command", json=pause_body)
         assert p1_dup.status_code == 200
         assert int(p1_dup.json()["projection"]["state_revision"]) == rev1
 
-        # Stale state_revision with a new operation_id is rejected with 409 Conflict
         stale_res = client.post(
             "/api/runs/run-campus-waitlist/command",
             json={
@@ -862,8 +862,9 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             },
         )
         assert stale_res.status_code == 409
+        conflict_edges = stale_res.json()["projection"]["dag"]["edges"]
+        assert conflict_edges and all("from" in edge and "to" in edge for edge in conflict_edges)
 
-        # 5. Reject accept_risk without reason
         bad_risk = client.post(
             "/api/runs/run-campus-waitlist/command",
             json={
@@ -876,7 +877,6 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         )
         assert bad_risk.status_code == 400
 
-        # 6. Test accept_risk distinguishing unverified_risk_accepted from verified
         risk_res = client.post(
             "/api/runs/run-campus-waitlist/command",
             json={
@@ -888,6 +888,27 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
             },
         )
         assert risk_res.status_code == 200
+
+        retry_completed = client.post(
+            "/api/runs/run-delivery-acceptance/command",
+            json={
+                "operation_id": "op-retry-completed",
+                "action": "retry_workflow",
+                "sync": True,
+            },
+        )
+        assert retry_completed.status_code == 200
+        assert retry_completed.json()["command_result"]["workflow"]["complete"] is True
+        retry_replay = client.post(
+            "/api/runs/run-delivery-acceptance/command",
+            json={
+                "operation_id": "op-retry-completed",
+                "action": "retry_workflow",
+                "sync": True,
+            },
+        )
+        assert retry_replay.status_code == 200
+        assert retry_replay.json()["command_result"]["workflow"]["complete"] is True
         proj_after_risk = risk_res.json()["projection"]
         t03_node = next(n for n in proj_after_risk["dag"]["nodes"] if n["task_id"] == "T03-R1")
         assert t03_node["status"] == TaskStatus.ACCEPTED.value

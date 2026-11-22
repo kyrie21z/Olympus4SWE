@@ -237,8 +237,13 @@
           "baseline": {
             "anyOf": [
               {
-                "additionalProperties": true,
-                "type": "object"
+                "$ref": "#/components/schemas/GoalSpec"
+              },
+              {
+                "$ref": "#/components/schemas/DesignSpec"
+              },
+              {
+                "$ref": "#/components/schemas/TaskPlan"
               },
               {
                 "type": "null"
@@ -722,159 +727,6 @@
       },
       "CommandResult": {
         "additionalProperties": true,
-        "description": "Union of every recorded HITL command result.\n\nCommand handlers record different result shapes; the common fields are\ntyped and unknown handler-specific keys pass through unchanged.",
-        "properties": {
-          "approval_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Approval Id"
-          },
-          "budget_max_calls": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Budget Max Calls"
-          },
-          "deduplicated": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deduplicated"
-          },
-          "from_workflow": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "From Workflow"
-          },
-          "remaining_blockers": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Remaining Blockers"
-          },
-          "run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run Id"
-          },
-          "spec_hash": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Spec Hash"
-          },
-          "spec_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Spec Id"
-          },
-          "state_revision": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "State Revision"
-          },
-          "status": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Status"
-          },
-          "task_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Task Id"
-          },
-          "version": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Version"
-          },
-          "workflow": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/WorkflowRunResult"
-              },
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workflow"
-          }
-        },
-        "title": "CommandResult",
         "type": "object"
       },
       "ConflictResponse": {
@@ -969,9 +821,7 @@
             "title": "Monitor Model"
           },
           "provider_config": {
-            "additionalProperties": true,
-            "title": "Provider Config",
-            "type": "object"
+            "$ref": "#/components/schemas/ProviderConfig"
           },
           "raw_input": {
             "anyOf": [
@@ -1061,6 +911,17 @@
               }
             ],
             "title": "Coalesced"
+          },
+          "complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete"
           },
           "error": {
             "anyOf": [
@@ -2300,19 +2161,6 @@
         "title": "GoalSpec",
         "type": "object"
       },
-      "HTTPValidationError": {
-        "properties": {
-          "detail": {
-            "items": {
-              "$ref": "#/components/schemas/ValidationError"
-            },
-            "title": "Detail",
-            "type": "array"
-          }
-        },
-        "title": "HTTPValidationError",
-        "type": "object"
-      },
       "HealthResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2898,6 +2746,79 @@
           "action"
         ],
         "title": "PromoteToExecuteCommand",
+        "type": "object"
+      },
+      "ProviderConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "env_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env File"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "providers_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Providers File"
+          }
+        },
+        "title": "ProviderConfig",
         "type": "object"
       },
       "ProviderRetryRecord": {
@@ -5075,46 +4996,6 @@
         "title": "TurnReceipt",
         "type": "object"
       },
-      "ValidationError": {
-        "properties": {
-          "ctx": {
-            "title": "Context",
-            "type": "object"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "loc": {
-            "items": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "integer"
-                }
-              ]
-            },
-            "title": "Location",
-            "type": "array"
-          },
-          "msg": {
-            "title": "Message",
-            "type": "string"
-          },
-          "type": {
-            "title": "Error Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
-        "title": "ValidationError",
-        "type": "object"
-      },
       "WaterfallTurn": {
         "additionalProperties": false,
         "properties": {
@@ -5360,6 +5241,17 @@
               }
             ],
             "title": "Coalesced"
+          },
+          "complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete"
           },
           "deduplicated": {
             "anyOf": [
@@ -5744,16 +5636,6 @@
               }
             },
             "description": "Bad Request"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "List Runs"
@@ -5810,16 +5692,6 @@
               }
             },
             "description": "Conflict"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Create Run"
@@ -5869,16 +5741,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Get Run"
@@ -5999,16 +5861,6 @@
               }
             },
             "description": "Conflict"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Run Command"
@@ -6049,8 +5901,10 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
             "description": "Successful Response"
@@ -6074,16 +5928,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Get Delivery Log"
@@ -6143,16 +5987,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Get Run Events"
@@ -6195,11 +6029,13 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Server-Sent Events stream"
           },
           "400": {
             "content": {
@@ -6220,16 +6056,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Stream Run"
@@ -6297,16 +6123,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Get Task Artifacts"

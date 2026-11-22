@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -689,19 +690,37 @@ def _wait_for_layout(page, mode="elk"):
 
 
 GRAPH_STYLESHEET = """() => {
-  const link = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
-    .find((node) => node.href.includes('ariadne-graph.css'));
-  if (!link) return null;
-  return {href: link.href, rules: link.sheet ? link.sheet.cssRules.length : 0};
+  const links = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+    .filter((node) => node.href.includes('ariadne-graph.css'))
+    .map((node) => {
+      let rules = 0;
+      try {
+        rules = node.sheet ? node.sheet.cssRules.length : 0;
+      } catch {
+        rules = 0;
+      }
+      return {href: node.href, crossOrigin: node.crossOrigin, rules};
+    });
+  const viewport = document.querySelector('#dag-graph .react-flow__viewport');
+  return {
+    links,
+    viewportPosition: viewport ? getComputedStyle(viewport).position : null,
+  };
 }"""
 
 
-def _assert_graph_stylesheet_applied(page):
-    """Regression #79: ariadne-graph.css must be applied on first paint, with no retry needed."""
-    stylesheet = page.evaluate(GRAPH_STYLESHEET)
-    assert stylesheet is not None, "ariadne-graph.css <link> missing"
-    assert stylesheet["href"].endswith("/static/assets/ariadne-graph.css"), stylesheet
+def _assert_graph_stylesheet_applied(page, *, allow_retry=False):
+    """Regression #79: ariadne-graph.css must be applied cleanly with a single stylesheet link."""
+    state = page.evaluate(GRAPH_STYLESHEET)
+    assert len(state["links"]) == 1, state
+    stylesheet = state["links"][0]
+    parsed = urlparse(stylesheet["href"])
+    assert parsed.path.endswith("/static/assets/ariadne-graph.css"), stylesheet
+    if not allow_retry:
+        assert not parsed.query, stylesheet
+    assert stylesheet["crossOrigin"] == "anonymous", stylesheet
     assert stylesheet["rules"] > 0, stylesheet
+    assert state["viewportPosition"] == "absolute", state
 
 
 def _inside(point, card, inset=1.0):
@@ -975,6 +994,38 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     expect(broken.locator("#workflow-graph .ag-island")).to_be_visible()
     _assert_graph_stylesheet_applied(broken)
     broken.close()
+
+    for label, handler in (
+        ("http-503", lambda route: route.fulfill(status=503, body="css unavailable")),
+        ("abort", lambda route: route.abort()),
+    ):
+        css_broken = browser.new_page()
+        css_broken.route("**/static/assets/ariadne-graph*.css*", handler)
+        css_broken.goto(f"{url}/?run={run_id}")
+        expect(css_broken.locator("#dag-graph")).to_contain_text("任务依赖图组件未能加载")
+        expect(css_broken.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
+        assert css_broken.locator("#dag-graph .ag-island").count() == 0, label
+        css_broken.unroute("**/static/assets/ariadne-graph*.css*")
+        css_broken.locator("#thread-list .thread-item").nth(1).click()
+        expect(css_broken.locator("#dag-graph .ag-island")).to_be_visible()
+        expect(css_broken.locator("#workflow-graph .ag-island")).to_be_visible()
+        _assert_graph_stylesheet_applied(css_broken, allow_retry=True)
+        css_broken.close()
+
+    stalled_css = browser.new_page()
+    stalled_css.route("**/static/assets/ariadne-graph*.css*", lambda _route: None)
+    stalled_css.goto(f"{url}/?run={run_id}")
+    expect(stalled_css.locator("#dag-graph")).to_contain_text(
+        "任务依赖图组件未能加载", timeout=7000
+    )
+    expect(stalled_css.locator("#workflow-graph")).to_contain_text("编排工作流组件未能加载")
+    assert stalled_css.locator("#dag-graph .ag-island").count() == 0
+    stalled_css.unroute("**/static/assets/ariadne-graph*.css*")
+    stalled_css.locator("#thread-list .thread-item").nth(1).click()
+    expect(stalled_css.locator("#dag-graph .ag-island")).to_be_visible()
+    expect(stalled_css.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(stalled_css, allow_retry=True)
+    stalled_css.close()
 
 
 # ---------------------------------------------------------------------------

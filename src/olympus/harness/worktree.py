@@ -92,11 +92,25 @@ def create_sandbox(repo_root: Path | str, *, label: str) -> SandboxHandle:
     )
 
 
-def capture_sandbox_diff(handle: SandboxHandle) -> str:
-    """Return tracked diff plus untracked file list/contents for cold-start review."""
+def capture_sandbox_diff(
+    handle: SandboxHandle, baseline: SandboxBaseline | None = None
+) -> str:
+    """Return tracked diff plus untracked file contents for cold-start review.
+
+    Supplying the task's pre-worker ``baseline`` restricts the output to paths
+    mutated since that snapshot, so unchanged upstream ``accepted_overlay``
+    files never leak into a downstream task's diff. Without a baseline the
+    legacy ``HEAD`` + untracked behavior is preserved for direct callers.
+    """
     ws = handle.workspace_path
     if not is_git_repo(ws):
         return "(non-git sandbox; inspect modified files directly)"
+    if baseline is None:
+        return _head_scoped_diff(ws)
+    return _baseline_scoped_diff(handle, baseline)
+
+
+def _head_scoped_diff(ws: Path) -> str:
     tracked = _run_git(ws, "diff", "HEAD").stdout
     untracked_proc = _run_git(ws, "ls-files", "--others", "--exclude-standard")
     parts: list[str] = []
@@ -106,12 +120,104 @@ def capture_sandbox_diff(handle: SandboxHandle) -> str:
     for rel in untracked:
         fpath = ws / rel
         if fpath.is_file():
-            try:
-                content = fpath.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = "<binary file>"
-            parts.append(f"--- /dev/null\n+++ b/{rel}\n{content}")
+            parts.append(f"--- /dev/null\n+++ b/{rel}\n{_read_text(fpath)}")
     return "\n\n".join(parts) if parts else "(no changes)"
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "<binary file>"
+
+
+def _prefixed_content(path: Path) -> str:
+    text = _read_text(path)
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(f"+{line}" for line in lines) + "\n"
+
+
+def _new_file_block(ws: Path, rel: str) -> str:
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        "new file mode 100644\n"
+        f"--- /dev/null\n+++ b/{rel}\n"
+        f"{_prefixed_content(ws / rel)}"
+    )
+
+
+def _deleted_file_block(ws: Path, rel: str) -> str:
+    tracked = _run_git(ws, "diff", "HEAD", "--", rel).stdout.rstrip()
+    if tracked:
+        return tracked
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        "deleted file mode 100644\n"
+        f"--- a/{rel}\n+++ /dev/null"
+    )
+
+
+def _modified_file_block(ws: Path, rel: str) -> str:
+    tracked = _run_git(ws, "ls-files", "--error-unmatch", "--", rel)
+    if tracked.returncode == 0:
+        return _run_git(ws, "diff", "HEAD", "--", rel).stdout.rstrip()
+    # Baseline-only (overlay) file: no recorded baseline content, so show the full
+    # current file as added lines rather than dropping the mutation from review.
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"--- a/{rel}\n+++ b/{rel}\n"
+        f"{_prefixed_content(ws / rel)}"
+    )
+
+
+def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> str:
+    ws = handle.workspace_path
+    before = baseline.mapping()
+    changed = collect_sandbox_changes(handle, baseline)
+    if not changed:
+        return "(no changes)"
+
+    def present(rel: str) -> bool:
+        candidate = ws / rel
+        return candidate.is_file() or candidate.is_symlink()
+
+    added = {rel for rel in changed if rel not in before and present(rel)}
+    deleted = {rel for rel in changed if rel in before and not present(rel)}
+    modified = set(changed) - added - deleted
+
+    renames: dict[str, str] = {}
+    for old in sorted(deleted):
+        fingerprint = before[old]
+        if fingerprint is None:
+            continue
+        match = next(
+            (new for new in sorted(added) if _file_fingerprint(ws / new) == fingerprint),
+            None,
+        )
+        if match is not None:
+            renames[old] = match
+            added.discard(match)
+
+    blocks: list[str] = []
+    for rel in sorted(changed):
+        if rel in renames:
+            new = renames[rel]
+            blocks.append(
+                f"diff --git a/{rel} b/{new}\n"
+                "similarity index 100%\n"
+                f"rename from {rel}\nrename to {new}"
+            )
+        elif rel in renames.values():
+            continue
+        elif rel in added:
+            blocks.append(_new_file_block(ws, rel))
+        elif rel in deleted:
+            blocks.append(_deleted_file_block(ws, rel))
+        elif rel in modified:
+            blocks.append(_modified_file_block(ws, rel))
+    return "\n\n".join(blocks) if blocks else "(no changes)"
 
 
 def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -208,6 +209,68 @@ def _diff_stats(diff_text: str) -> tuple[int, int]:
             elif line.startswith("-") and not line.startswith("---"):
                 removed += 1
     return added, removed
+
+
+_INLINE_DIFF_BUDGET = 48_000
+
+
+def _diff_file_blocks(diff_text: str) -> list[str]:
+    """Split a captured diff into per-file blocks, honoring git headers first."""
+    if diff_text.startswith("diff --git "):
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in diff_text.splitlines():
+            if line.startswith("diff --git ") and current:
+                blocks.append("\n".join(current))
+                current = []
+            current.append(line)
+        if current:
+            blocks.append("\n".join(current))
+        return blocks
+    return [block for block in diff_text.split("\n\n") if block.strip()]
+
+
+def _diff_block_label(block: str) -> str | None:
+    rename_from = re.search(r"^rename from (.+)$", block, re.MULTILINE)
+    rename_to = re.search(r"^rename to (.+)$", block, re.MULTILINE)
+    if rename_from is not None and rename_to is not None:
+        return f"renamed: {rename_to.group(1).strip()} (from {rename_from.group(1).strip()})"
+    header = re.search(r"^diff --git a/(.+?) b/(.+)$", block, re.MULTILINE)
+    if header is not None:
+        path = header.group(2).strip()
+    else:
+        target = re.search(r"^\+\+\+ b/(.+)$", block, re.MULTILINE)
+        path = target.group(1).strip() if target is not None else None
+    if path is None:
+        return None
+    if "new file mode" in block or block.startswith("--- /dev/null") or "\n--- /dev/null" in block:
+        return f"new: {path}"
+    if "deleted file mode" in block or "\n+++ /dev/null" in block:
+        return f"deleted: {path}"
+    return f"modified: {path}"
+
+
+def _diff_summary_lines(diff_text: str) -> list[str]:
+    lines: list[str] = []
+    for block in _diff_file_blocks(diff_text):
+        label = _diff_block_label(block)
+        if label is None:
+            continue
+        added, removed = _diff_stats(block)
+        lines.append(f"- {label} (+{added}/-{removed})")
+    return lines
+
+
+def _bounded_inline_diff(
+    diff_text: str, *, budget: int = _INLINE_DIFF_BUDGET
+) -> tuple[str, bool]:
+    """Return the inline diff capped at ``budget`` characters plus a truncation flag."""
+    if len(diff_text) <= budget:
+        return diff_text, False
+    cut = diff_text.rfind("\n", 0, budget)
+    if cut <= 0:
+        cut = budget
+    return diff_text[:cut].rstrip(), True
 
 
 def _write_manifest_md(
@@ -677,6 +740,7 @@ class OrchestrateStage:
         task: TaskNode,
         sandbox: SandboxHandle,
         diff_text: str,
+        diff_path: Path,
         check_summary: str,
         art_dir: Path,
         reviewer: tuple[AgentDriver, str | None],
@@ -699,6 +763,20 @@ class OrchestrateStage:
         oos_json = json.dumps(spec.out_of_scope, ensure_ascii=False)
         spec_ctx = _format_spec_context(spec)
         design_ctx = _format_design_context(design, task=task)
+        diff_summary = "\n".join(_diff_summary_lines(diff_text)) or "- (none detected)"
+        inline_diff, diff_truncated = _bounded_inline_diff(diff_text)
+        diff_ctx = (
+            f"Changed files (per-file summary):\n{diff_summary}\n\n"
+            f"Diff (inline{' truncated' if diff_truncated else ''}):\n{inline_diff}\n"
+        )
+        if diff_truncated:
+            diff_ctx += (
+                f"\nThe inline diff above was truncated at {_INLINE_DIFF_BUDGET} characters. "
+                f"The complete diff is saved at: {diff_path}\n"
+                "Inspect only the specific files you need with your read-only tools "
+                "(read_file, grep_files, glob_files) before deciding; do not assume the "
+                "inline diff is complete.\n"
+            )
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
             f"TaskNode: {task_summary}\n"
@@ -711,7 +789,7 @@ class OrchestrateStage:
             f"Incremental review cycle={task.review_cycle + 1} (incremental_only={incremental})\n"
             f"{prior_ctx}\n"
             f"Command check outputs:\n{check_summary}\n\n"
-            f"Git diff / changes:\n{diff_text}\n\n"
+            f"{diff_ctx}\n"
             f"Set task_id='{task.task_id}', attempt={task.attempt}, "
             f"incremental_only={str(incremental).lower()}.\n"
             f"Return ReviewVerdict JSON matching schema:\n{schema_json}"
@@ -1018,7 +1096,7 @@ class OrchestrateStage:
                 event_type="task.verifying",
             )
 
-            diff_text = capture_sandbox_diff(sandbox)
+            diff_text = capture_sandbox_diff(sandbox, worker_baseline)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
 
@@ -1138,6 +1216,7 @@ class OrchestrateStage:
                     task=verifying,
                     sandbox=sandbox,
                     diff_text=diff_text,
+                    diff_path=diff_file,
                     check_summary=check_summary,
                     art_dir=art_dir,
                     reviewer=reviewer,

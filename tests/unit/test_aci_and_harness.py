@@ -13,7 +13,12 @@ import olympus.tools.aci as aci_module
 from olympus.core.contracts import BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.loop import AgentLoop
-from olympus.harness.worktree import capture_sandbox_diff, create_sandbox, remove_sandbox
+from olympus.harness.worktree import (
+    capture_sandbox_diff,
+    create_sandbox,
+    remove_sandbox,
+    snapshot_sandbox_state,
+)
 from olympus.providers.base import (
     ChatMessage,
     LLMResponse,
@@ -110,6 +115,46 @@ def test_git_worktree_sandbox_isolates_changes_and_captures_diff(tmp_path: Path)
     finally:
         remove_sandbox(handle)
     assert not handle.workspace_path.exists()
+
+
+def test_baseline_scoped_diff_only_emits_paths_mutated_since_baseline(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def f() -> int:\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    handle = create_sandbox(repo, label="task-scope-a1")
+    try:
+        ws = handle.workspace_path
+        # accepted_overlay-style files already exist before the pre-worker baseline
+        (ws / "upstream.py").write_text("UPSTREAM = 1\n", encoding="utf-8")
+        (ws / "stable.py").write_text("STABLE = True\n", encoding="utf-8")
+        (ws / "old_name.py").write_text("RENAMED = True\n", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+
+        (ws / "app.py").write_text("def f() -> int:\n    return 2\n", encoding="utf-8")
+        (ws / "new_mod.py").write_text("VAL = 9\n", encoding="utf-8")
+        (ws / "old_name.py").rename(ws / "renamed.py")
+        (ws / "upstream.py").unlink()
+
+        scoped = capture_sandbox_diff(handle, baseline)
+        assert "return 2" in scoped
+        assert "new_mod.py" in scoped and "VAL = 9" in scoped
+        assert "rename from old_name.py" in scoped
+        assert "rename to renamed.py" in scoped
+        assert "deleted file mode" in scoped
+        assert "upstream.py" in scoped
+        assert "stable.py" not in scoped
+        assert "STABLE = True" not in scoped
+
+        unscoped = capture_sandbox_diff(handle)
+        assert "stable.py" in unscoped and "STABLE = True" in unscoped
+    finally:
+        remove_sandbox(handle)
 
 
 def test_agent_loop_preserves_prefix_and_errors_and_respects_budget(tmp_path: Path) -> None:

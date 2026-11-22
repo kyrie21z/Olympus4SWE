@@ -5,9 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
+import openai
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
 
 from olympus.providers.auth import EndpointTarget
 from olympus.providers.types import (
@@ -21,6 +27,10 @@ from olympus.providers.types import (
 )
 
 MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
+
+# The SDK refuses to construct without credentials; keyless endpoints strip the
+# synthesized Authorization header on each request instead.
+_KEYLESS_PLACEHOLDER = "unused"
 
 
 def serialize_tool_schemas_openai(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
@@ -64,10 +74,11 @@ class OpenAIChatCompat:
 
 @dataclass(frozen=True)
 class OpenAIChatDialect:
-    """Posts ``/chat/completions`` and parses the completion response."""
+    """Sends ``/chat/completions`` through the official OpenAI SDK."""
 
     compat: OpenAIChatCompat = field(default_factory=OpenAIChatCompat)
     max_tokens: int | None = None
+    http_client: httpx.Client | None = None
 
     def send(
         self,
@@ -79,50 +90,71 @@ class OpenAIChatDialect:
         temperature: float = 0.0,
         timeout: float = 180.0,
     ) -> LLMResponse:
-        body = self._build_body(
-            model=model,
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-        )
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        headers.update(endpoint.headers)
-        if endpoint.api_key:
-            headers["Authorization"] = f"Bearer {endpoint.api_key}"
-
         url = f"{endpoint.base_url.rstrip('/')}/chat/completions"
-        resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
-        if resp.status_code >= 400:
-            raise HttpStatusError(resp.status_code, url, resp.text[:500])
+        client = openai.OpenAI(
+            api_key=endpoint.api_key or _KEYLESS_PLACEHOLDER,
+            base_url=endpoint.base_url,
+            default_headers=dict(endpoint.headers),
+            timeout=timeout,
+            max_retries=0,
+            http_client=self.http_client,
+        )
+        request_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": cast(
+                Sequence[ChatCompletionMessageParam],
+                self._serialize_messages(messages),
+            ),
+            "temperature": temperature,
+        }
+        if tools:
+            request_kwargs["tools"] = cast(
+                Sequence[ChatCompletionToolUnionParam],
+                serialize_tool_schemas_openai(tools),
+            )
+        if self.max_tokens is not None and self.compat.max_tokens_field is not None:
+            request_kwargs[self.compat.max_tokens_field] = self.max_tokens
+        # ``extra_body`` must never override explicitly serialized fields.
+        passthrough = {
+            key: value
+            for key, value in self.compat.extra_body.items()
+            if key not in request_kwargs
+        }
+        if passthrough:
+            request_kwargs["extra_body"] = passthrough
+        if not endpoint.api_key and not any(
+            key.lower() == "authorization" for key in endpoint.headers
+        ):
+            request_kwargs["extra_headers"] = {"Authorization": openai.Omit()}
 
-        data = resp.json()
-        choice = data["choices"][0]["message"]
+        try:
+            completion = client.chat.completions.create(**request_kwargs)
+        except openai.APIStatusError as exc:
+            raise HttpStatusError(exc.status_code, url, exc.response.text[:500]) from exc
+        finally:
+            if self.http_client is None:
+                client.close()
+
+        choice = completion.choices[0].message
         parsed_calls: list[ToolCall] = []
-        for raw_tc in choice.get("tool_calls") or []:
-            fn = raw_tc["function"]
-            raw_args = fn.get("arguments") or "{}"
-            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            parsed_calls.append(ToolCall(id=raw_tc["id"], name=fn["name"], arguments=args))
+        for raw_tc in choice.tool_calls or []:
+            if not isinstance(raw_tc, ChatCompletionMessageFunctionToolCall):
+                continue
+            args = json.loads(raw_tc.function.arguments or "{}")
+            parsed_calls.append(ToolCall(id=raw_tc.id, name=raw_tc.function.name, arguments=args))
 
-        usage = data.get("usage") or {}
+        usage = completion.usage
         return LLMResponse(
-            content=choice.get("content") or "",
+            content=choice.content or "",
             tool_calls=tuple(parsed_calls),
             usage=UsageStats(
-                input_tokens=int(usage.get("prompt_tokens", 0)),
-                output_tokens=int(usage.get("completion_tokens", 0)),
+                input_tokens=usage.prompt_tokens if usage is not None else 0,
+                output_tokens=usage.completion_tokens if usage is not None else 0,
             ),
-            raw_model=str(data.get("model") or model),
+            raw_model=completion.model or model,
         )
 
-    def _build_body(
-        self,
-        *,
-        model: str,
-        messages: Sequence[ChatMessage],
-        tools: Sequence[ToolSpec],
-        temperature: float,
-    ) -> dict[str, Any]:
+    def _serialize_messages(self, messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
         payload_messages: list[dict[str, Any]] = []
         for msg in messages:
             content: str | None = msg.content
@@ -146,16 +178,4 @@ class OpenAIChatDialect:
             if self.compat.include_tool_result_name and msg.name is not None:
                 item["name"] = msg.name
             payload_messages.append(item)
-
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": payload_messages,
-            "temperature": temperature,
-        }
-        if tools:
-            body["tools"] = serialize_tool_schemas_openai(tools)
-        if self.max_tokens is not None and self.compat.max_tokens_field is not None:
-            body[self.compat.max_tokens_field] = self.max_tokens
-        for key, value in self.compat.extra_body.items():
-            body.setdefault(key, value)
-        return body
+        return payload_messages

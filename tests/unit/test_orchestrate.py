@@ -958,6 +958,66 @@ def _gate_rejections(store: RunStore, run_id: str) -> list[Any]:
     return [e for e in store.list_events(run_id) if e.event_type == "task.diff_gate_rejected"]
 
 
+class _DirectWriteWorker:
+    """Deterministic worker driver: writes prepared files per task and completes."""
+
+    name = "direct"
+    supports_steer = False
+
+    def __init__(self, files: dict[str, dict[str, str]]) -> None:
+        self._files = files
+
+    def steer(self, guidance: str, *, source: str) -> bool:
+        del guidance, source
+        return False
+
+    def cancel(self, *, reason: str) -> None:
+        del reason
+
+    def run_turn(
+        self,
+        request: DriverTurnRequest,
+        *,
+        on_event: Any = None,
+        on_handle: Any = None,
+    ) -> TurnOutcome:
+        del on_event, on_handle
+        for rel, content in self._files[request.task_id].items():
+            target = request.workspace_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return TurnOutcome(
+            completed=True,
+            stop_reason="final_response",
+            final_content="done",
+            steps_taken=1,
+            driver_name="direct",
+        )
+
+
+def _capturing_reviewer(prompts: dict[str, str]) -> MockLLMProvider:
+    class CapturingReviewer(MockLLMProvider):
+        def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            del args
+            user_prompt = kwargs["messages"][1].content
+            task_id = re.search(r'"task_id":"(T\d+)"', user_prompt)
+            assert task_id is not None
+            prompts[task_id.group(1)] = user_prompt
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "task_id": task_id.group(1),
+                        "attempt": 1,
+                        "passed": True,
+                        "summary": "ok",
+                        "findings": [],
+                    }
+                )
+            )
+
+    return CapturingReviewer()
+
+
 def test_diff_gate_rejects_tracked_edit_outside_write_scope_before_checks(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     notes = tmp_path / "docs" / "notes.md"
@@ -2321,6 +2381,139 @@ def test_argus_prompt_enforces_hard_write_scope_boundary(tmp_path: Path) -> None
         '["feature.py"]'
     )
     assert expected_scope_line in user_prompt
+
+
+def test_multiwave_diff_and_argus_prompt_exclude_unchanged_upstream_overlay(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    plan = TaskPlan.model_validate(
+        {
+            "plan_id": "plan-scoped-diff",
+            "spec_id": spec.spec_id,
+            "spec_hash": spec.content_hash,
+            "tasks": [
+                {
+                    "task_id": "T0",
+                    "title": "Publish the upstream module",
+                    "objective": "Create the upstream module",
+                    "requirement_refs": ["R1"],
+                    "write_scope": ["upstream.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "REV-0",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Review the upstream module",
+                        }
+                    ],
+                },
+                {
+                    "task_id": "T1",
+                    "title": "Publish the downstream module",
+                    "objective": "Create the downstream module",
+                    "requirement_refs": ["R1"],
+                    "depends_on": ["T0"],
+                    "write_scope": ["child.py"],
+                    "acceptance_checks": [
+                        {
+                            "id": "REV-1",
+                            "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                            "description": "Review the downstream module",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    _approve_plan(store, run_id, plan)
+    upstream_body = "".join(f"UPSTREAM_{i} = {i}\n" for i in range(300))
+    prompts: dict[str, str] = {}
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry(
+            {
+                "direct": _DirectWriteWorker(
+                    {
+                        "T0": {"upstream.py": upstream_body},
+                        "T1": {"child.py": "CHILD = True\n"},
+                    }
+                )
+            }
+        ),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    assert set(prompts) == {"T0", "T1"}
+    assert "UPSTREAM_299" in prompts["T0"]
+
+    downstream_prompt = prompts["T1"]
+    assert "child.py" in downstream_prompt
+    assert "CHILD = True" in downstream_prompt
+    assert "UPSTREAM_" not in downstream_prompt
+    assert "upstream.py" not in downstream_prompt
+
+    diff_path = (
+        tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1" / "diff.patch"
+    )
+    downstream_diff = diff_path.read_text(encoding="utf-8")
+    assert "child.py" in downstream_diff and "CHILD = True" in downstream_diff
+    assert "UPSTREAM_" not in downstream_diff
+    assert "upstream.py" not in downstream_diff
+
+
+def test_oversized_task_diff_is_bounded_in_argus_prompt_with_patch_pointer(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    store, run_id = _confirmed_run(tmp_path)
+    plan = _single_task_plan(
+        spec=store.get_run(run_id)["spec"],
+        write_scope=["big_feature.py"],
+        checks=[
+            {
+                "id": "REV-1",
+                "kind": CheckKind.INDEPENDENT_REVIEW.value,
+                "description": "Review the oversized module",
+            }
+        ],
+    )
+    _approve_plan(store, run_id, plan)
+    body = "".join(f"ROW_{i} = {i}\n" for i in range(4000)) + "TAIL_MARKER = True\n"
+    prompts: dict[str, str] = {}
+    stage = OrchestrateStage(
+        store=store,
+        workspace_root=tmp_path,
+        provider=_capturing_reviewer(prompts),
+        execution_drivers=ExecutionDriversConfig(worker_driver="direct"),
+        driver_registry=DriverRegistry(
+            {"direct": _DirectWriteWorker({"T1": {"big_feature.py": body}})}
+        ),
+    )
+    out = stage.run_execution(run_id=run_id)
+
+    assert out["status"] == RunStatus.COMPLETED
+    prompt = prompts["T1"]
+    assert "new: big_feature.py" in prompt
+    assert "+4001" in prompt
+    assert "diff.patch" in prompt
+    assert "truncated" in prompt.lower()
+    assert "TAIL_MARKER" not in prompt
+    assert "ROW_3999" not in prompt
+    assert len(prompt) < 60_000
+
+    diff_path = (
+        tmp_path / ".olympus" / "runs" / run_id / "artifacts" / "T1" / "attempt-1" / "diff.patch"
+    )
+    full_diff = diff_path.read_text(encoding="utf-8")
+    assert "TAIL_MARKER" in full_diff
+    assert "ROW_3999" in full_diff
 
 
 def test_default_worker_max_steps_is_unlimited() -> None:

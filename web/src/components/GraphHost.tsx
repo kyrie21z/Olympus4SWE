@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useMemo, type ErrorInfo, type ReactNode } from "react";
+import { Component, lazy, Suspense, useMemo, useState, type ErrorInfo, type ReactNode } from "react";
 
 import { Notice } from "./ui";
 import type { DagGraphProps, WorkflowGraphProps } from "../graph/types";
@@ -9,17 +9,53 @@ let cachedGraphModule: GraphModule | null = null;
 let graphModulePromise: Promise<GraphModule> | null = null;
 let graphLoadAttempt = 0;
 
-function ensureGraphStylesheet(): void {
+/** Upper bound so a never-firing `load`/`error` event cannot wedge the graph import. */
+const STYLESHEET_LOAD_TIMEOUT_MS = 4000;
+
+/**
+ * Keep this import unconditional and alone: Vite/Rolldown analyses the literal specifier here and
+ * emits `__vite__mapDeps([..., ariadne-graph.css])`. Folding it into a ternary with a
+ * `@vite-ignore` sibling made the preload list collapse to `[]` (regression #79).
+ */
+function importInitialGraphModule(): Promise<GraphModule> {
+  return import("../graph/ariadne-graph");
+}
+
+function waitForStylesheet(link: HTMLLinkElement): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      link.removeEventListener("load", finish);
+      link.removeEventListener("error", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, STYLESHEET_LOAD_TIMEOUT_MS);
+    link.addEventListener("load", finish);
+    link.addEventListener("error", finish);
+  });
+}
+
+/** Resolve once ariadne-graph.css is applied, injecting it when Vite's preload was bypassed. */
+async function ensureGraphStylesheet(): Promise<void> {
   if (typeof document === "undefined" || import.meta.env.DEV) return;
   const href = new URL(/* @vite-ignore */ "./ariadne-graph.css", import.meta.url).href;
-  const existing = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).some(
+  const existing = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).find(
     (link) => (link as HTMLLinkElement).href === href,
-  );
-  if (existing) return;
+  ) as HTMLLinkElement | undefined;
+  if (existing) {
+    if (existing.sheet) return;
+    await waitForStylesheet(existing);
+    return;
+  }
   const link = document.createElement("link");
   link.rel = "stylesheet";
   link.href = href;
+  const loaded = waitForStylesheet(link);
   document.head.appendChild(link);
+  await loaded;
 }
 
 function loadGraphModule(): Promise<GraphModule> {
@@ -28,13 +64,13 @@ function loadGraphModule(): Promise<GraphModule> {
   const attempt = graphLoadAttempt++;
   const promise: Promise<GraphModule> =
     attempt === 0 || import.meta.env.DEV
-      ? import("../graph/ariadne-graph")
+      ? importInitialGraphModule()
       : (import(
           /* @vite-ignore */ `${new URL(/* @vite-ignore */ "./ariadne-graph.js", import.meta.url).href}?retry=${attempt}`
         ) as Promise<GraphModule>);
   graphModulePromise = promise
-    .then((mod) => {
-      if (attempt > 0) ensureGraphStylesheet();
+    .then(async (mod) => {
+      await ensureGraphStylesheet();
       cachedGraphModule = mod;
       return mod;
     })
@@ -86,7 +122,10 @@ export class GraphErrorBoundary extends Component<BoundaryProps, BoundaryState> 
 }
 
 export function DagGraphHost(props: DagGraphProps) {
-  const Loaded = cachedGraphModule?.DagGraphView ?? null;
+  // Freeze the choice per mount: if `cachedGraphModule` fills in after the lazy chunk resolves, a
+  // later re-render would swap <LazyDag> for <Loaded>, remounting the graph and dropping focus and
+  // the panned/zoomed viewport on the first interaction.
+  const [Loaded] = useState(() => cachedGraphModule?.DagGraphView ?? null);
   const LazyDag = useMemo(
     () =>
       Loaded
@@ -110,7 +149,7 @@ export function DagGraphHost(props: DagGraphProps) {
 }
 
 export function WorkflowGraphHost(props: WorkflowGraphProps) {
-  const Loaded = cachedGraphModule?.WorkflowGraphView ?? null;
+  const [Loaded] = useState(() => cachedGraphModule?.WorkflowGraphView ?? null);
   const LazyWorkflow = useMemo(
     () =>
       Loaded

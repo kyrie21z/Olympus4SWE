@@ -753,6 +753,9 @@ def test_ariadne_http_sse_and_idempotent_hitl_commands(tmp_path: Path) -> None:
         assert app_res.status_code == 200
         assert "javascript" in app_res.headers["content-type"]
         assert app_res.headers["cache-control"] == "no-store"
+        # Regression #79: the lazy graph import must keep its CSS in Vite's preload dependency
+        # list, otherwise React Flow renders unstyled until a manual retry.
+        assert "assets/ariadne-graph.css" in app_res.text
 
         graph_js = client.get("/static/assets/ariadne-graph.js")
         assert graph_js.status_code == 200

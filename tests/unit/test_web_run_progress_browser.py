@@ -688,6 +688,22 @@ def _wait_for_layout(page, mode="elk"):
     return page.locator("#dag-graph").evaluate(GRAPH_GEOMETRY)
 
 
+GRAPH_STYLESHEET = """() => {
+  const link = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+    .find((node) => node.href.includes('ariadne-graph.css'));
+  if (!link) return null;
+  return {href: link.href, rules: link.sheet ? link.sheet.cssRules.length : 0};
+}"""
+
+
+def _assert_graph_stylesheet_applied(page):
+    """Regression #79: ariadne-graph.css must be applied on first paint, with no retry needed."""
+    stylesheet = page.evaluate(GRAPH_STYLESHEET)
+    assert stylesheet is not None, "ariadne-graph.css <link> missing"
+    assert stylesheet["href"].endswith("/static/assets/ariadne-graph.css"), stylesheet
+    assert stylesheet["rules"] > 0, stylesheet
+
+
 def _inside(point, card, inset=1.0):
     x, y = point
     return (card["x"] + inset < x < card["x"] + card["w"] - inset
@@ -725,6 +741,7 @@ def test_task_dag_island_keeps_fixed_scale_and_routes_around_cards(skip_dag, bro
     page = browser.new_page(viewport={"width": 1600, "height": 1000})
     page.goto(f"{url}/?run={run_id}")
     geo = _wait_for_layout(page)
+    _assert_graph_stylesheet_applied(page)
     cards = {card["id"]: card for card in geo["cards"]}
     assert set(cards) == set(SKIP_DEPS)
 
@@ -892,6 +909,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     page = browser.new_page(viewport={"width": 1400, "height": 900})
     page.goto(f"{url}/?run={run_id}")
     _wait_for_layout(page)
+    _assert_graph_stylesheet_applied(page)
     expect = playwright.expect
 
     page.evaluate("""() => {
@@ -955,6 +973,7 @@ def test_task_dag_island_empty_cycle_fallback_and_missing_bundle(workbench, brow
     broken.locator("#thread-list .thread-item").nth(1).click()
     expect(broken.locator("#dag-graph .ag-island")).to_be_visible()
     expect(broken.locator("#workflow-graph .ag-island")).to_be_visible()
+    _assert_graph_stylesheet_applied(broken)
     broken.close()
 
 

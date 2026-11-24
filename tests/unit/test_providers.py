@@ -1126,3 +1126,132 @@ def test_dialects_handle_gateway_quirks_and_unwrap_transport_errors(
         )
     assert excinfo.value.status_code == 307
     assert hosts == ["gateway.invalid"]
+
+
+def test_keepalive_http_client_sets_socket_options_and_long_read_timeout() -> None:
+    import socket
+
+    from olympus.providers.dialects.http import (
+        DEFAULT_READ_TIMEOUT_SECONDS,
+        build_keepalive_httpx_client,
+        tcp_keepalive_socket_options,
+    )
+
+    assert DEFAULT_READ_TIMEOUT_SECONDS >= 300.0
+    opts = tcp_keepalive_socket_options()
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in opts
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    if idle_opt is not None:
+        idle_values = [
+            val for lvl, opt, val in opts if lvl == socket.IPPROTO_TCP and opt == idle_opt
+        ]
+        assert idle_values and 15 <= idle_values[0] <= 30
+
+    client = build_keepalive_httpx_client()
+    try:
+        assert client.timeout.read is not None and client.timeout.read >= 300.0
+        assert client.timeout.connect is not None and client.timeout.connect <= 30.0
+        pool = getattr(client._transport, "_pool", None)
+        assert pool is not None
+        assert getattr(pool, "_socket_options", None) == opts
+    finally:
+        client.close()
+
+
+def test_openai_dialect_enable_thinking_false_streaming_and_fallback() -> None:
+    seen_bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_bodies.append(body)
+        if body.get("stream"):
+            sse = (
+                'data: {"id":"1","object":"chat.completion.chunk","model":"m-stream",'
+                '"choices":[{"index":0,"delta":{"role":"assistant",'
+                '"content":"{\\"action\\": "}}]}\n\n'
+                'data: {"id":"1","object":"chat.completion.chunk","model":"m-stream",'
+                '"choices":[{"index":0,"delta":{"content":"\\"approve\\"}"}}],'
+                '"usage":{"prompt_tokens":12,"completion_tokens":5}}\n\n'
+                "data: [DONE]\n\n"
+            )
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=sse)
+        return httpx.Response(
+            200,
+            json={
+                "model": "m-unary",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        dialect = OpenAIChatDialect(http_client=client)
+        endpoint = EndpointTarget("sk-test", "https://gateway.invalid/v1")
+
+        # Default core call leaves thinking untouched (no enable_thinking injected).
+        default_resp = dialect.send(
+            endpoint,
+            model="m",
+            messages=[ChatMessage(role="user", content="plan")],
+        )
+        assert default_resp.content == "ok"
+        assert "enable_thinking" not in seen_bodies[-1]
+        assert seen_bodies[-1].get("stream") is not True
+
+        # Classification call explicitly disables thinking and uses streaming.
+        stream_resp = dialect.send(
+            endpoint,
+            model="m",
+            messages=[ChatMessage(role="user", content="classify")],
+            enable_thinking=False,
+            stream=True,
+            timeout=30.0,
+        )
+        assert stream_resp.content == '{"action": "approve"}'
+        assert stream_resp.raw_model == "m-stream"
+        assert stream_resp.usage.input_tokens == 12
+        assert stream_resp.usage.output_tokens == 5
+        assert seen_bodies[-1].get("enable_thinking") is False
+        assert seen_bodies[-1].get("stream") is True
+    finally:
+        client.close()
+
+    # Strict endpoint rejecting unknown enable_thinking retries cleanly without it.
+    strict_bodies: list[dict[str, Any]] = []
+
+    def strict_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        strict_bodies.append(body)
+        if "enable_thinking" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unrecognized request argument supplied: enable_thinking"
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "strict-m",
+                "choices": [{"message": {"role": "assistant", "content": "fallback-ok"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+            },
+        )
+
+    strict_client = httpx.Client(transport=httpx.MockTransport(strict_handler))
+    try:
+        resp = OpenAIChatDialect(http_client=strict_client).send(
+            EndpointTarget("sk-test", "https://gateway.invalid/v1"),
+            model="strict-m",
+            messages=[ChatMessage(role="user", content="classify")],
+            enable_thinking=False,
+        )
+        assert resp.content == "fallback-ok"
+        assert len(strict_bodies) == 2
+        assert strict_bodies[0].get("enable_thinking") is False
+        assert "enable_thinking" not in strict_bodies[1]
+    finally:
+        strict_client.close()

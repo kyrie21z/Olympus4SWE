@@ -657,6 +657,32 @@ def _fast_path_intent(
     return None
 
 
+_ROUTER_TIMEOUT_SECONDS = 30.0
+
+
+def _call_router_provider(
+    provider: LLMProvider,
+    messages: list[ChatMessage],
+) -> Any:
+    """Invoke ``provider.complete`` with fast non-thinking classification hints when supported."""
+    import inspect
+
+    kwargs: dict[str, Any] = {"messages": messages}
+    params: dict[str, inspect.Parameter]
+    try:
+        params = dict(inspect.signature(provider.complete).parameters)
+    except (TypeError, ValueError):
+        params = {}
+    accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if accepts_varkw or "enable_thinking" in params:
+        kwargs["enable_thinking"] = False
+    if accepts_varkw or "stream" in params:
+        kwargs["stream"] = True
+    if accepts_varkw or "timeout" in params:
+        kwargs["timeout"] = _ROUTER_TIMEOUT_SECONDS
+    return provider.complete(**kwargs)
+
+
 def parse_reply(
     *,
     provider: LLMProvider,
@@ -682,11 +708,12 @@ def parse_reply(
         gate=gate,
         completed=completed,
     )
-    response = provider.complete(
-        messages=[
+    response = _call_router_provider(
+        provider,
+        [
             ChatMessage(role="system", content=_ROUTER_SYSTEM_PROMPT),
             ChatMessage(role="user", content=user_prompt),
-        ]
+        ],
     )
     try:
         parsed = _RawIntent.model_validate_json(_extract_json(response.content))

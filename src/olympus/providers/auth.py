@@ -167,7 +167,7 @@ class PooledProvider:
         model_name: str,
         dialect: Dialect,
         pool: CredentialPool,
-        timeout: float = 180.0,
+        timeout: float = 300.0,
     ) -> None:
         self.model_name = model_name
         self.dialect = dialect
@@ -203,12 +203,16 @@ class PooledProvider:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] = (),
         temperature: float = 0.0,
+        enable_thinking: bool | None = None,
+        stream: bool = False,
+        timeout: float | None = None,
     ) -> LLMResponse:
         if not self.pool.endpoints:
             raise ProviderError(
                 "No credentials resolved for this provider. Set an API key environment "
                 "variable, configure providers.json, or pass --base-url."
             )
+        effective_timeout = self.timeout if timeout is None else timeout
         while True:
             endpoint = self.pool.active
             if endpoint is None:
@@ -220,7 +224,9 @@ class PooledProvider:
                     messages=messages,
                     tools=tools,
                     temperature=temperature,
-                    timeout=self.timeout,
+                    timeout=effective_timeout,
+                    enable_thinking=enable_thinking,
+                    stream=stream,
                 )
             except HttpStatusError as exc:
                 if not self.pool.should_failover(exc) or not self.pool.advance():

@@ -88,6 +88,7 @@ class MockLLMProvider:
         self._queue = list(responses or [])
         self._responder = responder
         self.recorded_requests: list[tuple[tuple[ChatMessage, ...], tuple[ToolSpec, ...]]] = []
+        self.recorded_options: list[dict[str, Any]] = []
 
     def complete(
         self,
@@ -95,9 +96,19 @@ class MockLLMProvider:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] = (),
         temperature: float = 0.0,
+        enable_thinking: bool | None = None,
+        stream: bool = False,
+        timeout: float | None = None,
     ) -> LLMResponse:
         del temperature
         self.recorded_requests.append((tuple(messages), tuple(tools)))
+        self.recorded_options.append(
+            {
+                "enable_thinking": enable_thinking,
+                "stream": stream,
+                "timeout": timeout,
+            }
+        )
         if self._responder is not None:
             return self._responder(messages, tools)
         if not self._queue:

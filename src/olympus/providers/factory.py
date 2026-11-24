@@ -47,7 +47,7 @@ def build_provider(
     user_providers_path: Path | None = _DEFAULT_USER_PROVIDERS_PATH,
     project_providers_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
-    timeout: float = 180.0,
+    timeout: float = 300.0,
 ) -> LLMProvider:
     """Construct a provider from a registry spec, environment, or ad-hoc base URL."""
     proc_env = os.environ if environ is None else environ
@@ -318,7 +318,7 @@ class OpenAICompatibleProvider(PooledProvider):
         endpoints: Sequence[EndpointTarget],
         compat: OpenAIChatCompat | None = None,
         max_tokens: int | None = None,
-        timeout: float = 180.0,
+        timeout: float = 300.0,
     ) -> None:
         super().__init__(
             model_name=model,
@@ -340,7 +340,7 @@ class AnthropicProvider(PooledProvider):
         model: str,
         endpoints: Sequence[EndpointTarget],
         max_tokens: int = 4096,
-        timeout: float = 180.0,
+        timeout: float = 300.0,
     ) -> None:
         super().__init__(
             model_name=model,

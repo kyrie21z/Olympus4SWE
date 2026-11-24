@@ -143,10 +143,13 @@ Rules:
 3. Prefer native file read/search/edit tools, batching independent reads, searches, and edits in
    one turn, instead of serial shell `cat`/`sed`/`grep`/`find` probes; reserve shell execution for
    running tests, linters, and builds.
-4. Read relevant files first using absolute paths under the sandbox root, and only write or edit
+4. Prefer small, incremental file writes and targeted edits over emitting hundreds of lines in a
+   single massive write call: scaffold a compact module first, then extend it in focused edits so
+   each turn stays short, verifiable, and resilient against upstream stream drops.
+5. Read relevant files first using absolute paths under the sandbox root, and only write or edit
    files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
    non-forbidden integration edits.
-5. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
+6. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding. Once all acceptance checks pass cleanly, stop
    iterating and deliver your final summary immediately instead of over-polishing."""
 

@@ -12,6 +12,10 @@ import httpx
 from anthropic.types import MessageParam, ToolUnionParam
 
 from olympus.providers.auth import EndpointTarget
+from olympus.providers.dialects.http import (
+    DEFAULT_READ_TIMEOUT_SECONDS,
+    build_keepalive_httpx_client,
+)
 from olympus.providers.types import (
     ChatMessage,
     HttpStatusError,
@@ -39,8 +43,11 @@ class AnthropicMessagesDialect:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSpec] = (),
         temperature: float = 0.0,
-        timeout: float = 180.0,
+        timeout: float = DEFAULT_READ_TIMEOUT_SECONDS,
+        enable_thinking: bool | None = None,
+        stream: bool = False,
     ) -> LLMResponse:
+        del enable_thinking, stream
         conversation, system_parts = self._serialize_messages(messages)
         request_kwargs: dict[str, Any] = {
             "model": model,
@@ -78,7 +85,7 @@ class AnthropicMessagesDialect:
             request_kwargs["extra_headers"] = extra_headers
 
         owned_client = (
-            httpx.Client(timeout=timeout, follow_redirects=False)
+            build_keepalive_httpx_client(timeout=timeout, follow_redirects=False)
             if self.http_client is None
             else None
         )

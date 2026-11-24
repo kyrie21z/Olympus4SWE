@@ -2955,3 +2955,46 @@ def test_reply_requeues_stranded_task_alongside_blocked_sibling_on_in_place_reco
     assert continuations
     assert continuations[-1].get("retried_task_ids") == ["T1"]
     assert continuations[-1].get("requeued_task_ids") == ["T2"]
+
+
+def test_router_disables_thinking_and_uses_streaming_short_timeout() -> None:
+    from olympus.providers.base import LLMResponse, MockLLMProvider
+    from olympus.session.router import parse_reply
+
+    provider = MockLLMProvider(
+        responses=[LLMResponse(content='{"action": "approve", "message": "looks good"}')]
+    )
+    intent = parse_reply(
+        provider=provider,
+        message="Looks reasonable, please proceed once ready.",
+        snapshot={"spec": None, "status": RunStatus.AWAITING_HUMAN},
+        pause_kind=PauseKind.APPROVAL,
+        gate="plan",
+    )
+    assert intent.action == "approve"
+    assert len(provider.recorded_options) == 1
+    assert provider.recorded_options[0]["enable_thinking"] is False
+    assert provider.recorded_options[0]["stream"] is True
+    assert provider.recorded_options[0]["timeout"] == 30.0
+
+    class _LegacyProvider:
+        model_name = "legacy"
+
+        def complete(
+            self,
+            *,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[object] = (),
+            temperature: float = 0.0,
+        ) -> LLMResponse:
+            del messages, tools, temperature
+            return LLMResponse(content='{"action": "approve", "message": "ok"}')
+
+    legacy_intent = parse_reply(
+        provider=_LegacyProvider(),  # type: ignore[arg-type]
+        message="Looks reasonable, please proceed once ready.",
+        snapshot={"spec": None, "status": RunStatus.AWAITING_HUMAN},
+        pause_kind=PauseKind.APPROVAL,
+        gate="plan",
+    )
+    assert legacy_intent.action == "approve"

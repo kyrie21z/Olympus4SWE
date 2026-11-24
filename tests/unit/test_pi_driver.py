@@ -2775,3 +2775,39 @@ print(json.dumps({"type": "message_end", "message": msg}), flush=True)
     assert outcome2.completed is False
     assert "keyless" not in outcome2.stop_reason
     assert "keyless" not in trace2.read_text(encoding="utf-8")
+
+
+def test_pi_env_injects_node_keepalive_preload_preserving_existing_node_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from olympus.harness.pi import _NET_KEEPALIVE_PATH, _build_pi_env
+
+    assert _NET_KEEPALIVE_PATH.is_file()
+    monkeypatch.setenv("NODE_OPTIONS", "--max-old-space-size=4096")
+    env = _build_pi_env(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="hi",
+            read_only=False,
+        )
+    )
+    node_opts = env.get("NODE_OPTIONS", "")
+    assert "--max-old-space-size=4096" in node_opts
+    assert f"--require={_NET_KEEPALIVE_PATH.resolve()}" in node_opts
+
+    # Idempotent when already present.
+    monkeypatch.setenv("NODE_OPTIONS", node_opts)
+    env2 = _build_pi_env(
+        DriverTurnRequest(
+            workspace_path=tmp_path,
+            env_root=tmp_path,
+            actor="worker",
+            system_prompt="",
+            user_prompt="hi",
+            read_only=False,
+        )
+    )
+    assert env2["NODE_OPTIONS"].count(str(_NET_KEEPALIVE_PATH.resolve())) == 1

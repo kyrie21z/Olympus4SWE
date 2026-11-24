@@ -49,6 +49,7 @@ _WRITABLE_TOOLS = "read,bash,edit,write,grep,find,ls"
 _FORBIDDEN_WRITE_TOOLS = "bash,write,edit,powershell"
 _HELP_PROBE_TIMEOUT_SECONDS = 10.0
 _SCOPE_GUARD_PATH = Path(__file__).with_name("pi_scope_guard.ts")
+_NET_KEEPALIVE_PATH = Path(__file__).with_name("pi_net_keepalive.cjs")
 _TRACE_MILESTONE_TYPES = frozenset(
     {
         "tool_execution_start",
@@ -272,12 +273,28 @@ def _read_only_tmp_dir(request: DriverTurnRequest) -> Path | None:
     return Path(tempfile.gettempdir()) / "olympus-pi-readonly-tmp" / f"{digest}-{safe_actor}"
 
 
+def _inject_pi_node_keepalive(env: dict[str, str]) -> None:
+    """Attach the TCP keep-alive & read-timeout preload to Pi's ``NODE_OPTIONS``."""
+    if not _NET_KEEPALIVE_PATH.is_file():
+        return
+    preload = str(_NET_KEEPALIVE_PATH.resolve())
+    if any(ch.isspace() or ch in ('"', "'") for ch in preload):
+        return
+    flag = f"--require={preload}"
+    existing = (env.get("NODE_OPTIONS") or "").strip()
+    if preload in existing:
+        return
+    env["NODE_OPTIONS"] = f"{existing} {flag}".strip() if existing else flag
+
+
 def _build_pi_env(request: DriverTurnRequest) -> dict[str, str]:
-    return build_sandbox_env(
+    env = build_sandbox_env(
         request.workspace_path,
         host_root=request.env_root,
         tmp_dir=_read_only_tmp_dir(request),
     )
+    _inject_pi_node_keepalive(env)
+    return env
 
 
 def _normalize_thinking_level(value: str | None) -> str | None:

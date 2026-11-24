@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import socket
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
@@ -38,6 +39,12 @@ _MAX_JSON_RESPONSE = 16 * 1024 * 1024
 _MAX_ERROR_RESPONSE = 64 * 1024
 _SUBSTRING_SECRET_MIN = 8
 _REDACTED = "[redacted]"
+UPSTREAM_READ_TIMEOUT_SECONDS = 300.0
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = 30.0
+UPSTREAM_POOL_TIMEOUT_SECONDS = 10.0
+TCP_KEEPALIVE_IDLE_SECONDS = 20
+TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+TCP_KEEPALIVE_COUNT = 6
 _FAILOVER_AUTH = {401, 402, 403}
 _SECURITY_HEADERS = (
     (b"cache-control", b"no-store"),
@@ -52,6 +59,30 @@ _SECURITY_HEADERS = (
         ),
     ),
 )
+
+
+def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
+    options: list[tuple[int, int, int]] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    if idle is not None:
+        options.append((socket.IPPROTO_TCP, int(idle), TCP_KEEPALIVE_IDLE_SECONDS))
+    interval = getattr(socket, "TCP_KEEPINTVL", None)
+    if interval is not None:
+        options.append((socket.IPPROTO_TCP, int(interval), TCP_KEEPALIVE_INTERVAL_SECONDS))
+    count = getattr(socket, "TCP_KEEPCNT", None)
+    if count is not None:
+        options.append((socket.IPPROTO_TCP, int(count), TCP_KEEPALIVE_COUNT))
+    return options
+
+
+def _build_upstream_transport(
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncBaseTransport:
+    if transport is not None:
+        return transport
+    return httpx.AsyncHTTPTransport(
+        trust_env=False, socket_options=_tcp_keepalive_socket_options()
+    )
 
 
 def _error(status: int, code: str, message: str, **detail: Any) -> JSONResponse:
@@ -490,11 +521,15 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with httpx.AsyncClient(
-            transport=transport,
+            transport=_build_upstream_transport(transport),
             trust_env=False,
             follow_redirects=False,
             cookies=CookieJar(policy=_NoCookies()),
-            timeout=httpx.Timeout(90, connect=10, pool=10),
+            timeout=httpx.Timeout(
+                UPSTREAM_READ_TIMEOUT_SECONDS,
+                connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                pool=UPSTREAM_POOL_TIMEOUT_SECONDS,
+            ),
         ) as client:
             app.state.client = client
             yield

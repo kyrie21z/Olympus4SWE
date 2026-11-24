@@ -1,5 +1,6 @@
 import json
 import logging
+import socket
 import sqlite3
 from collections.abc import AsyncIterator
 from functools import partial
@@ -459,3 +460,46 @@ def test_error_body_size_is_bounded_before_and_after_redaction(
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "upstream_error"
     assert len(response.content) <= 64 * 1024
+
+
+def test_upstream_client_uses_long_read_timeout_and_keepalive(
+    config: Config,
+    credentials: dict[tuple[str, str], Credential],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
+    app = create_app(config, credentials)
+    with local_client(app):
+        client = app.state.client
+        assert client.timeout == httpx.Timeout(300.0, connect=30.0, pool=10.0)
+        assert client._trust_env is False
+        transport = client._transport
+        assert isinstance(transport, httpx.AsyncHTTPTransport)
+        options = transport._pool._socket_options
+        assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in options
+        for name, seconds in (
+            ("TCP_KEEPIDLE", 20),
+            ("TCP_KEEPALIVE", 20),
+            ("TCP_KEEPINTVL", 10),
+            ("TCP_KEEPCNT", 6),
+        ):
+            option = getattr(socket, name, None)
+            if option is not None:
+                assert (socket.IPPROTO_TCP, int(option), seconds) in options
+
+
+def test_upstream_read_timeout_returns_502_and_records_event(
+    config: Config, credentials: dict[tuple[str, str], Credential]
+) -> None:
+    def upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow upstream", request=request)
+
+    injected = httpx.MockTransport(upstream)
+    app = create_app(config, credentials, transport=injected)
+    with local_client(app) as client:
+        assert app.state.client._transport is injected
+        response = client.post("/v1/chat/completions", json={"model": "mock-model"})
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "upstream_error"
+        (event,) = client.get("/api/events").json()["events"]
+        assert event["outcome"] == "upstream_error"

@@ -6,9 +6,12 @@ import pytest
 
 from olympus.core.contracts import (
     AcceptanceCheck,
+    AcceptanceCriterion,
     CheckKind,
+    DeliverableKind,
     DesignModule,
     DesignSpec,
+    EarsPattern,
     GoalSpec,
     RequirementItem,
     TaskKind,
@@ -21,7 +24,9 @@ from olympus.core.dag import (
     assert_valid_plan,
     compute_dispatchable_tasks,
     normalize_scope_path,
+    paths_overlap,
     scopes_overlap,
+    validate_goal_spec,
     validate_plan,
 )
 
@@ -219,136 +224,6 @@ def test_validate_plan_rejects_hardcoded_host_workspace_path_in_command_check() 
     assert validate_plan(good_plan, spec=spec, workspace_root="/tmp/host_repo") == []
 
 
-def test_validate_plan_rejects_broken_inline_python_syntax_and_accepts_multiline() -> None:
-    spec = _spec()
-    bad_try_cmd = (
-        'python -c "from src.api.cfg import Config; c = Config(); '
-        "try: c.limit = 99; assert False; except AttributeError: pass\""
-    )
-    bad_plan = TaskPlan(
-        spec_id=spec.spec_id,
-        spec_hash=spec.content_hash,
-        tasks=[
-            TaskNode(
-                task_id="T1",
-                title="Contract",
-                objective="Verify config immutability",
-                requirement_refs=["R1", "R2"],
-                write_scope=["src/api/cfg.py"],
-                acceptance_checks=[
-                    _check("C-try", bad_try_cmd),
-                    _check("C-quote", 'python -c "unclosed'),
-                ],
-            )
-        ],
-    )
-    violations = validate_plan(bad_plan, spec=spec)
-    assert any("C-try" in v and "invalid Python syntax" in v for v in violations)
-    assert any("C-quote" in v and "invalid shell syntax" in v for v in violations)
-
-    good_multiline_cmd = (
-        'python -c "\nfrom src.api.cfg import Config\nc = Config()\n'
-        'try:\n    c.limit = 99\n    assert False\nexcept AttributeError:\n    pass\n"'
-    )
-    good_plan = bad_plan.model_copy(
-        update={
-            "tasks": [
-                bad_plan.tasks[0].model_copy(
-                    update={
-                        "acceptance_checks": [
-                            _check("C-multi", good_multiline_cmd),
-                            _check("C-pytest", "python -m pytest -c pyproject.toml -q"),
-                        ]
-                    }
-                )
-            ]
-        }
-    )
-    assert validate_plan(good_plan, spec=spec) == []
-
-
-def test_validate_plan_rejects_non_ancestor_sibling_import_and_accepts_dependency() -> None:
-    spec = _spec()
-    mw_cmd = (
-        "python -c 'from src.api.limiter import FixedWindowLimiter; "
-        "from src.api import server; assert FixedWindowLimiter'"
-    )
-    parallel_bad = TaskPlan(
-        spec_id=spec.spec_id,
-        spec_hash=spec.content_hash,
-        tasks=[
-            TaskNode(
-                task_id="T1-limiter",
-                title="Limiter",
-                objective="Limiter core",
-                requirement_refs=["R1"],
-                write_scope=["src/api/limiter.py"],
-                acceptance_checks=[_check("CL", "python -c 'import src.api.limiter'")],
-            ),
-            TaskNode(
-                task_id="T1-middleware",
-                title="Middleware",
-                objective="Rate limit middleware",
-                requirement_refs=["R2"],
-                depends_on=[],
-                write_scope=["src/api/middleware.py"],
-                acceptance_checks=[_check("CM", mw_cmd)],
-            ),
-            TaskNode(
-                task_id="T2-integrate",
-                title="Export",
-                objective="Export package symbol",
-                requirement_refs=["R2"],
-                depends_on=["T1-limiter", "T1-middleware"],
-                write_scope=["src/api/__init__.py"],
-                acceptance_checks=[_check("CI", "pytest -q")],
-            ),
-        ],
-    )
-    violations = validate_plan(parallel_bad, spec=spec)
-    assert len(violations) == 1
-    assert "T1-middleware" in violations[0]
-    assert "T1-limiter" in violations[0]
-
-    ordered_ok = parallel_bad.model_copy(
-        update={
-            "tasks": [
-                parallel_bad.tasks[0],
-                parallel_bad.tasks[1].model_copy(update={"depends_on": ["T1-limiter"]}),
-                parallel_bad.tasks[2],
-            ]
-        }
-    )
-    assert validate_plan(ordered_ok, spec=spec) == []
-
-    # Stdlib / third-party imports must never false-positive even when a sibling owns `src/`.
-    stdlib_plan = TaskPlan(
-        spec_id=spec.spec_id,
-        spec_hash=spec.content_hash,
-        tasks=[
-            TaskNode(
-                task_id="T1-src",
-                title="Core",
-                objective="Core src",
-                requirement_refs=["R1"],
-                write_scope=["src/"],
-                acceptance_checks=[_check("C1", "python -c 'pass'")],
-            ),
-            TaskNode(
-                task_id="T2-docs",
-                title="Docs",
-                objective="Verify docs with pathlib and pytest",
-                requirement_refs=["R2"],
-                write_scope=["docs/"],
-                acceptance_checks=[
-                    _check("C2", "python -c 'import pathlib, pytest; assert pathlib.Path'")
-                ],
-            ),
-        ],
-    )
-    assert validate_plan(stdlib_plan, spec=spec) == []
-
-
 def _vertical_spec() -> GoalSpec:
     return GoalSpec(
         spec_id="spec-vertical",
@@ -531,32 +406,6 @@ def test_validate_plan_vertical_gate_rejects_horizontal_test_only_deferral() -> 
     assert any("T1-code" in violation and "command" in violation for violation in violations)
 
 
-def test_validate_plan_vertical_gate_rejects_monolithic_multi_module_sink() -> None:
-    spec = _vertical_spec()
-    design = _vertical_design(spec)
-    plan = TaskPlan(
-        spec_id=spec.spec_id,
-        spec_hash=spec.content_hash,
-        design_id=design.design_id,
-        design_hash=design.content_hash,
-        tasks=[
-            TaskNode(
-                task_id="T1-everything",
-                title="Catch-all implementation",
-                objective="Build every module and requirement in one ticket",
-                requirement_refs=["R1", "R2", "R3", "R4"],
-                design_refs=["M1", "M2", "M3"],
-                write_scope=["src/core.py", "src/items.py", "src/count.py", "src/api.py"],
-                acceptance_checks=[_check()],
-            )
-        ],
-    )
-    violations = validate_plan(plan, spec=spec, design=design, topology="vertical_slices")
-    assert any(
-        "T1-everything" in violation and "monolithic" in violation for violation in violations
-    )
-
-
 @pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
 def test_validate_plan_vertical_gate_accepts_clean_tracer_bullet_dag(topology: str) -> None:
     spec = _vertical_spec()
@@ -594,108 +443,110 @@ def test_validate_plan_vertical_gate_is_noop_for_legacy_topologies(
     )
     assert validate_plan(monolithic, spec=spec, design=design) == []
     assert validate_plan(monolithic, spec=spec, design=design, topology=topology) == []
-    with pytest.raises(PlanValidationError):
-        assert_valid_plan(monolithic, spec=spec, design=design, topology="tdd_first")
 
 
-def test_validate_plan_monolithic_sink_catches_bypasses_and_allows_thin_tracer() -> None:
-    spec = _vertical_spec()
-    design = _vertical_design(spec)
-
-    root_monolith = TaskPlan(
-        spec_id=spec.spec_id,
-        spec_hash=spec.content_hash,
-        design_id=design.design_id,
-        design_hash=design.content_hash,
-        tasks=[
-            TaskNode(
-                task_id="T-root",
-                title="Repo-root monolith",
-                objective="Implement everything under repo root",
-                requirement_refs=["R1", "R2", "R3", "R4"],
-                design_refs=["M1", "M2", "M3"],
-                write_scope=["."],
-                acceptance_checks=[_check()],
+def test_prose_and_shell_shape_pass_while_hard_dag_invariants_still_fail() -> None:
+    """Speculative prose/AST heuristics are gone; cycles, missing deps, and overlaps remain."""
+    prose_spec = GoalSpec(
+        spec_id="spec-prose",
+        goal="Ship an operator console",
+        deliverable_kind=DeliverableKind.CLI,
+        observable_surfaces=["blacknote CLI"],
+        actors=["operator"],
+        test_seams=["blacknote --help"],
+        out_of_scope=["billing"],
+        requirements=[
+            RequirementItem(
+                id="R1",
+                description="The console should be user-friendly and handle appropriately, etc.",
+                actor="operator",
+                ears_criteria=[
+                    AcceptanceCriterion(
+                        id="R1-C1",
+                        pattern=EarsPattern.UBIQUITOUS,
+                        outcome="print 美观 help text",
+                    )
+                ],
             )
         ],
     )
-    assert any(
-        "T-root" in v and "monolithic" in v
-        for v in validate_plan(root_monolith, spec=spec, design=design, topology="tdd_first")
-    )
+    assert validate_goal_spec(prose_spec) == []
 
-    dir_scopes = ["storage/", "logic/", "ui/", "tests/"]
-    multi_dir_design = design.model_copy(
-        update={
-            "modules": [
-                mod.model_copy(update={"target_paths": [scope]})
-                for mod, scope in zip(design.modules, dir_scopes[:3], strict=True)
-            ]
-        }
-    )
-    omitted_refs_plan = TaskPlan(
+    spec = _spec()
+    shell_plan = TaskPlan(
         spec_id=spec.spec_id,
         spec_hash=spec.content_hash,
-        design_id=multi_dir_design.design_id,
-        design_hash=multi_dir_design.content_hash,
         tasks=[
             TaskNode(
-                task_id="T-boot",
-                title="Bootstrap",
-                objective="Seed bootstrap",
-                requirement_refs=["R1", "R2", "R3"],
-                design_refs=["M1", "M2", "M3"],
-                write_scope=["bootstrap/"],
-                acceptance_checks=[_check("C1")],
-            ),
-            TaskNode(
-                task_id="T-sink",
-                title="Catch-all without design_refs",
-                objective="Write every module scope at once",
-                requirement_refs=["R4"],
-                design_refs=[],
-                depends_on=["T-boot"],
-                write_scope=dir_scopes,
-                acceptance_checks=[_check("C2")],
-            ),
+                task_id="T1",
+                title="Pipeline and inline python",
+                objective="Run a shell pipeline plus an inline snippet",
+                requirement_refs=["R1", "R2"],
+                write_scope=["src/app.py"],
+                acceptance_checks=[
+                    _check("C1", "pytest -q && ruff check src"),
+                    _check("C2", "python -c 'import src.app; print(1)'"),
+                ],
+            )
         ],
     )
-    assert any(
-        "T-sink" in v and "monolithic" in v
-        for v in validate_plan(
-            omitted_refs_plan, spec=spec, design=multi_dir_design, topology="tdd_first"
+    assert validate_plan(shell_plan, spec=spec) == []
+
+    def task(task_id: str, depends_on: list[str], scope: str) -> TaskNode:
+        return TaskNode(
+            task_id=task_id,
+            title=task_id,
+            objective=task_id,
+            requirement_refs=["R1", "R2"],
+            depends_on=depends_on,
+            write_scope=[scope],
+            acceptance_checks=[_check(f"C-{task_id}")],
         )
-    )
 
-    design_only_sink = TaskPlan(
-        design_id=multi_dir_design.design_id,
-        design_hash=multi_dir_design.content_hash,
+    cyclic = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[task("T1", ["T2"], "src/a.py"), task("T2", ["T1"], "src/b.py")],
+    )
+    with pytest.raises(PlanValidationError, match="cycle"):
+        assert_valid_plan(cyclic, spec=spec)
+
+    dangling = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[task("T1", ["T9"], "src/a.py")],
+    )
+    with pytest.raises(PlanValidationError, match="unknown task"):
+        assert_valid_plan(dangling, spec=spec)
+
+    overlapping = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[task("T1", [], "src/app/"), task("T2", [], "src/app/cli.py")],
+    )
+    with pytest.raises(PlanValidationError, match="overlapping write_scope"):
+        assert_valid_plan(overlapping, spec=spec)
+
+    assert not paths_overlap("test_*.py", "src/app.py")
+    assert not paths_overlap("foo_*.py", "bar.py")
+
+    punctuation_only = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
         tasks=[
             TaskNode(
-                task_id="T-design-only",
-                title="Design-only catch-all",
-                objective="Implement all modules in one task",
-                requirement_refs=["R1", "R2", "R3", "R4"],
-                design_refs=["M1", "M2", "M3"],
-                write_scope=dir_scopes,
-                acceptance_checks=[_check()],
+                task_id="T1",
+                title="Punctuation command",
+                objective="Invalid punctuation-only command",
+                requirement_refs=["R1", "R2"],
+                write_scope=["src/"],
+                acceptance_checks=[
+                    AcceptanceCheck(
+                        id="C1", kind=CheckKind.COMMAND, description="No-op", command=";"
+                    )
+                ],
             )
         ],
     )
-    assert any(
-        "T-design-only" in v and "monolithic" in v
-        for v in validate_plan(design_only_sink, design=multi_dir_design, topology="tdd_first")
-    )
-
-    clean_plan = _vertical_slices_plan(spec, design)
-    thin_tracer = clean_plan.tasks[0].model_copy(
-        update={
-            "requirement_refs": ["R1"],
-            "design_refs": ["M1", "M2", "M3"],
-            "write_scope": ["src/core.py", "src/items.py", "src/count.py", "src/app.py"],
-        }
-    )
-    tracer_plan = clean_plan.model_copy(
-        update={"tasks": [thin_tracer, clean_plan.tasks[1], clean_plan.tasks[2]]}
-    )
-    assert validate_plan(tracer_plan, spec=spec, design=design, topology="tdd_first") == []
+    with pytest.raises(PlanValidationError, match="command"):
+        assert_valid_plan(punctuation_only, spec=spec, topology="vertical_slices")

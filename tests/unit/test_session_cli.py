@@ -664,35 +664,6 @@ def test_deterministic_validation_failure_pauses_blocked(
     assert _git_status(repo) == ""
 
 
-def test_invalid_check_syntax_auto_retries_before_pausing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    state = tmp_path / "state"
-    broken = (
-        "python3 -c \"import calculator; try: assert calculator.divide(6, 2) == 3; "
-        "except Exception: pass\""
-    )
-    script = SessionScript()
-    script.align.append(json.dumps(_goal_spec()))
-    script.design.append(json.dumps(_design()))
-    script.plan.append(json.dumps(_plan(command=broken)))
-    script.plan.append(json.dumps(_plan()))
-    script.workers.append(("calculator.py", _CALC_CODE))
-    _patch_provider(monkeypatch, script)
-
-    code, envelope = _invoke(["start", "Build a calculator library", *_base(repo, state)])
-    assert code == 0, json.dumps(envelope, indent=2)
-    assert envelope["status"] == "completed"
-    assert envelope["pause_kind"] is None
-    assert envelope["changed_files"] == ["calculator.py"]
-    assert script.plan == []
-
-    plan = RunStore(state / "olympus.db").get_run(str(envelope["run_id"]))["plan"]
-    assert plan.tasks[0].acceptance_checks[0].command == _DIVIDE_CHECK
-
-
 def test_blocked_pause_hint_restarts_from_plan_and_completes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

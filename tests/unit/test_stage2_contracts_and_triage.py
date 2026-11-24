@@ -210,65 +210,6 @@ def test_goal_spec_gate_requires_out_of_scope_by_default() -> None:
     ) == []
 
 
-def test_goal_spec_gate_rejects_vague_unquantified_wording() -> None:
-    spec = _canonical_spec()
-    vague_req = RequirementItem(
-        id="R3",
-        description="The UI must be user-friendly and handle appropriately",
-        actor="operator",
-        ears_criteria=[
-            _ears("R3-C1", EarsPattern.UBIQUITOUS, outcome="make the interface 美观")
-        ],
-    )
-    spec = spec.model_copy(update={"requirements": [*spec.requirements, vague_req]})
-    violations = validate_goal_spec(spec)
-    assert any("Vague unquantified wording" in v for v in violations)
-
-
-def test_goal_spec_gate_accepts_vague_word_with_a_measurable_detail() -> None:
-    spec = _canonical_spec()
-    concrete_req = RequirementItem(
-        id="R4",
-        description="The interface stays user-friendly: first paint within 300 ms",
-        actor="operator",
-        ears_criteria=[
-            _ears(
-                "R4-C1",
-                EarsPattern.UBIQUITOUS,
-                outcome="keep the settings page 界面友好 with a 300 ms p95 budget",
-            )
-        ],
-    )
-    spec = spec.model_copy(update={"requirements": [*spec.requirements, concrete_req]})
-    assert validate_goal_spec(spec) == []
-
-
-def test_goal_spec_gate_rejects_premature_implementation_leaks() -> None:
-    spec = _canonical_spec()
-    leaky = RequirementItem(
-        id="R5",
-        description="Create the table with CREATE TABLE items and edit src/api/app.py",
-        actor="operator",
-        ears_criteria=[
-            _ears("R5-C1", EarsPattern.UBIQUITOUS, outcome="persist rows with 1 ms latency")
-        ],
-    )
-    spec = spec.model_copy(update={"requirements": [*spec.requirements, leaky]})
-    violations = validate_goal_spec(spec)
-    assert any("implementation leak" in v for v in violations)
-
-    allowed = spec.model_copy(
-        update={
-            "constraints": [
-                "python 3.13",
-                "CREATE TABLE items",
-                "src/api/app.py",
-            ]
-        }
-    )
-    assert validate_goal_spec(allowed) == []
-
-
 def test_goal_spec_gate_requires_public_test_seams_under_strict_ears() -> None:
     missing = _canonical_spec().model_copy(update={"test_seams": []})
     assert any("test_seams" in v for v in validate_goal_spec(missing))
@@ -276,15 +217,6 @@ def test_goal_spec_gate_requires_public_test_seams_under_strict_ears() -> None:
 
     blank = _canonical_spec().model_copy(update={"test_seams": ["", "   "]})
     assert any("test_seams" in v for v in validate_goal_spec(blank))
-
-
-def test_goal_spec_gate_applies_hygiene_to_test_seams() -> None:
-    spec = _canonical_spec().model_copy(
-        update={"test_seams": ["用户登录体验流畅", "src/api/routes.py"]}
-    )
-    violations = validate_goal_spec(spec)
-    assert any("Vague unquantified wording in test seam" in v for v in violations)
-    assert any("implementation leak in test seam" in v for v in violations)
 
 
 def test_align_stage_persists_and_renders_test_seams_under_strict_canonical(

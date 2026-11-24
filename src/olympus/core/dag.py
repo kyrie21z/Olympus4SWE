@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-import ast
-import contextlib
-import fnmatch
 import re
-import shlex
-import sys
-from collections import deque
-from collections.abc import Sequence
-from pathlib import Path, PurePosixPath
+from collections import Counter
+from collections.abc import Collection, Mapping
+from itertools import combinations
+from pathlib import Path
 
 from olympus.core.contracts import (
     CheckKind,
-    DesignModule,
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
@@ -23,6 +18,10 @@ from olympus.core.contracts import (
     TaskPlan,
     TaskStatus,
 )
+from olympus.core.scope_paths import normalize_scope_path as normalize_scope_path
+from olympus.core.scope_paths import normalized_scopes, overlap_messages
+from olympus.core.scope_paths import paths_overlap as paths_overlap
+from olympus.core.scope_paths import scopes_overlap as scopes_overlap
 
 
 class PlanValidationError(ValueError):
@@ -33,184 +32,28 @@ class PlanValidationError(ValueError):
         super().__init__("; ".join(violations))
 
 
-# Buzzwords that describe an intention rather than a verifiable behavior.
-_VAGUE_TERMS: tuple[str, ...] = (
-    "美观",
-    "体验流畅",
-    "界面友好",
-    "合理处理",
-    "等等",
-    "及相关功能",
-    "user-friendly",
-    "user friendly",
-    "seamlessly",
-    "handle appropriately",
-    "etc.",
-)
-
-# A vague term is tolerated only when the same sentence carries a measurable detail.
-_CONCRETE_DETAIL_RE = re.compile(
-    r"(?:\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|m|min|h|%|percent|px|kb|mb|gb|"
-    r"qps|rps|req/s|requests|items|records|rows|lines|bytes|次|条|个|行|秒|毫秒|分钟)\b)"
-    r"|(?:\b(?:HTTP\s*)?[1-5]\d{2}\b)"
-    r"|(?:`[^`]+`)"
-    r"|(?:\b[\w./-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|toml|html|css)\b)"
-    r"|(?:\b(?:GET|POST|PUT|PATCH|DELETE)\s+/[^\s]*)",
-    re.IGNORECASE,
-)
-
-_IMPLEMENTATION_LEAK_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bCREATE\s+TABLE\b", re.IGNORECASE),
-    re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE),
-    re.compile(r"\bsrc/[A-Za-z0-9_./-]+\.py\b"),
-)
-
-
-def _vague_terms(text: str) -> list[str]:
-    if not text:
-        return []
-    lowered = text.lower()
-    hits = [term for term in _VAGUE_TERMS if term.lower() in lowered]
-    if not hits:
-        return []
-    if _CONCRETE_DETAIL_RE.search(text):
-        return []
-    return hits
-
-
-def _implementation_leaks(text: str, constraints: list[str]) -> list[str]:
-    if not text:
-        return []
-    allowed = " | ".join(constraints).lower()
-    leaks: list[str] = []
-    for pattern in _IMPLEMENTATION_LEAK_RES:
-        for match in pattern.finditer(text):
-            token = match.group(0)
-            if token.lower() in allowed:
-                continue
-            if token not in leaks:
-                leaks.append(token)
-    return leaks
-
-
-def normalize_scope_path(raw: str) -> str:
-    """Normalize a repo-relative POSIX scope pattern and reject escapes."""
-    cleaned = raw.strip().replace("\\", "/")
-    if not cleaned:
-        raise ValueError("Empty write_scope path is not allowed")
-    if cleaned.startswith("/"):
-        raise ValueError(f"write_scope must be repo-relative, got absolute path: {raw}")
-    is_dir_hint = cleaned.endswith("/")
-    pure = PurePosixPath(cleaned.rstrip("/") or ".")
-    if ".." in pure.parts:
-        raise ValueError(f"write_scope cannot contain '..': {raw}")
-    norm = pure.as_posix()
-    if norm == ".":
-        return "."
-    return f"{norm}/" if is_dir_hint else norm
-
-
-_GLOB_CHARS = ("*", "?", "[")
-
-
-def _has_glob(text: str) -> bool:
-    return any(char in text for char in _GLOB_CHARS)
-
-
-def _glob_static_prefix(pattern: str) -> str:
-    """Return the directory prefix a glob pattern is anchored to (e.g. ``docs/``)."""
-    cut = len(pattern)
-    for char in _GLOB_CHARS:
-        found = pattern.find(char)
-        if found != -1:
-            cut = min(cut, found)
-    prefix = pattern[:cut]
-    if "/" not in prefix:
-        return ""
-    return prefix[: prefix.rfind("/") + 1]
-
-
-def _glob_literal_prefix(pattern: str) -> str:
-    """Return the literal prefix before the first glob metacharacter."""
-    cut = len(pattern)
-    for char in _GLOB_CHARS:
-        found = pattern.find(char)
-        if found != -1:
-            cut = min(cut, found)
-    return pattern[:cut]
-
-
-def _glob_paths_overlap(a: str, b: str) -> bool:
-    """Conservatively decide whether a glob scope can collide with another path."""
-    a_glob, b_glob = _has_glob(a), _has_glob(b)
-    if a_glob and b_glob:
-        prefix_a, prefix_b = _glob_static_prefix(a), _glob_static_prefix(b)
-        if prefix_a == prefix_b:
-            return True
-        return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
-    pattern, concrete = (a, b) if a_glob else (b, a)
-    concrete = concrete.rstrip("/")
-    if fnmatch.fnmatchcase(concrete, pattern):
-        return True
-    prefix = _glob_static_prefix(pattern)
-    if prefix:
-        prefix_dir = prefix.rstrip("/")
-        return (
-            concrete == prefix_dir
-            or concrete.startswith(prefix)
-            or prefix.startswith(f"{concrete}/")
-        )
-    lit_prefix = _glob_literal_prefix(pattern)
-    if not lit_prefix:
-        return True
-    return concrete.startswith(lit_prefix) or lit_prefix.startswith(concrete)
-
-
-def paths_overlap(a_raw: str, b_raw: str) -> bool:
-    """Return True if two normalized repo-relative paths, prefixes, or globs can overlap."""
-    a = normalize_scope_path(a_raw).rstrip("/")
-    b = normalize_scope_path(b_raw).rstrip("/")
-    if a == "." or b == ".":
-        return True
-    if _has_glob(a) or _has_glob(b):
-        return _glob_paths_overlap(a, b)
-    if a == b:
-        return True
-    return a.startswith(f"{b}/") or b.startswith(f"{a}/")
-
-
-def scopes_overlap(scope_a: list[str], scope_b: list[str]) -> list[tuple[str, str]]:
-    """Return all conflicting pairs between two write_scope lists."""
-    conflicts: list[tuple[str, str]] = []
-    for pa in scope_a:
-        for pb in scope_b:
-            if paths_overlap(pa, pb):
-                conflicts.append((pa, pb))
-    return conflicts
+def _dupes(kind: str, ids: Collection[str]) -> list[str]:
+    return [f"Duplicate {kind} id: {item}" for item, n in Counter(ids).items() if n > 1]
 
 
 def _build_ancestors(tasks: list[TaskNode]) -> dict[str, set[str]]:
-    by_id = {t.task_id: t for t in tasks}
-    ancestors: dict[str, set[str]] = {}
-
-    def visit(tid: str, visiting: set[str]) -> set[str]:
-        if tid in ancestors:
-            return ancestors[tid]
-        if tid in visiting:
-            return set()
-        visiting.add(tid)
-        acc: set[str] = set()
-        for dep in by_id[tid].depends_on:
-            if dep in by_id:
-                acc.add(dep)
-                acc |= visit(dep, visiting)
-        visiting.remove(tid)
-        ancestors[tid] = acc
-        return acc
-
-    for t in tasks:
-        visit(t.task_id, set())
+    """Return the transitive dependency ids of every task; self-dependencies are ignored."""
+    known = {t.task_id for t in tasks}
+    direct = {t.task_id: {d for d in t.depends_on if d != t.task_id and d in known} for t in tasks}
+    ancestors: dict[str, set[str]] = {tid: set() for tid in direct}
+    for _ in direct:
+        for tid, deps in direct.items():
+            ancestors[tid] |= {d for dep in deps for d in {dep} | ancestors.get(dep, set())}
     return ancestors
+
+
+def _residual_cycles(nodes: Collection[str], deps_of: Mapping[str, Collection[str]]) -> list[str]:
+    """Return sorted nodes left after peeling every node whose dependencies are all peeled."""
+    remaining = {node: {dep for dep in deps_of[node] if dep in nodes} for node in nodes}
+    while free := [n for n, deps in remaining.items() if not deps & remaining.keys()]:
+        for node in free:
+            del remaining[node]
+    return sorted(remaining)
 
 
 def validate_goal_spec(
@@ -219,159 +62,30 @@ def validate_goal_spec(
     strict_ears: bool = True,
     require_out_of_scope: bool = True,
 ) -> list[str]:
-    """Zero-token gate for the 5-element + EARS GoalSpec contract.
-
-    Covers deliverable kind, observable surfaces, actors, public test seams,
-    per-requirement EARS criteria, anti-vague lexical hygiene, premature
-    implementation leaks, out-of-scope boundaries, and unresolved blocking ambiguities.
-    """
-    violations: list[str] = []
-    actor_pool = {actor.strip().lower() for actor in spec.actors if actor.strip()}
-
+    """Zero-token gate for the 5-element + EARS GoalSpec contract and unresolved blockers."""
+    issues: list[str] = []
     if strict_ears:
-        if spec.deliverable_kind is None:
-            violations.append("GoalSpec is missing deliverable_kind (web_app/rest_api/cli/...)")
-        if not [s for s in spec.observable_surfaces if s.strip()]:
-            violations.append("GoalSpec is missing observable_surfaces")
-        if not actor_pool:
-            violations.append("GoalSpec is missing actors")
-        public_seams = [seam for seam in spec.test_seams if seam.strip()]
-        if not public_seams:
-            violations.append(
-                "GoalSpec is missing test_seams (declare 1-2 public boundary seams: "
-                "HTTP routes, CLI commands, or public module APIs)"
-            )
-        for idx, seam in enumerate(public_seams, start=1):
-            label = f"test seam {idx}"
-            vague = _vague_terms(seam)
-            if vague:
-                violations.append(
-                    f"Vague unquantified wording in {label}: "
-                    f"{', '.join(vague)} (name an exercisable public boundary)"
-                )
-            leaks = _implementation_leaks(seam, spec.constraints)
-            if leaks:
-                violations.append(
-                    f"Premature internal implementation leak in {label}: {', '.join(leaks)}"
-                )
-
-    for req in spec.requirements:
-        if strict_ears:
-            if not req.actor or not req.actor.strip():
-                violations.append(f"Requirement {req.id} is missing actor")
-            elif req.actor.strip().lower() not in actor_pool:
-                violations.append(
-                    f"Requirement {req.id} actor '{req.actor}' is not declared in GoalSpec.actors"
-                )
-            if not req.ears_criteria:
-                violations.append(f"Requirement {req.id} has no ears_criteria")
-
-        scanned: list[tuple[str, str]] = [
-            (f"description of {req.id}", req.description),
-            *[
-                (f"acceptance criterion {idx} of {req.id}", text)
-                for idx, text in enumerate(req.acceptance_criteria, start=1)
-            ],
-            *[
-                (f"EARS outcome {crit.id} of {req.id}", crit.outcome)
-                for crit in req.ears_criteria
-            ],
+        actors = {actor.strip().lower() for actor in spec.actors if actor.strip()}
+        required = [
+            (spec.deliverable_kind is not None, "deliverable_kind"),
+            (any(s.strip() for s in spec.observable_surfaces), "observable_surfaces"),
+            (bool(actors), "actors"),
+            (any(s.strip() for s in spec.test_seams), "test_seams (public boundary seams)"),
         ]
-        for label, text in scanned:
-            vague = _vague_terms(text)
-            if vague:
-                violations.append(
-                    f"Vague unquantified wording in {label}: "
-                    f"{', '.join(vague)} (add a measurable threshold or concrete artifact)"
-                )
-            leaks = _implementation_leaks(text, spec.constraints)
-            if leaks:
-                violations.append(
-                    f"Premature internal implementation leak in {label}: {', '.join(leaks)}"
-                )
-
-    if require_out_of_scope and not [item for item in spec.out_of_scope if item.strip()]:
-        violations.append("GoalSpec is missing out_of_scope boundaries")
-
-    blockers = spec.unresolved_blockers()
-    if blockers:
-        violations.append(f"GoalSpec still has unresolved blockers: {', '.join(blockers)}")
-    return violations
-
-
-_SHALLOW_WRAPPER_RE = re.compile(
-    r"\b(?:pass[- ]?through|forwarding\s+wrapper|thin\s+wrapper|single[- ]caller)\b",
-    re.IGNORECASE,
-)
-_GENERIC_SURFACE_WORDS = frozenset(
-    {
-        "api",
-        "app",
-        "application",
-        "command",
-        "endpoint",
-        "interface",
-        "layer",
-        "service",
-        "surface",
-    }
-)
-
-
-def _is_path_surface(surface: str) -> bool:
-    stripped = surface.strip()
-    return (
-        bool(stripped)
-        and "/" in stripped
-        and not stripped.startswith("/")
-        and not any(ch.isspace() for ch in stripped)
-    )
-
-
-def _module_matches_named_surface(module_text: str, surface: str) -> bool:
-    lowered = surface.strip().lower()
-    if not lowered:
-        return False
-    if lowered in module_text:
-        return True
-    tokens = [
-        tok
-        for tok in re.findall(r"[a-z0-9_./:-]+", lowered)
-        if len(tok) >= 2 and tok not in _GENERIC_SURFACE_WORDS
-    ]
-    return bool(tokens) and all(tok in module_text for tok in tokens)
-
-
-def _module_owns_observable_surface(
-    module: DesignModule,
-    peer: DesignModule,
-    normalized_paths: list[str],
-    spec: GoalSpec | None,
-) -> bool:
-    if spec is None:
-        return False
-    module_text = f"{module.name} {module.responsibility}".lower()
-    if _SHALLOW_WRAPPER_RE.search(module_text):
-        return False
-
-    surfaces = [s.strip() for s in spec.observable_surfaces if s.strip()]
-    path_surfaces = [s for s in surfaces if _is_path_surface(s)]
-    for path in normalized_paths:
-        for surface in path_surfaces:
-            with contextlib.suppress(ValueError):
-                if paths_overlap(path, surface):
-                    return True
-
-    peer_text = f"{peer.name} {peer.responsibility}".lower()
-    named_surfaces = [s for s in surfaces if not _is_path_surface(s)] + [
-        s.strip() for s in spec.test_seams if s.strip()
-    ]
-    for surface in named_surfaces:
-        if _module_matches_named_surface(
-            module_text, surface
-        ) and not _module_matches_named_surface(peer_text, surface):
-            return True
-    return False
+        issues += [f"GoalSpec is missing {name}" for ok, name in required if not ok]
+        for req in spec.requirements:
+            actor = (req.actor or "").strip()
+            if not actor:
+                issues.append(f"Requirement {req.id} is missing actor")
+            elif actor.lower() not in actors:
+                issues.append(f"Requirement {req.id} actor is not a declared GoalSpec actor")
+            if not req.ears_criteria:
+                issues.append(f"Requirement {req.id} has no ears_criteria")
+    if require_out_of_scope and not any(item.strip() for item in spec.out_of_scope):
+        issues.append("GoalSpec is missing out_of_scope boundaries")
+    if blockers := spec.unresolved_blockers():
+        issues.append(f"GoalSpec still has unresolved blockers: {', '.join(blockers)}")
+    return issues
 
 
 def validate_design_spec(
@@ -380,676 +94,120 @@ def validate_design_spec(
     *,
     strict_v2: bool = False,
 ) -> list[str]:
-    """Zero-token gate for invariants, shared contract seams, module cycles, coverage, and
-    shallow-duplicate modules."""
-    violations: list[str] = []
-
-    module_ids: set[str] = set()
-    for module in design.modules:
-        if module.id in module_ids:
-            violations.append(f"Duplicate design module id: {module.id}")
-        module_ids.add(module.id)
-
-    normalized: dict[str, list[str]] = {}
-    for module in design.modules:
-        paths: list[str] = []
-        for raw in module.target_paths:
-            try:
-                paths.append(normalize_scope_path(raw))
-            except ValueError as exc:
-                violations.append(f"Design module {module.id} invalid target_path ({raw}): {exc}")
-        normalized[module.id] = paths
-
-    shared_norm: list[str] = []
-    for raw in design.shared_contract_paths:
-        try:
-            shared_norm.append(normalize_scope_path(raw))
-        except ValueError as exc:
-            violations.append(f"DesignSpec invalid shared_contract_path ({raw}): {exc}")
-
-    ordered_ids = list(module_ids)
-    for i in range(len(ordered_ids)):
-        for j in range(i + 1, len(ordered_ids)):
-            left, right = ordered_ids[i], ordered_ids[j]
-            try:
-                conflicts = scopes_overlap(normalized.get(left, []), normalized.get(right, []))
-            except ValueError:
-                conflicts = []
-            if conflicts:
-                pairs = ", ".join(f"{a}<->{b}" for a, b in conflicts)
-                violations.append(
-                    f"Design modules {left} and {right} have overlapping target_paths: {pairs}"
-                )
-
-    if shared_norm:
-        for mod_id in ordered_ids:
-            try:
-                shared_conflicts = scopes_overlap(shared_norm, normalized.get(mod_id, []))
-            except ValueError:
-                shared_conflicts = []
-            if shared_conflicts:
-                pairs = ", ".join(f"{a}<->{b}" for a, b in shared_conflicts)
-                violations.append(
-                    f"shared_contract_paths overlaps module {mod_id} target_paths: {pairs}"
-                )
-
-    invariant_ids: set[str] = set()
+    """Zero-token gate for invariants, shared contract seams, module cycles, and coverage."""
+    issues: list[str] = []
+    issues += _dupes("design module", [m.id for m in design.modules])
+    issues += _dupes("global invariant", [i.id for i in design.shared_invariants])
+    issues += _dupes("interface contract", [i.id for i in design.interfaces])
+    known = {m.id for m in design.modules}
+    paths = {m.id: normalized_scopes(m.target_paths, m.id, issues) for m in design.modules}
+    shared = normalized_scopes(design.shared_contract_paths, "DesignSpec", issues)
+    for left, right in combinations(known, 2):
+        label = f"Modules {left}/{right} have overlapping target_paths"
+        issues += overlap_messages(label, paths[left], paths[right])
+    for mod_id in known:
+        label = f"shared_contract_paths overlaps module {mod_id}"
+        issues += overlap_messages(label, shared, paths[mod_id])
     for inv in design.shared_invariants:
-        if inv.id in invariant_ids:
-            violations.append(f"Duplicate global invariant id: {inv.id}")
-        invariant_ids.add(inv.id)
-        for mod_id in inv.applies_to:
-            if mod_id not in module_ids:
-                violations.append(
-                    f"GlobalInvariant {inv.id} applies_to unknown module '{mod_id}'"
-                )
-
-    entity_names = {entity.name for entity in design.data_models}
-    for entity in design.data_models:
-        if entity.owner_module_id not in module_ids:
-            violations.append(
-                f"DataEntity {entity.name} owner_module_id '{entity.owner_module_id}' "
-                "is not a declared design module"
-            )
-
-    interface_ids: set[str] = set()
-    mod_edges: dict[str, set[str]] = {mid: set() for mid in module_ids}
-    mod_in_degree: dict[str, int] = {mid: 0 for mid in module_ids}
+        issues += [
+            f"Invariant {inv.id} applies_to unknown '{mod}'"
+            for mod in inv.applies_to
+            if mod not in known
+        ]
+    entities = {e.name for e in design.data_models}
+    refs = [(f"DataEntity {e.name} owner_module_id", e.owner_module_id) for e in design.data_models]
+    deps: dict[str, set[str]] = {mod_id: set() for mod_id in known}
     for iface in design.interfaces:
-        if iface.id in interface_ids:
-            violations.append(f"Duplicate interface contract id: {iface.id}")
-        interface_ids.add(iface.id)
-        if iface.provider_module_id not in module_ids:
-            violations.append(
-                f"Interface {iface.id} provider_module_id '{iface.provider_module_id}' "
-                "is not a declared design module"
-            )
+        provider = iface.provider_module_id
+        refs.append((f"Interface {iface.id} provider", provider))
+        refs += [(f"Interface {iface.id} consumer", c) for c in iface.consumer_module_ids]
+        unknown = [ref for ref in iface.data_entity_refs if ref not in entities]
+        issues += [f"Interface {iface.id} unknown DataEntity '{ref}'" for ref in unknown]
         for consumer in iface.consumer_module_ids:
-            if consumer not in module_ids:
-                violations.append(
-                    f"Interface {iface.id} consumer_module_id '{consumer}' "
-                    "is not a declared design module"
-                )
-            elif consumer == iface.provider_module_id:
-                violations.append(
-                    f"Interface {iface.id} introduces a self-dependency cycle on {consumer}"
-                )
-            elif (
-                iface.provider_module_id in module_ids
-                and iface.provider_module_id not in mod_edges[consumer]
-            ):
-                mod_edges[consumer].add(iface.provider_module_id)
-                mod_in_degree[iface.provider_module_id] += 1
-        for ref in iface.data_entity_refs:
-            if ref not in entity_names:
-                violations.append(
-                    f"Interface {iface.id} references unknown DataEntity '{ref}'"
-                )
-
-    # Kahn topological sort on consumer -> provider dependencies to forbid module cycles
-    mod_queue = deque(mid for mid, deg in mod_in_degree.items() if deg == 0)
-    visited_mods = 0
-    while mod_queue:
-        cur = mod_queue.popleft()
-        visited_mods += 1
-        for dep_provider in mod_edges[cur]:
-            mod_in_degree[dep_provider] -= 1
-            if mod_in_degree[dep_provider] == 0:
-                mod_queue.append(dep_provider)
-    if visited_mods < len(module_ids):
-        cyclic = sorted(mid for mid, deg in mod_in_degree.items() if deg > 0)
-        violations.append(
-            f"DesignSpec module dependency graph contains a cycle involving: {', '.join(cyclic)}"
-        )
-
+            if consumer == provider:
+                issues.append(f"Interface {iface.id} self-dependency cycle on {consumer}")
+            elif consumer in known and provider in known:
+                deps[consumer].add(provider)
+    issues += [f"{name} references unknown module '{r}'" for name, r in refs if r not in known]
+    if cyclic := _residual_cycles(known, deps):
+        issues.append(f"DesignSpec module dependency cycle: {', '.join(cyclic)}")
     if len(design.modules) > 1 and not design.interfaces:
-        violations.append(
-            "Multi-module design requires at least one interface contract (seam closure)"
-        )
-
+        issues.append("Multi-module design requires an interface contract (seam closure)")
     if strict_v2:
-        if not design.shared_invariants:
-            violations.append(
-                "DesignSpec v2 requires at least one shared_invariants rule "
-                "(e.g. error_envelope, id_format, time_encoding)"
-            )
-        if design.execution_strategy is None:
-            violations.append(
-                "DesignSpec v2 requires execution_strategy "
-                "('contract_first_parallel' or 'serial_handoff')"
-            )
-        elif len(design.strategy_rationale.strip()) < 10:
-            violations.append(
-                "DesignSpec v2 requires a non-trivial strategy_rationale (>= 10 characters)"
-            )
-        if len(design.modules) > 1:
-            for iface in design.interfaces:
-                if not iface.input_schema:
-                    violations.append(
-                        f"Interface {iface.id} is missing typed input_schema fields"
-                    )
-                if not iface.output_schema:
-                    violations.append(
-                        f"Interface {iface.id} is missing typed output_schema fields"
-                    )
-                if not iface.error_cases:
-                    violations.append(
-                        f"Interface {iface.id} is missing explicit error_cases"
-                    )
-            if (
-                design.execution_strategy == ExecutionStrategy.CONTRACT_FIRST_PARALLEL
-                and not shared_norm
-            ):
-                violations.append(
-                    "execution_strategy='contract_first_parallel' with multiple modules "
-                    "requires non-empty shared_contract_paths for Wave 0 contract lock"
-                )
-
-        data_owner_ids = {entity.owner_module_id for entity in design.data_models}
-        interface_providers = {
-            iface.provider_module_id for iface in design.interfaces if iface.consumer_module_ids
-        }
-        for index, left_module in enumerate(design.modules):
-            for right_module in design.modules[index + 1 :]:
-                shared_refs = set(left_module.requirement_refs)
-                if not shared_refs or shared_refs != set(right_module.requirement_refs):
-                    continue
-                shallow = [
-                    module.id
-                    for module, peer in (
-                        (left_module, right_module),
-                        (right_module, left_module),
-                    )
-                    if module.id not in data_owner_ids
-                    and module.id not in interface_providers
-                    and not _module_owns_observable_surface(
-                        module, peer, normalized.get(module.id, []), spec
-                    )
-                ]
-                if shallow:
-                    violations.append(
-                        f"Design modules {left_module.id} and {right_module.id} declare "
-                        f"identical requirement_refs ({', '.join(sorted(shared_refs))}) while "
-                        f"{', '.join(shallow)} owns no data_models, provides no "
-                        "interface to a distinct consumer, and owns no observable "
-                        "surface; apply the Deletion Test and consolidate the shallow "
-                        "duplicate, or give it a distinct entity or interface"
-                    )
-
+        required = [
+            (bool(design.shared_invariants), "shared_invariants"),
+            (design.execution_strategy is not None, "execution_strategy"),
+            (len(design.strategy_rationale.strip()) >= 10, "strategy_rationale (>= 10 chars)"),
+        ]
+        issues += [f"DesignSpec v2 requires {name}" for ok, name in required if not ok]
+        for iface in design.interfaces if len(design.modules) > 1 else []:
+            fields = ("input_schema", "output_schema", "error_cases")
+            absent = [name for name in fields if not getattr(iface, name)]
+            if absent:
+                issues.append(f"Interface {iface.id} is missing {', '.join(absent)}")
+        locked = design.execution_strategy == ExecutionStrategy.CONTRACT_FIRST_PARALLEL
+        if locked and len(design.modules) > 1 and not shared:
+            issues.append("contract_first_parallel requires shared_contract_paths")
     if spec is not None:
-        if design.spec_id is None:
-            violations.append("DesignSpec is not bound to a GoalSpec (spec_id is empty)")
-        elif design.spec_id != spec.spec_id:
-            violations.append(
-                f"DesignSpec spec_id ({design.spec_id}) does not match GoalSpec ({spec.spec_id})"
-            )
-        if design.spec_hash is None:
-            violations.append("DesignSpec is not bound to a GoalSpec hash (spec_hash is empty)")
-        elif design.spec_hash != spec.content_hash:
-            violations.append(
-                f"DesignSpec spec_hash ({design.spec_hash}) does not match GoalSpec "
-                f"({spec.content_hash})"
-            )
-
-        valid_reqs = {req.id for req in spec.requirements}
-        covered: set[str] = set()
-        for module in design.modules:
-            for ref in module.requirement_refs:
-                if ref not in valid_reqs:
-                    violations.append(
-                        f"Design module {module.id} references unknown requirement: {ref}"
-                    )
-                else:
-                    covered.add(ref)
-        missing = sorted(valid_reqs - covered)
-        if missing:
-            violations.append(
-                f"Requirements not covered by any design module: {', '.join(missing)}"
-            )
-
-    return violations
-
-
-_PYTHON_BIN_RE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
-_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*")
-_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "\n"})
-
-
-def _split_shell_segments(command: str) -> tuple[list[list[str]], str | None]:
-    """Tokenize a shell command and split on unquoted command separators."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError as exc:
-        return [], f"invalid shell syntax ({exc})"
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for tok in tokens:
-        if tok in _SHELL_SEPARATORS:
-            if current:
-                segments.append(current)
-                current = []
-        else:
-            current.append(tok)
-    if current:
-        segments.append(current)
-    return segments, None
-
-
-def _extract_segment_python_inline(segment: list[str]) -> tuple[str | None, str | None, int]:
-    """Return `(inline_code, error, arg_start_idx)` when a segment invokes `python -c`."""
-    idx = 0
-    while idx < len(segment):
-        tok = segment[idx]
-        if _ENV_ASSIGN_RE.match(tok) or tok == "env":
-            idx += 1
-            continue
-        if tok in ("uv", "poetry") and idx + 1 < len(segment) and segment[idx + 1] == "run":
-            idx += 2
-            continue
-        break
-    if idx >= len(segment):
-        return None, None, len(segment)
-    exe = PurePosixPath(segment[idx]).name
-    if not _PYTHON_BIN_RE.match(exe):
-        return None, None, idx + 1
-    idx += 1
-    while idx < len(segment):
-        arg = segment[idx]
-        if arg in ("-W", "-X"):
-            idx += 2
-            continue
-        if arg == "-c":
-            if idx + 1 >= len(segment):
-                return None, "python -c is missing its inline script argument", idx + 1
-            return segment[idx + 1], None, idx + 2
-        if arg.startswith("-c") and len(arg) > 2:
-            return arg[2:], None, idx + 1
-        if arg == "-m" or not arg.startswith("-"):
-            return None, None, idx
-        idx += 1
-    return None, None, idx
-
-
-def _module_candidates(
-    mod: str,
-    *,
-    include_init: bool = True,
-    include_src_prefix: bool = True,
-) -> list[str]:
-    parts = [p for p in mod.split(".") if p]
-    if not parts or parts[0] in sys.stdlib_module_names:
-        return []
-    joined = "/".join(parts)
-    out = [f"{joined}.py", f"{joined}/"]
-    if include_init:
-        out.append(f"{joined}/__init__.py")
-    if include_src_prefix and parts[0] != "src":
-        src_joined = f"src/{joined}"
-        out.extend([f"{src_joined}.py", f"{src_joined}/"])
-        if include_init:
-            out.append(f"{src_joined}/__init__.py")
-    return out
-
-
-def _imported_module_paths(tree: ast.AST) -> list[tuple[str, list[str], bool]]:
-    """Extract `(display_module, candidate_paths, is_package_from)` for non-stdlib imports."""
-    refs: list[tuple[str, list[str], bool]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                cands = _module_candidates(alias.name, include_src_prefix=True)
-                if cands:
-                    refs.append((alias.name, cands, False))
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            cands = _module_candidates(node.module, include_src_prefix=True)
-            if cands:
-                refs.append((node.module, cands, True))
-            if node.module.split(".", 1)[0] not in sys.stdlib_module_names:
-                for alias in node.names:
-                    if alias.name != "*":
-                        sub = f"{node.module}.{alias.name}"
-                        sub_cands = _module_candidates(
-                            sub, include_init=False, include_src_prefix=True
-                        )
-                        if sub_cands:
-                            refs.append((sub, sub_cands, False))
-    return refs
-
-
-def _scopes_share_package(pkg_dir: str, visible_scopes: Sequence[str]) -> bool:
-    norm_pkg = pkg_dir.rstrip("/") + "/"
-    return any(
-        s.startswith(norm_pkg) or norm_pkg.startswith(s.rstrip("/") + "/")
-        for s in visible_scopes
-        if s
-    )
-
-
-def _check_inline_python_imports(
-    *,
-    task: TaskNode,
-    check_id: str,
-    tree: ast.AST,
-    visible_scopes: list[str],
-    non_ancestors: Sequence[TaskNode],
-) -> list[str]:
-    violations: list[str] = []
-    for mod_name, cands, is_pkg_from in _imported_module_paths(tree):
-        filtered = [
-            c
-            for c in cands
-            if not (
-                is_pkg_from
-                and c.endswith("/__init__.py")
-                and _scopes_share_package(c[: -len("/__init__.py")], visible_scopes)
-            )
-        ]
-        if not filtered or scopes_overlap(filtered, visible_scopes):
-            continue
-        direct_cands = [
-            c for c in filtered if mod_name.startswith("src.") or not c.startswith("src/")
-        ]
-        src_implicit_cands = [
-            c for c in filtered if not mod_name.startswith("src.") and c.startswith("src/")
-        ]
-        for other in non_ancestors:
-            if not other.write_scope:
-                continue
-            matched = bool(direct_cands and scopes_overlap(direct_cands, other.write_scope))
-            if not matched and src_implicit_cands:
-                # Only match implicit `src/<mod>` imports against concrete subpaths under `src/`,
-                # avoiding false positives on third-party packages when a sibling owns bare `src/`.
-                deep_scopes = [
-                    s for s in other.write_scope if len(PurePosixPath(s).parts) >= 2
-                ]
-                matched = bool(deep_scopes and scopes_overlap(src_implicit_cands, deep_scopes))
-            if matched:
-                violations.append(
-                    f"Task {task.task_id} check {check_id} imports '{mod_name}' owned by "
-                    f"non-ancestor task {other.task_id}; add {other.task_id} to "
-                    f"{task.task_id}.depends_on or test cross-module wiring downstream."
-                )
-                break
-    return violations
-
-
-def _check_segment_file_refs(
-    *,
-    task: TaskNode,
-    check_id: str,
-    args: Sequence[str],
-    visible_scopes: list[str],
-    non_ancestors: Sequence[TaskNode],
-) -> list[str]:
-    violations: list[str] = []
-    for tok in args:
-        if tok.startswith("-") or tok.startswith("/"):
-            continue
-        file_part = tok.split("::", 1)[0]
-        if not file_part.endswith(".py"):
-            continue
-        with contextlib.suppress(ValueError):
-            norm_file = normalize_scope_path(file_part)
-            if scopes_overlap([norm_file], visible_scopes):
-                continue
-            for other in non_ancestors:
-                if other.write_scope and scopes_overlap([norm_file], other.write_scope):
-                    violations.append(
-                        f"Task {task.task_id} check {check_id} references '{file_part}' owned "
-                        f"by non-ancestor task {other.task_id}; add {other.task_id} to "
-                        "depends_on or move downstream."
-                    )
-                    break
-    return violations
-
-
-def _validate_single_command_check(
-    *,
-    task: TaskNode,
-    check_id: str,
-    command: str,
-    visible_scopes: list[str],
-    non_ancestors: Sequence[TaskNode],
-) -> list[str]:
-    segments, shell_err = _split_shell_segments(command)
-    if shell_err is not None:
-        return [f"Task {task.task_id} check {check_id} has {shell_err}."]
-
-    violations: list[str] = []
-    for seg in segments:
-        code, py_err, arg_start = _extract_segment_python_inline(seg)
-        if py_err is not None:
-            violations.append(f"Task {task.task_id} check {check_id}: {py_err}.")
-            continue
-        if code is not None:
-            try:
-                tree = ast.parse(code)
-            except SyntaxError as exc:
-                violations.append(
-                    f"Task {task.task_id} check {check_id} has invalid Python syntax "
-                    f"in '-c' script ({exc.msg}); avoid semicolon-separated compound blocks "
-                    "like '; try: ...; except ...'—use newlines or pytest."
-                )
-                continue
-            violations.extend(
-                _check_inline_python_imports(
-                    task=task,
-                    check_id=check_id,
-                    tree=tree,
-                    visible_scopes=visible_scopes,
-                    non_ancestors=non_ancestors,
-                )
-            )
-            continue
-        if non_ancestors:
-            violations.extend(
-                _check_segment_file_refs(
-                    task=task,
-                    check_id=check_id,
-                    args=seg[arg_start:],
-                    visible_scopes=visible_scopes,
-                    non_ancestors=non_ancestors,
-                )
-            )
-    return violations
-
-
-def _validate_command_syntax_and_deps(
-    tasks: Sequence[TaskNode],
-    ancestors: dict[str, set[str]] | None,
-) -> list[str]:
-    """Validate check shell syntax, `python -c` AST syntax, and sibling scope isolation."""
-    violations: list[str] = []
-    by_id = {t.task_id: t for t in tasks}
-
-    for task in tasks:
-        non_ancestors: list[TaskNode] = []
-        visible_scopes = list(task.write_scope)
-        if ancestors is not None:
-            anc_ids = ancestors.get(task.task_id, set())
-            for anc_id in anc_ids:
-                if anc_id in by_id:
-                    visible_scopes.extend(by_id[anc_id].write_scope)
-            non_ancestors = [
-                other
-                for other in tasks
-                if other.task_id != task.task_id and other.task_id not in anc_ids
-            ]
-
-        for check in task.acceptance_checks:
-            if check.kind != CheckKind.COMMAND or not check.command:
-                continue
-            violations.extend(
-                _validate_single_command_check(
-                    task=task,
-                    check_id=check.id,
-                    command=check.command,
-                    visible_scopes=visible_scopes,
-                    non_ancestors=non_ancestors,
-                )
-            )
-    return violations
+        for value, expected, label in (
+            (design.spec_id, spec.spec_id, "spec_id"),
+            (design.spec_hash, spec.content_hash, "spec_hash"),
+        ):
+            if value is None:
+                issues.append(f"DesignSpec is not bound to a GoalSpec ({label} is empty)")
+            elif value != expected:
+                issues.append(f"DesignSpec {label} ({value}) != GoalSpec")
+        valid = {req.id for req in spec.requirements}
+        owners = {m.id: m.requirement_refs for m in design.modules}
+        for name, wanted in owners.items():
+            issues += [f"Design module {name} unknown ref: {r}" for r in wanted if r not in valid]
+        covered = {ref for refs in owners.values() for ref in refs if ref in valid}
+        if missing := sorted(valid - covered):
+            issues.append(f"Requirements not covered by any design module: {', '.join(missing)}")
+    return issues
 
 
 VERTICAL_SLICE_TOPOLOGIES = frozenset({"tdd_first", "vertical_slices"})
 
-_MONOLITH_MIN_SCOPES = 4
-_MONOLITH_MIN_REQUIREMENTS = 4
-_MONOLITH_MIN_MODULES = 3
-_SHELL_PUNCTUATION_TOKENS = frozenset({";", "&&", "||", "|", "&", "(", ")"})
-
-
-def _command_has_executable_statement(command: str | None) -> bool:
-    if not command or not command.strip():
-        return False
-    try:
-        tokens = shlex.split(command, comments=True)
-    except ValueError:
-        non_comment = [
-            line.strip()
-            for line in command.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-        return bool(non_comment)
-    return any(token not in _SHELL_PUNCTUATION_TOKENS for token in tokens)
-
 
 def _has_executable_command(task: TaskNode) -> bool:
-    return any(
-        check.kind == CheckKind.COMMAND and _command_has_executable_statement(check.command)
-        for check in task.acceptance_checks
-    )
+    """Return True when a task carries a command check with an executable non-comment token."""
+    for check in task.acceptance_checks:
+        lines = [line.strip() for line in (check.command or "").splitlines()]
+        if check.kind == CheckKind.COMMAND and any(
+            line.strip(" \t;|&()") for line in lines if line and line[0] != "#"
+        ):
+            return True
+    return False
 
 
 def _is_human_gate_task(task: TaskNode) -> bool:
-    return (
-        task.role.strip().lower() == "human"
-        and bool(task.acceptance_checks)
-        and all(check.kind == CheckKind.HUMAN for check in task.acceptance_checks)
+    return task.role.strip().lower() == "human" and all(
+        check.kind == CheckKind.HUMAN for check in task.acceptance_checks
     )
 
 
-def _monolithic_sink_reason(
-    task: TaskNode,
-    *,
-    module_paths: dict[str, list[str]],
-    requirement_ids: set[str] | None,
-) -> str | None:
-    norm_scopes: list[str] = []
-    for scope in task.write_scope:
-        with contextlib.suppress(ValueError):
-            norm_scopes.append(normalize_scope_path(scope))
-    unique_scopes = set(norm_scopes)
-    effective_modules = set(task.design_refs) & set(module_paths)
-    if norm_scopes:
-        for mod_id, paths in module_paths.items():
-            if mod_id not in effective_modules and scopes_overlap(norm_scopes, paths):
-                effective_modules.add(mod_id)
-
-    if len(effective_modules) < _MONOLITH_MIN_MODULES:
-        return None
-
-    owned_requirements = (
-        set(task.requirement_refs) & requirement_ids
-        if requirement_ids is not None
-        else set(task.requirement_refs)
-    )
-    covers_repo_root = "." in unique_scopes
-    top_level_scopes = {
-        PurePosixPath(scope).parts[0]
-        for scope in unique_scopes
-        if scope != "." and PurePosixPath(scope).parts
-    }
-    wide_top_level = len(top_level_scopes) >= _MONOLITH_MIN_SCOPES
-    wide_multi_req = (
-        len(unique_scopes) >= _MONOLITH_MIN_SCOPES
-        and len(owned_requirements) >= _MONOLITH_MIN_REQUIREMENTS
-    )
-    if not (covers_repo_root or wide_top_level or wide_multi_req):
-        return None
-
-    scope_desc = (
-        "the repository root ('.')"
-        if covers_repo_root
-        else f"{len(unique_scopes)} write scopes ({len(top_level_scopes)} top-level)"
-    )
-    return (
-        f"covers {len(effective_modules)} design module(s) and {len(owned_requirements)} "
-        f"requirement(s) across {scope_desc}"
-    )
-
-
-def _validate_vertical_slices(
-    plan: TaskPlan,
-    spec: GoalSpec | None,
-    design: DesignSpec | None,
-    ancestors: dict[str, set[str]],
-) -> list[str]:
-    violations: list[str] = []
+def _validate_vertical_slices(plan: TaskPlan, ancestors: dict[str, set[str]]) -> list[str]:
+    issues: list[str] = []
     by_id = {task.task_id: task for task in plan.tasks}
-
     for task in plan.tasks:
-        if task.kind not in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE):
-            continue
-        if _is_human_gate_task(task) or _has_executable_command(task):
-            continue
-        violations.append(
-            f"Vertical slice {task.task_id} ({task.kind.value}) has no executable kind='command' "
-            "acceptance check; every implementation slice must verify its user-facing seam "
-            "end to end."
-        )
-
-    for task in plan.tasks:
+        slices = task.kind in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE)
+        if slices and not _is_human_gate_task(task) and not _has_executable_command(task):
+            issues.append(f"Vertical slice {task.task_id} needs an executable command check")
         if task.kind != TaskKind.TEST:
             continue
-        deferred: list[str] = []
-        for ancestor_id in sorted(ancestors.get(task.task_id, set())):
-            upstream = by_id.get(ancestor_id)
-            if (
-                upstream is not None
-                and upstream.kind in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE)
-                and not _is_human_gate_task(upstream)
-                and not _has_executable_command(upstream)
-            ):
-                deferred.append(ancestor_id)
+        upstream = [by_id.get(dep) for dep in sorted(ancestors.get(task.task_id, set()))]
+        deferred = [
+            up.task_id
+            for up in upstream
+            if up is not None
+            and up.kind in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE)
+            and not _is_human_gate_task(up)
+            and not _has_executable_command(up)
+        ]
         if deferred:
-            violations.append(
-                f"Task {task.task_id} (test) horizontally defers verification: upstream "
-                f"slice(s) {', '.join(deferred)} carry no executable kind='command' "
-                "check; move the seam test into each vertical slice."
-            )
-
-    if (
-        design is not None
-        and len(design.modules) >= _MONOLITH_MIN_MODULES
-        and (spec is None or len(spec.requirements) >= _MONOLITH_MIN_REQUIREMENTS)
-    ):
-        module_paths: dict[str, list[str]] = {}
-        for module in design.modules:
-            paths: list[str] = []
-            for raw in module.target_paths:
-                with contextlib.suppress(ValueError):
-                    paths.append(normalize_scope_path(raw))
-            module_paths[module.id] = paths
-        requirement_ids = {requirement.id for requirement in spec.requirements} if spec else None
-        for task in plan.tasks:
-            if task.kind not in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE):
-                continue
-            if _is_human_gate_task(task):
-                continue
-            reason = _monolithic_sink_reason(
-                task, module_paths=module_paths, requirement_ids=requirement_ids
-            )
-            if reason is not None:
-                violations.append(
-                    f"Task {task.task_id} ({task.kind.value}) is an un-sliced monolithic sink: it "
-                    f"{reason}; split it into vertical user-story slices, each ending in its own "
-                    "executable seam check."
-                )
-
-    return violations
+            issues.append(f"Task {task.task_id} horizontally defers verification to {deferred}")
+    return issues
 
 
 def validate_plan_topology(
@@ -1060,9 +218,10 @@ def validate_plan_topology(
     topology: str | None = None,
 ) -> list[str]:
     """Run only the topology-specific structural gate for ``plan``."""
+    del spec, design
     if topology not in VERTICAL_SLICE_TOPOLOGIES:
         return []
-    return _validate_vertical_slices(plan, spec, design, _build_ancestors(plan.tasks))
+    return _validate_vertical_slices(plan, _build_ancestors(plan.tasks))
 
 
 def validate_plan(
@@ -1073,173 +232,79 @@ def validate_plan(
     workspace_root: Path | str | None = None,
     topology: str | None = None,
 ) -> list[str]:
-    """Validate structural DAG properties, spec coverage, and concurrent write_scope isolation.
-
-    ``topology`` enables the 0-token vertical-slicing gate for ``tdd_first``/``vertical_slices``;
-    any other value (including ``None``) leaves validation unchanged.
-    """
-    violations: list[str] = []
-    host_root_pattern: re.Pattern[str] | None = None
-    host_root_display = ""
-    if workspace_root is not None:
-        host_root_display = str(Path(workspace_root).resolve())
-        host_root_pattern = re.compile(
-            rf"(?:^|[\s\"'=:;]){re.escape(host_root_display)}(?:$|[\s\"'/:;])"
-        )
-
-    seen_criteria: set[tuple[str, int]] = set()
-    for delivery_check in plan.delivery_checks:
-        key = (delivery_check.requirement_id, delivery_check.criterion_index)
-        requirements = [
-            req for req in spec.requirements if req.id == delivery_check.requirement_id
-        ] if spec else []
-        if len(requirements) != 1 or delivery_check.criterion_index > len(
-            requirements[0].acceptance_criteria
-        ):
-            violations.append(f"Delivery check references an unknown or ambiguous criterion: {key}")
-        if key in seen_criteria:
-            violations.append(f"Duplicate delivery check for criterion: {key}")
-        seen_criteria.add(key)
-        if host_root_pattern is not None and host_root_pattern.search(delivery_check.command):
-            violations.append(f"Delivery check {key} hardcodes host path '{host_root_display}'.")
-
-    by_id: dict[str, TaskNode] = {}
+    """Validate structural DAG properties, spec coverage, and concurrent write_scope isolation."""
+    issues: list[str] = []
+    root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
+    host = re.compile(rf"(?:^|[\s\"'=:;]){re.escape(root)}(?:$|[\s\"'/:;])") if root else None
+    reqs = spec.requirements if spec is not None else []
+    for delivery in plan.delivery_checks:
+        key = (delivery.requirement_id, delivery.criterion_index)
+        matches = [req for req in reqs if req.id == delivery.requirement_id]
+        if len(matches) != 1 or delivery.criterion_index > len(matches[0].acceptance_criteria):
+            issues.append(f"Delivery check references an unknown criterion: {key}")
+        if host is not None and host.search(delivery.command):
+            issues.append(f"Delivery check {key} hardcodes host path '{root}'")
+    issues += _dupes("task", [task.task_id for task in plan.tasks])
+    issues += _dupes(
+        "delivery check", [f"{d.requirement_id}:{d.criterion_index}" for d in plan.delivery_checks]
+    )
+    by_id = {task.task_id: task for task in plan.tasks}
+    scopes = {tid: normalized_scopes(t.write_scope, tid, issues) for tid, t in by_id.items()}
     for task in plan.tasks:
-        if task.task_id in by_id:
-            violations.append(f"Duplicate task_id: {task.task_id}")
-        by_id[task.task_id] = task
-        for scope in task.write_scope:
-            try:
-                normalize_scope_path(scope)
-            except ValueError as exc:
-                violations.append(f"Task {task.task_id} invalid write_scope ({scope}): {exc}")
-        if host_root_pattern is not None:
-            for check in task.acceptance_checks:
-                if (
-                    check.kind == CheckKind.COMMAND
-                    and check.command
-                    and host_root_pattern.search(check.command)
-                ):
-                    violations.append(
-                        f"Task {task.task_id} check {check.id} hardcodes host workspace path "
-                        f"'{host_root_display}'; command checks run inside isolated sandbox cwd "
-                        "and must use relative paths."
-                    )
-
-    # Dependency existence & self-loops
-    in_degree: dict[str, int] = {tid: 0 for tid in by_id}
-    children: dict[str, list[str]] = {tid: [] for tid in by_id}
+        for check in task.acceptance_checks:
+            if check.kind == CheckKind.COMMAND and host and host.search(check.command or ""):
+                issues.append(f"Task {task.task_id} check hardcodes host workspace path")
+    deps = {tid: {d for d in task.depends_on if d != tid} for tid, task in by_id.items()}
     for task in plan.tasks:
         for dep in task.depends_on:
             if dep == task.task_id:
-                violations.append(f"Task {task.task_id} cannot depend on itself")
+                issues.append(f"Task {task.task_id} cannot depend on itself")
             elif dep not in by_id:
-                violations.append(f"Task {task.task_id} depends on unknown task: {dep}")
-            else:
-                in_degree[task.task_id] += 1
-                children[dep].append(task.task_id)
-
-    # Kahn topological sort for cycle detection
-    queue = deque(tid for tid, deg in in_degree.items() if deg == 0)
-    visited = 0
-    while queue:
-        cur = queue.popleft()
-        visited += 1
-        for nxt in children[cur]:
-            in_degree[nxt] -= 1
-            if in_degree[nxt] == 0:
-                queue.append(nxt)
-    if visited != len(by_id):
-        violations.append("TaskPlan contains a dependency cycle")
-
-    # Spec traceability coverage
+                issues.append(f"Task {task.task_id} depends on unknown task: {dep}")
+    if cyclic := _residual_cycles(by_id, deps):
+        issues.append(f"TaskPlan contains a dependency cycle: {', '.join(cyclic)}")
     if spec is not None:
-        valid_reqs = {r.id for r in spec.requirements}
-        covered_reqs: set[str] = set()
-        for task in plan.tasks:
-            for ref in task.requirement_refs:
-                if ref not in valid_reqs:
-                    violations.append(f"Task {task.task_id} references unknown requirement: {ref}")
-                else:
-                    covered_reqs.add(ref)
-        missing_reqs = sorted(valid_reqs - covered_reqs)
-        if missing_reqs:
-            violations.append(f"Requirements not covered by any task: {', '.join(missing_reqs)}")
-
-    # Design traceability coverage
+        valid = {req.id for req in spec.requirements}
+        owners = {task.task_id: task.requirement_refs for task in plan.tasks}
+        for tid, wanted in owners.items():
+            issues += [f"Task {tid} unknown requirement: {r}" for r in wanted if r not in valid]
+        covered = {ref for refs in owners.values() for ref in refs if ref in valid}
+        if missing := sorted(valid - covered):
+            issues.append(f"Requirements not covered by any task: {', '.join(missing)}")
     if design is not None:
         if plan.design_id != design.design_id:
-            violations.append(
-                f"TaskPlan design_id ({plan.design_id}) does not match DesignSpec "
-                f"({design.design_id})"
-            )
+            issues.append(f"TaskPlan design_id ({plan.design_id}) != DesignSpec")
         if plan.design_hash != design.content_hash:
-            violations.append(
-                f"TaskPlan design_hash ({plan.design_hash}) does not match DesignSpec "
-                f"({design.content_hash})"
-            )
-        known_design_refs = {m.id for m in design.modules} | {i.id for i in design.interfaces}
-        allowed_design_refs = ", ".join(sorted(known_design_refs)) or "none"
-        referenced: set[str] = set()
+            issues.append(f"TaskPlan design_hash ({plan.design_hash}) != DesignSpec")
+        known = {m.id for m in design.modules} | {i.id for i in design.interfaces}
+        allowed = ", ".join(sorted(known)) or "none"
+        refs = [(task.task_id, ref) for task in plan.tasks for ref in task.design_refs]
+        for tid, ref in refs:
+            if ref not in known:
+                note = f"allowed design_refs: {allowed}"
+                issues.append(f"Task {tid} unknown design element: {ref} ({note})")
+        if orphans := sorted({m.id for m in design.modules} - {ref for _, ref in refs}):
+            issues.append(f"Design modules not referenced by any task: {orphans}")
+        shared = normalized_scopes(design.shared_contract_paths, "DesignSpec", issues)
         for task in plan.tasks:
-            for ref in task.design_refs:
-                if ref not in known_design_refs:
-                    violations.append(
-                        f"Task {task.task_id} references unknown design element: {ref} "
-                        f"(allowed design_refs: {allowed_design_refs})"
-                    )
-                else:
-                    referenced.add(ref)
-        orphan_modules = sorted({m.id for m in design.modules} - referenced)
-        if orphan_modules:
-            violations.append(
-                "Design modules not referenced by any task: " + ", ".join(orphan_modules)
-            )
-        if design.shared_contract_paths:
-            for task in plan.tasks:
-                if task.kind == TaskKind.CONTRACT:
-                    continue
-                try:
-                    c_hits = scopes_overlap(task.write_scope, design.shared_contract_paths)
-                except ValueError:
-                    c_hits = []
-                if c_hits:
-                    pairs = ", ".join(f"{a}<->{b}" for a, b in c_hits)
-                    violations.append(
-                        f"Task {task.task_id} ({task.kind.value}) write_scope overlaps "
-                        f"shared_contract_paths ({pairs}); only kind='contract' tasks "
-                        "may write shared contracts."
-                    )
-
-    # Independent sibling tasks must have disjoint write_scopes
-    ancestors: dict[str, set[str]] | None = None
-    if visited == len(by_id):
-        ancestors = _build_ancestors(plan.tasks)
-        tasks_list = list(by_id.values())
-        for i in range(len(tasks_list)):
-            for j in range(i + 1, len(tasks_list)):
-                ta, tb = tasks_list[i], tasks_list[j]
-                ordered = tb.task_id in ancestors[ta.task_id] or ta.task_id in ancestors[tb.task_id]
-                if ordered:
-                    continue
-                try:
-                    conflicts = scopes_overlap(ta.write_scope, tb.write_scope)
-                except ValueError:
-                    conflicts = []
-                if conflicts:
-                    pairs = ", ".join(f"{a}<->{b}" for a, b in conflicts)
-                    violations.append(
-                        f"Concurrent-eligible tasks {ta.task_id} and {tb.task_id} "
-                        f"have overlapping write_scope: {pairs}"
-                    )
-
-    violations.extend(_validate_command_syntax_and_deps(plan.tasks, ancestors))
-
+            hits = scopes_overlap(scopes[task.task_id], shared)
+            if hits and task.kind != TaskKind.CONTRACT:
+                pairs = ", ".join(f"{a}<->{b}" for a, b in hits)
+                note = "only kind='contract' tasks may write shared contracts"
+                issues.append(f"Task {task.task_id} overlaps shared paths ({pairs}); {note}")
+    ancestors = _build_ancestors(plan.tasks)
+    if not cyclic:
+        for task_a, task_b in combinations(by_id.values(), 2):
+            ordered = task_b.task_id in ancestors[task_a.task_id]
+            ordered = ordered or task_a.task_id in ancestors[task_b.task_id]
+            hits = [] if ordered else scopes_overlap(scopes[task_a.task_id], scopes[task_b.task_id])
+            if hits:
+                pairs = ", ".join(f"{a}<->{b}" for a, b in hits)
+                label = f"{task_a.task_id}/{task_b.task_id}"
+                issues.append(f"Concurrent-eligible {label} have overlapping write_scope: {pairs}")
     if topology in VERTICAL_SLICE_TOPOLOGIES:
-        vertical_ancestors = ancestors if ancestors is not None else _build_ancestors(plan.tasks)
-        violations.extend(_validate_vertical_slices(plan, spec, design, vertical_ancestors))
-
-    return violations
+        issues.extend(_validate_vertical_slices(plan, ancestors))
+    return issues
 
 
 def assert_valid_plan(
@@ -1250,15 +315,12 @@ def assert_valid_plan(
     workspace_root: Path | str | None = None,
     topology: str | None = None,
 ) -> None:
-    violations = validate_plan(
-        plan,
-        spec=spec,
-        design=design,
-        workspace_root=workspace_root,
-        topology=topology,
+    """Raise PlanValidationError when the plan breaks a structural invariant."""
+    issues = validate_plan(
+        plan, spec, design=design, workspace_root=workspace_root, topology=topology
     )
-    if violations:
-        raise PlanValidationError(violations)
+    if issues:
+        raise PlanValidationError(issues)
 
 
 def compute_dispatchable_tasks(
@@ -1269,26 +331,18 @@ def compute_dispatchable_tasks(
     """Return tasks ready to run now without write_scope or concurrency conflicts."""
     by_id = {t.task_id: t for t in plan.tasks}
     active = [t for t in plan.tasks if t.status in (TaskStatus.RUNNING, TaskStatus.VERIFYING)]
-    available_slots = max(0, max_concurrent - len(active))
-    if available_slots == 0:
-        return []
-
+    slots = max(0, max_concurrent - len(active))
     active_scopes = [s for t in active for s in t.write_scope]
-    dispatchable: list[TaskNode] = []
-
+    ready: list[TaskNode] = []
     for task in plan.tasks:
+        if len(ready) >= slots:
+            break
         if task.status not in (TaskStatus.WAITING, TaskStatus.READY):
             continue
-        deps_accepted = all(
-            dep in by_id and by_id[dep].status == TaskStatus.ACCEPTED for dep in task.depends_on
-        )
-        if not deps_accepted:
+        deps = [by_id.get(dep) for dep in task.depends_on]
+        blocked = any(dep is None or dep.status != TaskStatus.ACCEPTED for dep in deps)
+        if blocked or scopes_overlap(task.write_scope, active_scopes):
             continue
-        if scopes_overlap(task.write_scope, active_scopes):
-            continue
-        dispatchable.append(task)
+        ready.append(task)
         active_scopes.extend(task.write_scope)
-        if len(dispatchable) >= available_slots:
-            break
-
-    return dispatchable
+    return ready

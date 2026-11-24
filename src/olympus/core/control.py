@@ -178,58 +178,6 @@ class RunControl:
             handler=handler,
         )
 
-    def pause_for_watchdog(
-        self,
-        run_id: str,
-        *,
-        task: TaskNode,
-        diagnosis: dict[str, Any],
-        retained_sandbox: str | None = None,
-    ) -> TaskNode:
-        """Block the leased attempt and pause its run in one transaction."""
-        payload = {"task_id": task.task_id, "attempt": task.attempt, **diagnosis}
-        if retained_sandbox is not None:
-            payload["retained_sandbox"] = retained_sandbox
-
-        def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
-            snap = self.store.get_run_in_tx(conn, run_id)
-            plan: TaskPlan | None = snap["plan"]
-            candidates = plan.tasks if plan is not None else ()
-            current = next((t for t in candidates if t.task_id == task.task_id), None)
-            if (
-                current is None
-                or current.lease_generation != task.lease_generation
-                or current.status != TaskStatus.RUNNING
-            ):
-                raise ConcurrencyConflictError(f"Stale watchdog lease for {task.task_id}")
-            blocked = current.model_copy(update={
-                "status": TaskStatus.BLOCKED,
-                "last_error": diagnosis["summary"],
-                "worktree_path": retained_sandbox,
-            })
-            new_rev = self.store.update_plan_in_tx(
-                conn, run_id=run_id, cur_rev=cur_rev,
-                mutator=lambda plan: plan.model_copy(update={
-                    "tasks": [blocked if t.task_id == task.task_id else t for t in plan.tasks],
-                }),
-                stage="orchestrate", event_type="watchdog.paused", actor="watchdog",
-                payload=payload,
-            )
-            if snap["status"] == RunStatus.RUNNING:
-                self.store.update_status_in_tx(
-                    conn, run_id=run_id, cur_rev=new_rev, status=RunStatus.PAUSED,
-                    stage="orchestrate", event_type="run.paused", actor="watchdog",
-                    payload={"status": RunStatus.PAUSED.value, "reason": "watchdog_paused"},
-                )
-            return {"task": blocked.model_dump(mode="json")}
-
-        result = self.store.apply_idempotent_command(
-            operation_id=f"watchdog:{run_id}:{task.task_id}:{task.lease_generation}",
-            run_id=run_id, actor="watchdog", action="watchdog_pause",
-            expected_state_revision=None, payload=payload, handler=handler,
-        )
-        return TaskNode.model_validate(result["task"])
-
     def prepare_workflow_retry(
         self,
         run_id: str,

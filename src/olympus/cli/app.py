@@ -312,13 +312,21 @@ def cmd_run(
     ] = None,
     worker_driver: Annotated[
         str | None,
-        typer.Option(help="Stage 2 worker driver: native|pi (optionally driver@model)."),
+        typer.Option(
+            help="Stage 2 worker driver: auto|native|pi (optionally driver@model). "
+            "Default auto selects Pi when available on eligible remote providers."
+        ),
     ] = None,
     reviewer_driver: Annotated[
         str | None,
-        typer.Option(help="Stage 2 reviewer driver: native|pi (optionally driver@model)."),
+        typer.Option(
+            help="Stage 2 reviewer driver: auto|native|pi (optionally driver@model). "
+            "Default auto selects Pi when available on eligible remote providers."
+        ),
     ] = None,
-    monitor_model: Annotated[str | None, typer.Option(help="Monitor model.")] = None,
+    monitor_model: Annotated[
+        str | None, typer.Option(help="Deprecated no-op. The LLM Watchdog was removed.")
+    ] = None,
 ) -> None:
     """Stage 2: Execute approved TaskPlan with sandbox isolation and cold-start review."""
     ws = _resolve_workspace(workspace)

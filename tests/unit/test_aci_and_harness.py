@@ -1073,6 +1073,120 @@ def test_tools_aci_has_no_harness_imports_and_worktree_reexports_env_builder() -
     assert ".olympus" in IGNORED_DIR_NAMES
 
 
+def test_clean_runtime_artifacts_preserves_scope_and_existing_paths(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path)
+    (repo / ".gitignore").write_text("data/existing.db\n", encoding="utf-8")
+    (repo / "tracked.db").write_text("tracked", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore", "tracked.db"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "runtime fixtures"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="runtime")
+    try:
+        ws = handle.workspace_path
+        (ws / "data" / "uploads").mkdir(parents=True)
+        (ws / "existing-dir").mkdir()
+        (ws / "data" / "existing.db").write_text("pre-existing", encoding="utf-8")
+        baseline = snapshot_sandbox_state(handle)
+        runtime_files = [
+            "data/blacknote.db",
+            "data/blacknote.db-wal",
+            "data/uploads/nested/sample.png",
+            "existing-dir/output.sqlite3",
+            "existing-dir/output.sqlite3-journal",
+            "scratch/debug.log",
+            "scratch/rollback.sqlite-journal",
+        ]
+        for rel in [*runtime_files, "scoped.db", "data/uploads/config.json", "data/hack.py"]:
+            path = ws / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("worker output", encoding="utf-8")
+        (ws / "tracked.db").write_text("changed", encoding="utf-8")
+        # A path staged by the worker is now tracked, even though it was absent at HEAD.
+        (ws / "staged.db").write_text("staged", encoding="utf-8")
+        subprocess.run(["git", "add", "staged.db"], cwd=ws, check=True)
+
+        assert clean_ephemeral_artifacts(handle, baseline) == []
+        assert clean_ephemeral_artifacts(
+            handle, baseline, write_scope=["scoped.db"]
+        ) == runtime_files
+        assert (ws / "data" / "existing.db").read_text(encoding="utf-8") == "pre-existing"
+        assert list((ws / "existing-dir").iterdir()) == []
+        assert not (ws / "data" / "uploads" / "nested").exists()
+        assert not (ws / "scratch").exists()
+        assert (ws / "scoped.db").read_text(encoding="utf-8") == "worker output"
+        gate = run_diff_gate(
+            handle, baseline, allowed_write_scope=["scoped.db"], forbidden_globs=[]
+        )
+        assert [item.path for item in gate.violations] == [
+            "data/hack.py", "data/uploads/config.json", "staged.db", "tracked.db",
+        ]
+    finally:
+        remove_sandbox(handle)
+
+
+def test_clean_runtime_artifacts_skips_legacy_and_incomplete_baselines(tmp_path: Path) -> None:
+    from olympus.harness.worktree import SandboxBaseline
+
+    repo = _init_git_repo(tmp_path)
+    (repo / ".gitignore").write_text("existing.db\ncache/\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "ignore fixtures"], cwd=repo, check=True)
+    handle = create_sandbox(repo, label="legacy-and-incomplete")
+    ws = handle.workspace_path
+    locked = ws / "cache"
+    try:
+        (ws / "existing.db").write_text("legacy", encoding="utf-8")
+        legacy = SandboxBaseline(
+            is_git=True,
+            entries=(),
+            base_commit=handle.base_commit,
+            preexisting_ephemeral=(),
+            preexisting_dirs=None,
+        )
+        (ws / "junk.tmp").write_text("tmp", encoding="utf-8")
+        assert clean_ephemeral_artifacts(handle, legacy, write_scope=["feature.py"]) == ["junk.tmp"]
+        assert (ws / "existing.db").read_text(encoding="utf-8") == "legacy"
+
+        if os.geteuid() != 0:
+            nested = locked / "existing-dir"
+            nested.mkdir(parents=True)
+            (nested / "existing.db").write_text("locked-existing", encoding="utf-8")
+            locked.chmod(0o000)
+            try:
+                incomplete = snapshot_sandbox_state(handle)
+            finally:
+                locked.chmod(0o755)
+            assert incomplete.preexisting_dirs is None
+            (nested / "new.db").write_text("new", encoding="utf-8")
+            assert clean_ephemeral_artifacts(handle, incomplete, write_scope=["feature.py"]) == []
+            assert (nested / "existing.db").read_text(encoding="utf-8") == "locked-existing"
+            assert nested.is_dir()
+
+            git_dir_proc = subprocess.run(
+                ["git", "rev-parse", "--git-dir"],
+                cwd=ws,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            index_path = Path(git_dir_proc.stdout.strip())
+            if not index_path.is_absolute():
+                index_path = ws / index_path
+            index_file = index_path / "index"
+            index_file.chmod(0o000)
+            try:
+                index_fallback = snapshot_sandbox_state(handle)
+            finally:
+                index_file.chmod(0o644)
+            assert index_fallback.preexisting_dirs is None
+            assert clean_ephemeral_artifacts(
+                handle, index_fallback, write_scope=["feature.py"]
+            ) == []
+    finally:
+        if locked.exists():
+            locked.chmod(0o755)
+        remove_sandbox(handle)
+
+
 def test_clean_ephemeral_artifacts_preserves_preexisting_gitignored_files(tmp_path: Path) -> None:
     from olympus.harness.worktree import (
         clean_ephemeral_artifacts,

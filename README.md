@@ -17,7 +17,7 @@ Olympus4SWE is designed from first principles around four irreducible failure mo
 1. **Ambiguous intent → building the wrong system**: Stage 1 (`Align`) inspects the repository read-only, surfaces blocking ambiguities (with optional cold-start parallel critiques), and freezes a human-approved EARS `GoalSpec` with explicit `out_of_scope` boundaries before code is written.
 2. **Long-horizon context rot & concurrent write collisions**: Stage 2a (`Design`) locks white-box module boundaries and interface seams (`DesignSpec`), while the planner emits a validated Task DAG with strictly disjoint `write_scope` assignments executed in isolated `git worktree` sandboxes and verified by a post-flight `Diff Gate`.
 3. **Self-review confirmation bias**: Cold-start `Momus` (code review) and `Argus` (independent verification) inspect diffs and executable check outputs against frozen contracts with **zero shared conversation history** with the implementer, grading `Important` vs. `Nit` defects under bounded rework limits (`max_cycles=3`).
-4. **Black-box runs that are hard to monitor or steer**: Every state transition, milestone, diff, delivery check, and human ruling is recorded in an append-only SQLite event store projected live over SSE. A two-tier `Watchdog` detects stalls, repeated errors, or scope drift to issue bounded mid-turn `steer` guidance or pause safely to `blocked` without discarding work.
+4. **Black-box runs that are hard to monitor or steer**: Every state transition, milestone, diff, delivery check, and human ruling is recorded in an append-only SQLite event store projected live over SSE, while operators can issue mid-turn `steer` guidance or pause safely without discarding work.
 
 ---
 
@@ -31,7 +31,6 @@ flowchart LR
     Hephaestus -->|Post-flight Diff Gate| Momus["Momus · Review\n(Cold-Start Diff Audit)"]
     Momus -->|Important rework / pass| Argus["Argus · Verify\n(Cold-Start Delivery Checks)"]
     Argus -->|Verified Delivery| Zeus
-    Watchdog["Watchdog (L1/L2)"] -.->|Live milestones / steer / block| Hephaestus
 ```
 
 | Role | Responsibility |
@@ -42,7 +41,6 @@ flowchart LR
 | **Hephaestus** *(Build)* | Implements each `TaskNode` inside an isolated sandbox via its configured `AgentDriver` (`auto`, `pi`, or `native`). |
 | **Momus** *(Review & Audit)* | Cold-start diff reviewer classifying `Important` vs. `Nit` defects and enforcing bounded convergence. |
 | **Argus** *(Verify)* | Cold-start read-only verifier auditing sandbox diffs and isolated delivery checks against frozen upstream contracts. |
-| **Watchdog** *(Health)* | Runs alongside active turns with 0-token L1 anomaly triggers (repeated errors, silence, compactions, out-of-scope edits) and read-only L2 semantic checks. |
 
 The **Web Workbench** exposes two coordinated surfaces over the same SQLite event stream:
 - **L1 · Oracle Board**: Multi-workspace switching, Ball-in-Court columns (`Awaiting Your Ruling` · `In Flight` · `Delivered`), inline **Quick Ruling Drawer** for clarifications/approvals, and the pinned five-seat **Pantheon Dock**.
@@ -170,13 +168,12 @@ uv run olympus accept-risk <run_id> <task_id> --revision <n> --reason "Accepted 
 Per [ADR-0002](docs/adr/0002-meta-harness-driver-and-watchdog.md), Olympus4SWE separates its deterministic SDLC control plane from agent execution loops behind the `AgentDriver` protocol:
 
 - **Default `auto` resolution**: `stage_driver`, `worker_driver`, and `reviewer_driver` default to `auto`. On a real remote provider when the `pi` CLI is installed, `auto` selects `pi` (with `--mode rpc`, live milestones, mid-turn `steer`, and read-only tool lockdown for planning/review stages). In offline tests or zero-Node environments, `auto` transparently falls back to the built-in pure-Python `native` driver.
-- **Role-scoped heterogeneous overrides**: Mix drivers and models across roles via CLI flags (`--stage-driver`, `--worker-driver`, `--reviewer-driver`, `--monitor-model`) or environment variables (`OLYMPUS_STAGE_DRIVER`, `OLYMPUS_WORKER_DRIVER`, `OLYMPUS_REVIEWER_DRIVER`, `OLYMPUS_MONITOR_MODEL`), using `native`, `pi`, `auto`, or `driver@model`:
+- **Role-scoped heterogeneous overrides**: Mix drivers and models across roles via CLI flags (`--stage-driver`, `--worker-driver`, `--reviewer-driver`) or environment variables (`OLYMPUS_STAGE_DRIVER`, `OLYMPUS_WORKER_DRIVER`, `OLYMPUS_REVIEWER_DRIVER`), using `auto`, `pi`, `native`, or `driver@model`:
 
 ```bash
 uv run olympus run <run_id> \
   --worker-driver pi@gpt-4o \
-  --reviewer-driver native@claude-3-7-sonnet-latest \
-  --monitor-model gpt-4o-mini
+  --reviewer-driver pi@claude-3-7-sonnet-latest
 ```
 
 To enable the optional `Pi` driver:
@@ -196,7 +193,7 @@ Olympus4SWE/
 │   ├── core/          # Strict Pydantic contracts, SHA-256 fingerprints, DAG/scope validation, SQLite store, RunControl
 │   ├── providers/     # Pluggable LLM registry, sticky failover pool, thin official OpenAI/Anthropic SDK dialects
 │   ├── tools/         # Safe ACI file/shell primitives with absolute-path enforcement and bounded output
-│   ├── harness/       # Append-only loop, AgentDriver (native + pi), DiffGate, Watchdog, worktree sandbox, TurnReceipt
+│   ├── harness/       # Append-only loop, AgentDriver (native + pi), DiffGate, worktree sandbox, TurnReceipt
 │   ├── stages/        # Stage 1 Align, Stage 2a Design, Stage 2 Orchestrate & Verify
 │   ├── graph/         # Declarative YAML workflow loader, blackboard engine, conditional routing, progress projection
 │   ├── session/       # Headless pause/resume runner, gate policies, and natural-language reply router

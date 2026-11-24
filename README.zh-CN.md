@@ -17,7 +17,7 @@ Olympus4SWE 不依赖重型黑盒编排框架，而是从第一性原理出发�
 1. **意图模糊 → 从一开始就做偏**：Stage 1（`Align`）先对仓库做只读取证，识别真正阻塞实现的歧义（可选冷启动并行多视角挑刺），在写第一行代码前先冻结经人类批准、含明确 `out_of_scope` 边界的 EARS 范式 `GoalSpec`。
 2. **长程上下文衰减 & 并发修改互相踩踏**：Stage 2a（`Design`）先锁死白盒模块边界与跨模块接缝（`DesignSpec`），再由规划器生成经校验的 Task DAG，为并发节点分配严格不相交的 `write_scope`，在独立 `git worktree` 沙盒中执行并通过后置 `Diff Gate` 强校验。
 3. **自写自审的确认偏误**：冷启动的 `Momus`（代码审查）与 `Argus`（独立验收）在**零共享历史上下文**的前提下，对照冻结契约审查代码 Diff 与可执行检查输出，强制按 `Important` / `Nit` 分级并受限于 `max_cycles=3` 收敛上限。
-4. **过程黑盒、难以观测与中途纠偏**：每一次状态迁移、工具里程碑、Diff、交付检查与人工裁决都写入只追加 SQLite 事件表，并通过 SSE 实时投影到工作台。双层 `Watchdog` 在运行期检测停滞、重复报错或范围漂移，可注入有界 `steer` 纠偏提示，或安全暂停为 `blocked` 交由人类裁决，不悄悄丢弃已有工作。
+4. **过程黑盒、难以观测与中途纠偏**：每一次状态迁移、工具里程碑、Diff、交付检查与人工裁决都写入只追加 SQLite 事件表，并通过 SSE 实时投影到工作台；操作者可在运行中发送 `steer` 纠偏或安全暂停，不悄悄丢弃已有工作。
 
 ---
 
@@ -31,7 +31,6 @@ flowchart LR
     Hephaestus -->|后置 Diff Gate 拦截| Momus["Momus · Review\n（冷启动 Diff 审查）"]
     Momus -->|Important 打回 / 通过| Argus["Argus · Verify\n（冷启动独立验收）"]
     Argus -->|已验证交付| Zeus
-    Watchdog["Watchdog（L1/L2 监护）"] -.->|实时里程碑 / steer / block| Hephaestus
 ```
 
 | 角色 | 职责定位 |
@@ -42,7 +41,6 @@ flowchart LR
 | **Hephaestus** *(Build)* | Stage 2 编码执行：在隔离沙盒内通过配置的 `AgentDriver`（`auto` / `pi` / `native`）实现单个 `TaskNode`。 |
 | **Momus** *(Review & Audit)* | 冷启动代码审查：独立审阅执行 Diff，区分 `Important` 与 `Nit` 缺陷并约束有界返工收敛。 |
 | **Argus** *(Verify)* | 冷启动只读独立验收：对照上游冻结契约与隔离交付检查输出出具可审计的通过/拒绝结论。 |
-| **Watchdog** *(运行期健康)* | 伴随活跃执行轮次运行：0-Token L1 异常触发（连续相同报错、静默超时、频繁压缩、越界修改）+ 只读 L2 语义评估与温和 `steer`。 |
 
 **Web 工作台**基于同一份 SQLite 事件流提供两层协同视图：
 - **L1 · Oracle Board**：支持多 Workspace 切换、按球权归属分列（`Awaiting Your Ruling` · `In Flight` · `Delivered`）、侧抽屉 **Quick Ruling Drawer** 原地澄清/审批，以及底部常驻五神席位栏 **Pantheon Dock**。
@@ -170,13 +168,12 @@ uv run olympus accept-risk <run_id> <task_id> --revision <n> --reason "Accepted 
 依据 [ADR-0002](docs/adr/0002-meta-harness-driver-and-watchdog.md)，Olympus4SWE 通过 `AgentDriver` 协议将确定性控制面与底层编码执行循环解耦：
 
 - **默认 `auto` 解析**：`stage_driver`、`worker_driver` 与 `reviewer_driver` 默认均为 `auto`。当使用真实远程 Provider 且本机已安装 `pi` CLI 时，`auto` 自动启用 `pi`（`--mode rpc`、实时事件流、运行中 `steer`，并在规划/审查阶段锁定只读工具）；在离线单测或无 Node 环境下，`auto` 自动回退至纯 Python 内置 `native` 驱动。
-- **按角色异构混搭**：支持通过 CLI 参数（`--stage-driver`、`--worker-driver`、`--reviewer-driver`、`--monitor-model`）或环境变量（`OLYMPUS_STAGE_DRIVER`、`OLYMPUS_WORKER_DRIVER`、`OLYMPUS_REVIEWER_DRIVER`、`OLYMPUS_MONITOR_MODEL`）按角色指定 `native`、`pi`、`auto` 或 `driver@model`：
+- **按角色异构混搭**：支持通过 CLI 参数（`--stage-driver`、`--worker-driver`、`--reviewer-driver`）或环境变量（`OLYMPUS_STAGE_DRIVER`、`OLYMPUS_WORKER_DRIVER`、`OLYMPUS_REVIEWER_DRIVER`）按角色指定 `auto`、`pi`、`native` 或 `driver@model`：
 
 ```bash
 uv run olympus run <run_id> \
   --worker-driver pi@gpt-4o \
-  --reviewer-driver native@claude-3-7-sonnet-latest \
-  --monitor-model gpt-4o-mini
+  --reviewer-driver pi@claude-3-7-sonnet-latest
 ```
 
 安装可选的 `Pi` 执行驱动：
@@ -196,7 +193,7 @@ Olympus4SWE/
 │   ├── core/          # 强类型 Pydantic 契约、SHA-256 指纹、DAG/写域校验、SQLite 存储、RunControl
 │   ├── providers/     # 可插拔 LLM 注册表、粘性故障转移池、官方 OpenAI/Anthropic SDK 薄适配层
 │   ├── tools/         # 强制绝对路径与输出截断的安全 ACI 文件/Shell 原语
-│   ├── harness/       # Append-Only 循环、AgentDriver（native + pi）、DiffGate、Watchdog、worktree 沙盒、TurnReceipt
+│   ├── harness/       # Append-Only 循环、AgentDriver（native + pi）、DiffGate、worktree 沙盒、TurnReceipt
 │   ├── stages/        # Stage 1 Align、Stage 2a Design、Stage 2 Orchestrate & Verify
 │   ├── graph/         # 声明式 YAML 工作流加载器、黑板引擎、纯代码条件路由与进度投影
 │   ├── session/       # 无头暂停/恢复运行器、闸门策略与自然语言回复路由

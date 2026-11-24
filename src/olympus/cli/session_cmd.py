@@ -78,16 +78,21 @@ WorkerDriverOpt = Annotated[
     str | None,
     typer.Option(
         "--worker-driver",
-        help="Stage 2 worker driver: native|pi (optionally driver@model).",
+        help="Stage 2 worker driver: auto|native|pi (optionally driver@model). "
+        "Default auto selects Pi when available on eligible remote providers.",
     ),
 ]
 ReviewerDriverOpt = Annotated[
     str | None,
-    typer.Option("--reviewer-driver", help="Stage 2 reviewer driver: native|pi."),
+    typer.Option(
+        "--reviewer-driver",
+        help="Stage 2 reviewer driver: auto|native|pi (optionally driver@model). "
+        "Default auto selects Pi when available on eligible remote providers.",
+    ),
 ]
 MonitorModelOpt = Annotated[
     str | None,
-    typer.Option("--monitor-model", help="Watchdog monitor model."),
+    typer.Option("--monitor-model", help="Deprecated no-op. The LLM Watchdog was removed."),
 ]
 PiProviderOpt = Annotated[
     str | None,

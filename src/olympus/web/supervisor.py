@@ -29,7 +29,6 @@ from olympus.harness.driver import (
     ExecutionDriversConfig,
     default_driver_factories,
 )
-from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.auth import resolve_env_mapping
 from olympus.providers.base import LLMProvider, MockLLMProvider
 from olympus.providers.factory import build_provider
@@ -62,8 +61,6 @@ class RunSupervisor:
         artifacts_root: Path | None = None,
         provider_builder: ProviderBuilder | None = None,
         driver_registry: DriverRegistry | None = None,
-        monitor_provider: LLMProvider | None = None,
-        watchdog_config: WatchdogConfig | None = None,
         max_workers: int = 4,
     ) -> None:
         self.store = store
@@ -74,8 +71,6 @@ class RunSupervisor:
             else self.workspace_root / ".olympus" / "runs"
         )
         self.provider_builder = provider_builder
-        self.monitor_provider = monitor_provider
-        self.watchdog_config = watchdog_config
         self.driver_registry = driver_registry or DriverRegistry()
         self.live_activity = activity.LiveActivity()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -374,8 +369,6 @@ class RunSupervisor:
                     )
                 ),
                 model_provider=lambda model: self._builder({**provider_config, "model": model}),
-                monitor_provider=self.monitor_provider,
-                watchdog_config=self.watchdog_config,
                 on_driver_handle=lambda handle: self._register_turn(run_id, handle),
                 live_activity=self.live_activity,
             )

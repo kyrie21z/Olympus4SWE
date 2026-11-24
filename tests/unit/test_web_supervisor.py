@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 
 from olympus.core.contracts import ApprovalDecision, ApprovalRecord, ApprovalTarget, TaskPlan
 from olympus.core.store import RunStore
-from olympus.harness.watchdog import WatchdogConfig
 from olympus.providers.base import ChatMessage, LLMResponse, MockLLMProvider, ToolSpec
 from olympus.web.server import AriadneApp, create_fastapi_app
 from olympus.web.supervisor import RunSupervisor
@@ -1017,61 +1016,6 @@ def test_ariadne_pause_cancels_worker_without_spending_a_review_cycle(tmp_path: 
         assert resumed["projection"]["status"] == "completed"
         assert set(worker_models) == {"worker-role"} and set(reviews) == {"reviewer-role"}
         assert all(task.review_cycle == 0 for task in store.get_run(run_id)["plan"].tasks)
-    finally:
-        release_worker.set()
-        supervisor.shutdown()
-
-
-def test_supervisor_resolves_configured_watchdog_provider(tmp_path: Path) -> None:
-    _init_git_repo(tmp_path)
-    store = RunStore(tmp_path / ".olympus" / "olympus.db")
-    monitor = MockLLMProvider(responses=[LLMResponse(content=(
-        '{"verdict":"HEALTHY","summary":"Implementation is progressing.","suggested_steer":null}'
-    ))])
-    release_worker = threading.Event()
-    now = 0.0
-
-    def wait(condition: threading.Condition, timeout: float) -> None:
-        nonlocal now
-        if not now:
-            now += timeout
-            return
-        release_worker.set()
-        condition.wait()
-
-    def respond(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
-        system = messages[0].content
-        if "Execution Engineer (Hephaestus)" in system:
-            assert release_worker.wait(5)
-            return LLMResponse(content="Worker finished.")
-        if "Independent Verifier (Argus)" in system:
-            return LLMResponse(content='{"task_id":"T0","attempt":1,"passed":true,"summary":"OK"}')
-        return _responder(messages, tools)
-
-    def provider_builder(*, model: str = "primary", **kwargs: object) -> MockLLMProvider:
-        if model == "small-monitor":
-            return monitor
-        return MockLLMProvider(model_name=model, responder=respond)
-
-    supervisor = RunSupervisor(
-        store=store, workspace_root=tmp_path, provider_builder=provider_builder,
-        watchdog_config=WatchdogConfig(interval_seconds=300, clock=lambda: now, wait=wait),
-    )
-    app = AriadneApp(store=store, workspace_root=tmp_path, supervisor=supervisor)
-    try:
-        started = supervisor.start_run(
-            title="Configured Watchdog", raw_input="Build an inventory REST API",
-            workflow_name="full_sdlc_tdd", provider_config={"provider": "mock"},
-            monitor_model="small-monitor", auto_approve=True,
-        )
-        run_id = started["run_id"]
-        supervisor.wait(run_id, timeout=10)
-        projection = app.get_run_payload(run_id)["projection"]
-        assert projection["status"] == "completed"
-        assert len(monitor.recorded_requests) == 1
-        progress = projection["dag"]["nodes"][0]["live_progress"]
-        assert progress["watchdog_verdict"] == "HEALTHY"
-        assert progress["watchdog_summary"] == "Implementation is progressing."
     finally:
         release_worker.set()
         supervisor.shutdown()

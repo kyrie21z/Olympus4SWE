@@ -176,15 +176,6 @@ def _emit_work():
             "durationMs": 12,
         }
     )
-    if os.environ.get("FAKE_PI_WATCHDOG_ERRORS") == "1":
-        for step in range(3):
-            _emit({
-                "type": "tool_execution_end",
-                "toolCallId": f"err-{step}",
-                "toolName": "read",
-                "result": {"content": [{"type": "text", "text": "Repeated error"}]},
-                "isError": True,
-            })
     if os.environ.get("FAKE_PI_COMPACT") == "1":
         _emit({"type": "compaction_start", "reason": "threshold"})
         _emit({
@@ -821,9 +812,8 @@ def _review_responder(
     )
 
 
-@pytest.mark.parametrize("watchdog_enabled", [False, True])
 def test_pi_worker_heterogeneous_run_with_argus_review(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, watchdog_enabled: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _init_repo(tmp_path)
     store, run_id = _confirmed_run(tmp_path)
@@ -853,19 +843,10 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
     monkeypatch.setenv("FAKE_PI_ARGV_FILE", str(argv_file))
     monkeypatch.setenv("FAKE_PI_ENV_FILE", str(env_file))
 
-    monitor = None
-    if watchdog_enabled:
-        monkeypatch.setenv("FAKE_PI_AWAIT_STEER", "1")
-        monkeypatch.setenv("FAKE_PI_WATCHDOG_ERRORS", "1")
-        monitor = MockLLMProvider(responses=[LLMResponse(content=(
-            '{"verdict":"STUCK_LOOP","summary":"Repeated read errors.",'
-            '"suggested_steer":"Continue without the blocked read."}'
-        ))])
     stage = OrchestrateStage(
         store=store,
         provider=MockLLMProvider(responder=_review_responder),
         workspace_root=tmp_path,
-        monitor_provider=monitor,
         execution_drivers=ExecutionDriversConfig(
             worker_driver="pi", reviewer_driver="native"
         ),
@@ -877,21 +858,13 @@ def test_pi_worker_heterogeneous_run_with_argus_review(
     assert task.status == TaskStatus.ACCEPTED
 
     events = store.list_events(run_id)
-    if watchdog_enabled:
-        assert monitor is not None and len(monitor.recorded_requests) == 1
-        assert any(e.event_type == "watchdog.checked" for e in events)
-        assert any(
-            e.event_type == "agent.steered" and e.payload["source"] == "watchdog"
-            for e in events
-        )
     verdicts = [e for e in events if e.event_type == "review.verdict_recorded"]
     assert len(verdicts) == 1 and verdicts[0].payload["passed"] is True
     assert not [e for e in events if e.event_type == "task.diff_gate_rejected"]
 
     ledger = store.get_run(run_id)["budget_ledger"]
     assert (ledger.input_tokens, ledger.output_tokens) == (18, 8)
-    watchdog_calls = 1 if watchdog_enabled else 0
-    assert ledger.llm_calls_used == 3 + watchdog_calls
+    assert ledger.llm_calls_used == 3
 
     argv = json.loads(argv_file.read_text(encoding="utf-8"))["argv"]
     assert "--mode" in argv and argv[argv.index("--mode") + 1] == "rpc"
@@ -1566,6 +1539,50 @@ def test_resolve_driver_spec_auto_matrix(
         assert resolve_driver_spec("auto", provider=provider) == "native"
     finally:
         _reset_pi_availability_cache()
+
+
+def test_argus_auto_selects_pi_with_provider_model_and_read_only_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    _init_repo(workspace)
+    store, run_id = _confirmed_run(workspace)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    _approve_plan(store, run_id, _single_task_plan(spec, [{
+        "id": "CHK-1",
+        "kind": "independent_review",
+        "description": "Cold-start review",
+    }]))
+    monkeypatch.setenv("OLYMPUS_PI_BIN", str(_write_fake_pi(tmp_path, rpc=True)))
+    _reset_pi_availability_cache()
+
+    class RecordingPi(_ScriptedStageDriver):
+        name = "pi"
+
+    pi = RecordingPi([
+        "Worker finished.",
+        '{"task_id":"T1","attempt":1,"passed":true,"summary":"Verified","findings":[]}',
+    ])
+    provider = _StageProvider(model_name="argus-model")
+    try:
+        result = OrchestrateStage(
+            store=store,
+            provider=provider,
+            workspace_root=workspace,
+            execution_drivers=ExecutionDriversConfig(),
+            driver_registry=DriverRegistry({"pi": pi}),
+        ).run_execution(run_id=run_id)
+    finally:
+        _reset_pi_availability_cache()
+
+    assert result["status"] == RunStatus.COMPLETED
+    assert provider.calls == 0
+    worker, reviewer = pi.requests
+    assert worker.read_only is False
+    assert reviewer.actor == "argus:T1"
+    assert reviewer.model == "argus-model"
+    assert reviewer.read_only is True
 
 
 def test_align_stage_auto_runs_pi_read_only_and_leaves_workspace_untouched(

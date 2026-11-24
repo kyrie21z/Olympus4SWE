@@ -62,11 +62,9 @@ from olympus.harness.driver import (
 from olympus.harness.loop import AgentLoop, BudgetExhaustedError, parse_model_json
 from olympus.harness.native import NativeDriver
 from olympus.harness.structured import run_structured_turn
-from olympus.harness.watchdog import Watchdog, WatchdogConfig
 from olympus.harness.worktree import (
     SandboxHandle,
     absorb_verification_artifacts,
-    archive_sandbox_recovery,
     build_sandbox_env,
     capture_sandbox_diff,
     clean_ephemeral_artifacts,
@@ -82,7 +80,6 @@ from olympus.harness.worktree import (
     sync_upstream_files,
 )
 from olympus.providers.base import LLMProvider
-from olympus.providers.factory import build_provider
 from olympus.stages.common import (
     default_artifacts_root,
     format_workspace_inventory,
@@ -149,7 +146,8 @@ Rules:
 5. Read relevant files first using absolute paths under the sandbox root, and only write or edit
    files inside your assigned write_scope unless the task prompt explicitly authorizes adjacent
    non-forbidden integration edits.
-6. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
+6. Put self-test databases, uploads, and temp files in $TMPDIR or remove them before finishing.
+7. Do NOT claim completion without verified tool outputs. If prior review findings are provided,
    fix every Important finding before concluding. Once all acceptance checks pass cleanly, stop
    iterating and deliver your final summary immediately instead of over-polishing."""
 
@@ -909,8 +907,6 @@ class OrchestrateStage:
         execution_drivers: ExecutionDriversConfig | None = None,
         driver_registry: DriverRegistry | None = None,
         model_provider: Callable[[str], LLMProvider] | None = None,
-        monitor_provider: LLMProvider | None = None,
-        watchdog_config: WatchdogConfig | None = None,
         on_driver_event: DriverEvent | None = None,
         on_driver_handle: Callable[[ActiveTurnHandle], None] | None = None,
         live_activity: LiveActivity | None = None,
@@ -920,8 +916,6 @@ class OrchestrateStage:
         self.execution_drivers = execution_drivers or ExecutionDriversConfig.resolve()
         self.driver_registry = driver_registry or DriverRegistry()
         self.model_provider = model_provider
-        self.monitor_provider = monitor_provider
-        self.watchdog_config = watchdog_config
         self.on_driver_event = on_driver_event
         self.on_driver_handle = on_driver_handle
         self.live_activity = live_activity
@@ -1335,9 +1329,8 @@ class OrchestrateStage:
             diff_ctx += (
                 f"\nThe inline diff above was truncated at {_INLINE_DIFF_BUDGET} characters. "
                 f"The complete diff is saved at: {diff_path}\n"
-                "Inspect only the specific files you need with your read-only tools "
-                "(read_file, grep_files, glob_files) before deciding; do not assume the "
-                "inline diff is complete.\n"
+                "Inspect only the specific files you need with your read-only inspection tools "
+                "before deciding; do not assume the inline diff is complete.\n"
             )
         user_prompt = (
             f"Sandbox root: {sandbox.workspace_path}\n"
@@ -1693,13 +1686,8 @@ class OrchestrateStage:
         task: TaskNode,
         driver: AgentDriver,
         request: DriverTurnRequest,
-        watchdog: Watchdog | None,
-        *,
-        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
-        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
     ) -> TurnOutcome:
         activity = self.live_activity
-        active_handle: list[ActiveTurnHandle] = []
 
         def observe(kind: str, payload: dict[str, Any]) -> None:
             fields = milestone_fields(kind, payload)
@@ -1717,8 +1705,6 @@ class OrchestrateStage:
                         **fields,
                     },
                 )
-                if watchdog is not None:
-                    watchdog.observe(kind, fields)
             if kind == "text_delta" and activity is not None:
                 text = payload.get("text")
                 if isinstance(text, str) and text:
@@ -1729,22 +1715,9 @@ class OrchestrateStage:
             if self.on_driver_event is not None:
                 self.on_driver_event(kind, payload)
 
-        def register_handle(handle: ActiveTurnHandle) -> None:
-            active_handle.append(handle)
-            if on_handle_registered is not None:
-                on_handle_registered(handle)
-            if watchdog is not None:
-                watchdog.start(handle)
-            if self.on_driver_handle is not None:
-                self.on_driver_handle(handle)
-
         try:
-            return driver.run_turn(request, on_event=observe, on_handle=register_handle)
+            return driver.run_turn(request, on_event=observe, on_handle=self.on_driver_handle)
         finally:
-            if watchdog is not None:
-                watchdog.stop()
-            if on_handle_finished is not None and active_handle:
-                on_handle_finished(active_handle[-1])
             if activity is not None:
                 activity.clear(run_id, task.task_id, task.attempt)
 
@@ -1758,14 +1731,10 @@ class OrchestrateStage:
         apply_to_workspace: bool,
         worker_max_steps: int | None,
         worker: tuple[AgentDriver, str | None],
-        monitor_factory: Callable[[], LLMProvider] | None,
         reviewer: tuple[AgentDriver, str | None],
         interrupted: Event,
         design: DesignSpec | None = None,
         handoff_context: str = "",
-        on_handle_registered: Callable[[ActiveTurnHandle], None] | None = None,
-        on_handle_finished: Callable[[ActiveTurnHandle], None] | None = None,
-        on_run_paused: Callable[[], None] | None = None,
         strict_scope: bool = True,
         sibling_write_scopes: Sequence[str] = (),
     ) -> TaskNode:
@@ -1889,70 +1858,12 @@ class OrchestrateStage:
                 trace_path=art_dir / "worker.jsonl",
                 model=model,
             )
-            watchdog = None
-            if monitor_factory is not None:
-                def emit_watchdog(kind: str, payload: dict[str, Any]) -> None:
-                    self.store.append_event(
-                        run_id=run_id,
-                        stage="orchestrate",
-                        event_type=kind,
-                        actor="watchdog",
-                        payload={"task_id": leased.task_id, "attempt": leased.attempt, **payload},
-                    )
-                    if self.on_driver_event is not None:
-                        self.on_driver_event(kind, payload)
-
-                watchdog = Watchdog(
-                    config=self.watchdog_config or WatchdogConfig(),
-                    provider_factory=monitor_factory,
-                    sandbox=sandbox,
-                    objective=leased.objective,
-                    write_scope=leased.write_scope,
-                    emit=emit_watchdog,
-                    store=self.store,
-                    run_id=run_id,
-                    baseline=task_baseline,
-                    forbidden_globs=list(hard_forbidden),
-                )
-            worker_error = None
-            try:
-                loop_res = self._run_worker_turn(
-                    run_id,
-                    leased,
-                    driver,
-                    request,
-                    watchdog,
-                    on_handle_registered=on_handle_registered,
-                    on_handle_finished=on_handle_finished,
-                )
-            except Exception as exc:
-                if watchdog is None or watchdog.pause_diagnosis is None:
-                    raise
-                worker_error = type(exc).__name__
-
-            if watchdog is not None and watchdog.pause_diagnosis is not None:
-                diagnosis = dict(watchdog.pause_diagnosis)
-                if worker_error is not None:
-                    diagnosis["worker_error"] = worker_error
-                try:
-                    (art_dir / "watchdog.json").write_text(
-                        json.dumps(diagnosis, ensure_ascii=False), encoding="utf-8",
-                    )
-                    (art_dir / "worker.jsonl").touch(exist_ok=True)
-                    archive_sandbox_recovery(sandbox, art_dir)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    diagnosis["archive_error"] = type(exc).__name__
-                retained = (
-                    str(sandbox.workspace_path) if sandbox.workspace_path.exists() else None
-                )
-                retain_sandbox = retained is not None
-                paused_task = RunControl(self.store).pause_for_watchdog(
-                    run_id, task=leased, diagnosis=diagnosis,
-                    retained_sandbox=retained,
-                )
-                if on_run_paused is not None:
-                    on_run_paused()
-                return paused_task
+            loop_res = self._run_worker_turn(
+                run_id,
+                leased,
+                driver,
+                request,
+            )
 
             run_status = self.store.get_run(run_id)["status"]
             if run_status in (RunStatus.PAUSED, RunStatus.CANCELLED):
@@ -1975,14 +1886,22 @@ class OrchestrateStage:
                 event_type="task.verifying",
             )
 
+            stopped_early = not loop_res.completed and (
+                loop_res.stop_reason == "cancelled"
+                or loop_res.stop_reason.startswith("budget_exhausted")
+            )
+            removed_artifacts = (
+                []
+                if stopped_early
+                else clean_ephemeral_artifacts(
+                    sandbox, task_baseline, write_scope=verifying.write_scope
+                )
+            )
             diff_text = capture_sandbox_diff(sandbox, task_baseline)
             diff_file = art_dir / "diff.patch"
             diff_file.write_text(diff_text, encoding="utf-8")
 
-            if not loop_res.completed and (
-                loop_res.stop_reason == "cancelled"
-                or loop_res.stop_reason.startswith("budget_exhausted")
-            ):
+            if stopped_early:
                 _write_manifest_md(
                     art_dir=art_dir,
                     task=verifying,
@@ -2002,7 +1921,6 @@ class OrchestrateStage:
                     )
                 )
 
-            removed_artifacts = clean_ephemeral_artifacts(sandbox, task_baseline)
             if removed_artifacts:
                 self.store.append_event(
                     run_id=run_id,
@@ -2015,8 +1933,6 @@ class OrchestrateStage:
                         "removed_paths": removed_artifacts,
                     },
                 )
-                diff_text = capture_sandbox_diff(sandbox, task_baseline)
-                diff_file.write_text(diff_text, encoding="utf-8")
 
             gate = run_diff_gate(
                 sandbox,
@@ -2476,20 +2392,6 @@ class OrchestrateStage:
             event_type="task.budget_paused",
         )
 
-    def _monitor_factory(self) -> Callable[[], LLMProvider] | None:
-        if self.monitor_provider is not None:
-            provider = self.monitor_provider
-            return lambda: provider
-        model = self.execution_drivers.monitor_model
-        if model is None:
-            return None
-        if self.model_provider is not None:
-            factory = self.model_provider
-            return lambda: factory(model)
-        return lambda: build_provider(
-            model=model, project_providers_path=self.workspace_root / ".olympus" / "providers.json"
-        )
-
     def run_execution(
         self,
         *,
@@ -2521,7 +2423,6 @@ class OrchestrateStage:
             resolve_driver_spec(self.execution_drivers.reviewer_driver, provider=self.provider),
             native_factory=lambda model: self._native_driver(run_id, model, review=True),
         )
-        monitor_factory = self._monitor_factory()
         interrupted = Event()
         while True:
             snap = self.store.get_run(run_id)
@@ -2568,30 +2469,6 @@ class OrchestrateStage:
                 break
             except ConcurrencyConflictError:
                 continue
-
-        wave_lock = Lock()
-        wave_handles: set[ActiveTurnHandle] = set()
-        wave_paused = False
-
-        def register_wave_handle(handle: ActiveTurnHandle) -> None:
-            with wave_lock:
-                already_paused = wave_paused
-                if not already_paused:
-                    wave_handles.add(handle)
-            if already_paused:
-                handle.cancel(reason="run_paused")
-
-        def unregister_wave_handle(handle: ActiveTurnHandle) -> None:
-            with wave_lock:
-                wave_handles.discard(handle)
-
-        def cancel_wave_peers() -> None:
-            nonlocal wave_paused
-            with wave_lock:
-                wave_paused = True
-                peers = list(wave_handles)
-            for peer in peers:
-                peer.cancel(reason="run_paused")
 
         limit = (
             1
@@ -2687,14 +2564,10 @@ class OrchestrateStage:
                                 apply_to_workspace=apply_to_workspace,
                                 worker_max_steps=worker_max_steps,
                                 worker=worker,
-                                monitor_factory=monitor_factory,
                                 reviewer=reviewer,
                                 interrupted=interrupted,
                                 design=design,
                                 handoff_context=handoff,
-                                on_handle_registered=register_wave_handle,
-                                on_handle_finished=unregister_wave_handle,
-                                on_run_paused=cancel_wave_peers,
                                 strict_scope=task_strict_scope,
                                 sibling_write_scopes=sibling_write_scopes,
                             )

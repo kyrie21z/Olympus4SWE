@@ -9,7 +9,7 @@ import shutil
 import stat
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -27,6 +27,15 @@ EPHEMERAL_ARTIFACT_PATTERNS: tuple[str, ...] = (
     "**/__pycache__/**",
     "*.pyc",
     "**/.pytest_cache/**",
+)
+_RUNTIME_ARTIFACT_SUFFIXES = (
+    ".db", ".db-wal", ".db-shm", ".db-journal",
+    ".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal",
+    ".sqlite3", ".sqlite3-wal", ".sqlite3-shm", ".sqlite3-journal",
+    ".log",
+)
+_UPLOAD_ARTIFACT_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".bin"}
 )
 
 
@@ -66,6 +75,7 @@ class SandboxBaseline:
     entries: tuple[tuple[str, str | None], ...]
     base_commit: str | None = None
     preexisting_ephemeral: tuple[str, ...] = ()
+    preexisting_dirs: tuple[str, ...] | None = None
 
     def mapping(self) -> dict[str, str | None]:
         return dict(self.entries)
@@ -184,6 +194,7 @@ def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> N
                 "base_commit": baseline.base_commit,
                 "entries": [list(e) for e in baseline.entries],
                 "preexisting_ephemeral": list(baseline.preexisting_ephemeral),
+                "preexisting_dirs": baseline.preexisting_dirs,
             },
         ),
         encoding="utf-8",
@@ -206,11 +217,13 @@ def load_sandbox_baseline(handle: SandboxHandle) -> SandboxBaseline | None:
             if isinstance(raw_ephemeral, list)
             else ()
         )
+        raw_dirs = payload.get("preexisting_dirs")
         return SandboxBaseline(
             is_git=bool(payload["is_git"]),
             entries=entries,
             base_commit=base_commit,
             preexisting_ephemeral=preexisting_ephemeral,
+            preexisting_dirs=tuple(raw_dirs) if isinstance(raw_dirs, list) else None,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -392,33 +405,6 @@ def _baseline_scoped_diff(handle: SandboxHandle, baseline: SandboxBaseline) -> s
     return "\n\n".join(blocks) if blocks else "(no changes)"
 
 
-def archive_sandbox_recovery(handle: SandboxHandle, attempt_dir: Path) -> None:
-    """Record recoverable binary and text changes from a paused attempt."""
-    patch = attempt_dir / "diff.patch"
-    if handle.base_commit is None:
-        patch.write_text("Non-git workspace preserved in sandbox/\n", encoding="utf-8")
-        shutil.copytree(handle.workspace_path, attempt_dir / "sandbox", dirs_exist_ok=True)
-        return
-
-    ws = handle.workspace_path
-    diff = ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv"]
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=ws, capture_output=True, check=True,
-    ).stdout
-    with patch.open("wb") as output:
-        subprocess.run([*diff, handle.base_commit, "--"], cwd=ws, stdout=output, check=True)
-        for raw_path in untracked.split(b"\0"):
-            if not raw_path:
-                continue
-            result = subprocess.run(
-                [*diff, "--no-index", "--", "/dev/null", os.fsdecode(raw_path)],
-                cwd=ws, stdout=output, check=False,
-            )
-            if result.returncode != 1:
-                result.check_returncode()
-
-
 def _is_ignored_rel(rel: str) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in PurePosixPath(rel).parts)
 
@@ -500,56 +486,40 @@ def _git_changed_fingerprints(ws: Path, base_commit: str) -> dict[str, str | Non
 def snapshot_sandbox_state(handle: SandboxHandle) -> SandboxBaseline:
     """Capture the sandbox state before a worker runs so later mutations are attributable."""
     ws = handle.workspace_path
-    if handle.is_git_worktree and handle.base_commit is not None and is_git_repo(ws):
+    base_commit = handle.base_commit
+    if handle.is_git_worktree and base_commit is not None and is_git_repo(ws):
         try:
-            entries = _git_changed_fingerprints(ws, handle.base_commit)
+            entries = _git_changed_fingerprints(ws, base_commit)
         except RuntimeError:
+            base_commit = None
             entries = _workspace_fingerprints(ws)
-            base = SandboxBaseline(is_git=False, entries=tuple(sorted(entries.items())))
-            ephemeral = tuple(
-                sorted(
-                    rel.replace("\\", "/")
-                    for rel in _untracked_paths(handle, base)
-                    if is_ephemeral_artifact(rel)
-                )
-            )
-            return SandboxBaseline(
-                is_git=False,
-                entries=base.entries,
-                preexisting_ephemeral=ephemeral,
-            )
-        base = SandboxBaseline(
-            is_git=True,
-            entries=tuple(sorted(entries.items())),
-            base_commit=handle.base_commit,
-        )
-        ephemeral = tuple(
-            sorted(
-                rel.replace("\\", "/")
-                for rel in _untracked_paths(handle, base)
-                if is_ephemeral_artifact(rel)
-            )
-        )
-        return SandboxBaseline(
-            is_git=True,
-            entries=base.entries,
-            base_commit=handle.base_commit,
-            preexisting_ephemeral=ephemeral,
-        )
-    base = SandboxBaseline(
-        is_git=False, entries=tuple(sorted(_workspace_fingerprints(ws).items()))
-    )
+    else:
+        base_commit = None
+        entries = _workspace_fingerprints(ws)
+
+    untracked, untracked_complete = _scan_untracked_paths(handle)
     ephemeral = tuple(
-        sorted(
-            rel.replace("\\", "/")
-            for rel in _untracked_paths(handle, base)
-            if is_ephemeral_artifact(rel)
-        )
+        sorted(rel for rel in untracked if _is_cleanup_candidate(rel))
+    )
+    directories: list[str] = []
+    walk_complete = True
+
+    def _on_walk_error(_exc: OSError) -> None:
+        nonlocal walk_complete
+        walk_complete = False
+
+    for dirpath, dirnames, _ in os.walk(ws, onerror=_on_walk_error):
+        directories.extend((Path(dirpath) / name).relative_to(ws).as_posix() for name in dirnames)
+        dirnames[:] = [name for name in dirnames if name not in _EPHEMERAL_WALK_SKIP]
+    preexisting_dirs = (
+        tuple(sorted(directories)) if (untracked_complete and walk_complete) else None
     )
     return SandboxBaseline(
-        is_git=False,
-        entries=base.entries,
+        is_git=base_commit is not None,
+        entries=tuple(sorted(entries.items())),
+        base_commit=base_commit,
         preexisting_ephemeral=ephemeral,
+        preexisting_dirs=preexisting_dirs,
     )
 
 
@@ -587,7 +557,7 @@ def collect_sandbox_changes(handle: SandboxHandle, baseline: SandboxBaseline) ->
 
 def is_ephemeral_artifact(rel: str) -> bool:
     """Return True when ``rel`` matches a conservative temporary/backup junk pattern."""
-    parts = PurePosixPath(rel.replace("\\", "/")).parts
+    parts = PurePosixPath(rel).parts
     if not parts:
         return False
     name = parts[-1]
@@ -604,53 +574,104 @@ def is_ephemeral_artifact(rel: str) -> bool:
 _EPHEMERAL_WALK_SKIP = frozenset({".git", ".venv", ".olympus", "node_modules"})
 
 
-def _untracked_paths(handle: SandboxHandle, baseline: SandboxBaseline) -> list[str]:
-    """List untracked files, including ignored dirs such as ``__pycache__``."""
+def _is_cleanup_candidate(rel: str, *, include_runtime: bool = True) -> bool:
+    if is_ephemeral_artifact(rel):
+        return True
+    if not include_runtime:
+        return False
+    path = PurePosixPath(rel)
+    return path.name.endswith(_RUNTIME_ARTIFACT_SUFFIXES) or (
+        "uploads" in path.parts[:-1] and path.suffix.lower() in _UPLOAD_ARTIFACT_SUFFIXES
+    )
+
+
+def _scan_untracked_paths(handle: SandboxHandle) -> tuple[list[str], bool]:
+    """List untracked files (including ignored dirs) and whether the scan was complete."""
     ws = handle.workspace_path
-    if baseline.is_git and is_git_repo(ws):
-        proc = _run_git(ws, "ls-files", "--others", "-z")
-        if proc.returncode == 0:
-            return [rel for rel in proc.stdout.split("\0") if rel]
-    paths: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(ws):
+    git_failed = False
+    if handle.is_git_worktree:
+        if is_git_repo(ws):
+            proc = _run_git(ws, "ls-files", "--others", "-z")
+            if proc.returncode == 0:
+                paths = [rel for rel in proc.stdout.split("\0") if rel]
+                return paths, not bool(proc.stderr.strip())
+        git_failed = True
+    paths = []
+    complete = not git_failed
+
+    def _on_error(_exc: OSError) -> None:
+        nonlocal complete
+        complete = False
+
+    for dirpath, dirnames, filenames in os.walk(ws, onerror=_on_error):
         dirnames[:] = sorted(d for d in dirnames if d not in _EPHEMERAL_WALK_SKIP)
         for name in sorted(filenames):
             rel = (Path(dirpath) / name).relative_to(ws).as_posix()
             paths.append(rel)
+    return paths, complete
+
+
+def _untracked_paths(handle: SandboxHandle) -> list[str]:
+    """List untracked files, including ignored dirs such as ``__pycache__``."""
+    paths, _ = _scan_untracked_paths(handle)
     return paths
 
 
 def clean_ephemeral_artifacts(
-    handle: SandboxHandle, baseline: SandboxBaseline
+    handle: SandboxHandle, baseline: SandboxBaseline, *, write_scope: Sequence[str] | None = None
 ) -> list[str]:
-    """Delete newly created untracked junk files and return their sorted relative paths.
+    """Delete new untracked junk and optionally out-of-scope runtime files.
 
-    Only files absent from the pre-worker ``baseline`` (including gitignored pre-existing
-    ephemeral candidates) and the git ``base_commit`` are considered, so tracked files and
-    pre-existing sandbox files are never removed.
+    A supplied write scope protects all its files. Legacy or incomplete baselines
+    (where ``preexisting_dirs is None``) fall back to conservative junk cleanup only.
+    Return sorted paths for the cleanup event and prune only directories absent from
+    the pre-turn snapshot.
     """
     before = baseline.mapping()
     preexisting_ephemeral = set(baseline.preexisting_ephemeral)
     base_commit = baseline.base_commit or handle.base_commit
-    ws = handle.workspace_path
+    if handle.workspace_path.is_symlink():
+        return []
+    ws = handle.workspace_path.resolve()
+    policy = (
+        WorkspacePolicy(allowed_write_scope=list(write_scope)) if write_scope is not None else None
+    )
+    include_runtime = policy is not None and baseline.preexisting_dirs is not None
+
+    preexisting_dirs = set(baseline.preexisting_dirs or ())
     removed: list[str] = []
-    for raw_rel in sorted(_untracked_paths(handle, baseline)):
-        rel = raw_rel.replace("\\", "/")
+    for rel in sorted(_untracked_paths(handle)):
         if rel in before or rel in preexisting_ephemeral:
+            continue
+        if not _is_cleanup_candidate(rel, include_runtime=include_runtime):
+            continue
+        if policy is not None and policy.allows_relative_path(rel):
             continue
         if _is_tracked_at_base(ws, base_commit, rel):
             continue
-        if not is_ephemeral_artifact(rel):
-            continue
         target = ws / rel
         try:
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-            else:
+            if target.parent.resolve() != target.parent:
                 continue
-        except OSError:
+            if target.is_symlink():
+                if not is_ephemeral_artifact(rel):
+                    continue
+            elif not target.is_file():
+                continue
+            target.unlink()
+        except (OSError, RuntimeError):
             continue
         removed.append(rel)
+        if baseline.preexisting_dirs is not None and not any(
+            part in _EPHEMERAL_WALK_SKIP for part in Path(rel).parts[:-1]
+        ):
+            for parent in target.parents:
+                if parent == ws or parent.relative_to(ws).as_posix() in preexisting_dirs:
+                    break
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
     return removed
 
 
@@ -735,12 +756,7 @@ def sync_upstream_files(
                 merged[rel] = updated_map[rel]
             else:
                 merged.pop(rel, None)
-    return SandboxBaseline(
-        is_git=baseline.is_git,
-        entries=tuple(sorted(merged.items())),
-        base_commit=baseline.base_commit,
-        preexisting_ephemeral=baseline.preexisting_ephemeral,
-    )
+    return replace(baseline, entries=tuple(sorted(merged.items())))
 
 
 def absorb_verification_artifacts(
@@ -766,12 +782,7 @@ def absorb_verification_artifacts(
             continue
         if fingerprint is not None:
             merged[rel] = fingerprint
-    return SandboxBaseline(
-        is_git=baseline.is_git,
-        entries=tuple(sorted(merged.items())),
-        base_commit=baseline.base_commit,
-        preexisting_ephemeral=baseline.preexisting_ephemeral,
-    )
+    return replace(baseline, entries=tuple(sorted(merged.items())))
 
 
 def remove_sandbox(handle: SandboxHandle) -> None:

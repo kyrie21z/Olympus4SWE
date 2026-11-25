@@ -352,6 +352,222 @@ def _derive_skipped(
     return skipped
 
 
+_GRAPH_LIFECYCLE_EVENTS = frozenset(
+    {
+        "graph.node_started",
+        "graph.node_finished",
+        "graph.paused",
+        "graph.node_error",
+        "graph.failed",
+        "graph.finished",
+    }
+)
+_SESSION_LIFECYCLE_EVENTS = frozenset(
+    {
+        "session.started",
+        "session.continued",
+        "session.paused",
+        "session.completed",
+        "session.failed",
+    }
+)
+_SPEC_DOMAIN_EVENTS = frozenset(
+    {"spec.saved", "spec.aligned", "spec.resynthesized", "spec.clarified"}
+)
+_CRITIC_DOMAIN_EVENTS = frozenset(
+    {"spec.critic_recorded", "critic.completed", "critic.recorded"}
+)
+_EXECUTE_DOMAIN_EVENTS = frozenset(
+    {
+        "task.leased",
+        "task.verifying",
+        "task.accepted",
+        "task.accepted_with_risk",
+        "task.blocked",
+        "task.requeued",
+        "delivery.checks_completed",
+        "product.verified",
+        "review.verdict_recorded",
+        "review.verdict_verified",
+        "post_dag.repair_turn_completed",
+        "post_dag.repair_applied",
+        "post_dag.repair_rejected",
+        "post_dag.repro_rechecked",
+        "session.completed",
+    }
+)
+
+
+def _reconcile_domain_workflow_state(
+    events: Sequence[RunEvent],
+    statuses: dict[str, str],
+    run_status: RunStatus,
+    *,
+    spec_approved: bool,
+    design_approved: bool,
+    plan_approved: bool,
+) -> tuple[str | None, dict[str, Any] | None, str | None, str | None, bool]:
+    """Derive per-node workflow statuses from domain events when no graph.* events exist.
+
+    Headless ``SessionRunner`` runs persist stage artifacts, approvals, and ``session.*``
+    events without emitting ``graph.node_*`` events. Reconciling those deterministic
+    milestones keeps the workflow view aligned with ``stage_pipeline``.
+    """
+    has_intake = False
+    has_spec = spec_approved
+    has_critic = False
+    has_design = design_approved
+    has_plan = plan_approved
+    has_execute = False
+    has_session_completed = False
+    last_pause: RunEvent | None = None
+    last_fail: RunEvent | None = None
+
+    for event in events:
+        kind = event.event_type
+        if kind == "intake.triaged":
+            has_intake = True
+        elif kind in _SPEC_DOMAIN_EVENTS:
+            has_spec = True
+        elif kind in _CRITIC_DOMAIN_EVENTS:
+            has_critic = True
+        elif kind == "design.saved":
+            has_design = True
+        elif kind == "plan.saved":
+            has_plan = True
+        elif kind in _EXECUTE_DOMAIN_EVENTS:
+            has_execute = True
+            if kind == "session.completed":
+                has_session_completed = True
+        elif kind == "run.revision_requested":
+            # A revision returns the pipeline to Stage 1; downstream flags are re-established
+            # only by subsequent events (or still-valid approvals passed in by the caller).
+            has_spec = spec_approved
+            has_critic = False
+            has_design = design_approved
+            has_plan = plan_approved
+            has_execute = False
+            has_session_completed = False
+            last_pause = None
+            last_fail = None
+        elif kind == "session.paused":
+            last_pause = event
+        elif kind == "session.continued":
+            last_pause = None
+            last_fail = None
+        elif kind == "session.failed":
+            last_fail = event
+
+    def mark(node: str, status: str) -> None:
+        if node in statuses:
+            statuses[node] = status
+
+    if has_intake or has_spec or has_design or has_plan or has_execute:
+        mark("intake", "completed")
+    if has_spec:
+        mark("align", "completed")
+    if has_critic:
+        mark("critic", "completed")
+
+    if spec_approved:
+        mark("gate_spec", "completed")
+    elif (
+        has_spec
+        and run_status in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED)
+        and not (has_design or has_plan or has_execute)
+    ):
+        mark("gate_spec", "paused")
+
+    if has_design:
+        mark("design", "completed")
+        mark("validate_design", "completed")
+    if design_approved:
+        mark("gate_design", "completed")
+    elif (
+        has_design
+        and run_status in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED)
+        and not (has_plan or has_execute)
+    ):
+        mark("gate_design", "paused")
+
+    if has_plan:
+        mark("plan", "completed")
+        mark("validate_plan", "completed")
+    if plan_approved:
+        mark("gate_plan", "completed")
+    elif (
+        has_plan
+        and run_status in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED)
+        and not has_execute
+    ):
+        mark("gate_plan", "paused")
+
+    current_node: str | None = None
+    paused: dict[str, Any] | None = None
+    failed_node: str | None = None
+    last_error: str | None = None
+    finished = has_session_completed or run_status == RunStatus.COMPLETED
+
+    if "execute" in statuses:
+        if run_status == RunStatus.COMPLETED or has_session_completed:
+            if has_execute or plan_approved or run_status == RunStatus.COMPLETED:
+                mark("execute", "completed")
+        elif has_execute or (plan_approved and run_status == RunStatus.RUNNING):
+            if run_status == RunStatus.FAILED:
+                mark("execute", "failed")
+                failed_node = "execute"
+            elif run_status in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
+                mark("execute", "paused")
+            elif run_status == RunStatus.RUNNING:
+                mark("execute", "running")
+                current_node = "execute"
+            else:
+                mark("execute", "paused")
+
+    if run_status in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
+        pause_node: str | None = None
+        pause_reason: Any = None
+        if last_pause is not None:
+            raw_gate = last_pause.payload.get("gate")
+            raw_node = last_pause.payload.get("node")
+            pause_reason = last_pause.payload.get("reason") or last_pause.payload.get("pause_kind")
+            if isinstance(raw_gate, str) and raw_gate in GATE_SPECS:
+                candidate = GATE_SPECS[raw_gate]["node"]
+                if candidate in statuses:
+                    pause_node = candidate
+            elif isinstance(raw_node, str) and raw_node in statuses:
+                pause_node = raw_node
+        if pause_node is None:
+            for candidate in ("execute", "gate_plan", "gate_design", "gate_spec"):
+                if statuses.get(candidate) == "paused":
+                    pause_node = candidate
+                    break
+        if pause_node is not None:
+            statuses[pause_node] = "paused"
+            paused = {"node": pause_node, "reason": pause_reason}
+
+    if run_status == RunStatus.FAILED:
+        if last_fail is not None:
+            err = last_fail.payload.get("error") or last_fail.payload.get("reason")
+            if err:
+                last_error = str(err)
+        if failed_node is None:
+            if plan_approved and "execute" in statuses:
+                failed_node = "execute"
+            elif design_approved and "plan" in statuses:
+                failed_node = "plan"
+            elif spec_approved and "design" in statuses:
+                failed_node = "design"
+            elif (has_intake or has_spec) and "align" in statuses:
+                failed_node = "align"
+            elif "intake" in statuses:
+                failed_node = "intake"
+            if failed_node is not None:
+                statuses[failed_node] = "failed"
+
+    return current_node, paused, failed_node, last_error, finished
+
+
 def build_workflow_view(
     workflow_name: str,
     events: Sequence[RunEvent],
@@ -383,45 +599,63 @@ def build_workflow_view(
     failed_node: str | None = None
     last_error: str | None = None
     finished = False
-    for event in events:
-        payload = event.payload
-        node = payload.get("node")
-        if event.event_type == "graph.started":
-            finished = False
-        elif event.event_type == "graph.node_started" and isinstance(node, str):
-            finished = False
-            paused = None
-            failed_node = None
-            last_error = None
-            current_node = node
-            if node in statuses:
-                statuses[node] = "running"
-        elif event.event_type == "graph.node_finished" and isinstance(node, str):
-            if node in statuses:
-                statuses[node] = "completed"
-        elif event.event_type == "graph.paused":
-            paused = {
-                "node": node,
-                "reason": payload.get("reason"),
-            }
-            current_node = None
-            if isinstance(node, str) and node in statuses:
-                statuses[node] = "paused"
-        elif event.event_type == "graph.finished":
-            current_node = None
-            paused = None
-            finished = True
-        elif event.event_type == "graph.node_error" and isinstance(node, str) and node in statuses:
-            statuses[node] = "error"
-            failed_node = node
-            if payload.get("error"):
-                last_error = str(payload.get("error"))
-        elif event.event_type == "graph.failed":
-            last_error = str(payload.get("error") or "工作流执行异常中断")
-            failed_node = current_node or (node if isinstance(node, str) else None)
-            if failed_node and failed_node in statuses:
-                statuses[failed_node] = "failed"
-            current_node = None
+    has_graph_events = any(ev.event_type in _GRAPH_LIFECYCLE_EVENTS for ev in events)
+    has_session_events = any(ev.event_type in _SESSION_LIFECYCLE_EVENTS for ev in events)
+    if has_graph_events:
+        for event in events:
+            payload = event.payload
+            node = payload.get("node")
+            if event.event_type == "graph.started":
+                finished = False
+            elif event.event_type == "graph.node_started" and isinstance(node, str):
+                finished = False
+                paused = None
+                failed_node = None
+                last_error = None
+                current_node = node
+                if node in statuses:
+                    statuses[node] = "running"
+            elif event.event_type == "graph.node_finished" and isinstance(node, str):
+                if node in statuses:
+                    statuses[node] = "completed"
+            elif event.event_type == "graph.paused":
+                paused = {
+                    "node": node,
+                    "reason": payload.get("reason"),
+                }
+                current_node = None
+                if isinstance(node, str) and node in statuses:
+                    statuses[node] = "paused"
+            elif event.event_type == "graph.finished":
+                current_node = None
+                paused = None
+                finished = True
+            elif (
+                event.event_type == "graph.node_error"
+                and isinstance(node, str)
+                and node in statuses
+            ):
+                statuses[node] = "error"
+                failed_node = node
+                if payload.get("error"):
+                    last_error = str(payload.get("error"))
+            elif event.event_type == "graph.failed":
+                last_error = str(payload.get("error") or "工作流执行异常中断")
+                failed_node = current_node or (node if isinstance(node, str) else None)
+                if failed_node and failed_node in statuses:
+                    statuses[failed_node] = "failed"
+                current_node = None
+    elif has_session_events and statuses:
+        current_node, paused, failed_node, last_error, finished = (
+            _reconcile_domain_workflow_state(
+                events,
+                statuses,
+                run_status,
+                spec_approved=spec_approved,
+                design_approved=design_approved,
+                plan_approved=plan_approved,
+            )
+        )
 
     # Reconcile gates that were approved before resuming directly downstream.
     approved_by_gate = {
@@ -452,6 +686,13 @@ def build_workflow_view(
         name for name in ((description or {}).get("start") or ()) if isinstance(name, str)
     ]
     traversed_edges = _derive_traversed_edges(events, declared_edges)
+    if not has_graph_events and has_session_events and not traversed_edges:
+        traversed_edges = [
+            {"source": source, "target": target}
+            for source, target in declared_edges
+            if statuses.get(source) == "completed"
+            and statuses.get(target) in _VISITED_STATUSES
+        ]
     for name in _derive_skipped(statuses, declared_edges, traversed_edges, start_nodes):
         statuses[name] = "skipped"
 

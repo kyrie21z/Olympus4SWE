@@ -1164,3 +1164,111 @@ def test_classify_board_cancelled_is_archived_done(store: RunStore) -> None:
         "cancelled",
     )
     assert state.is_archived is True
+
+
+def test_build_workflow_view_reconciles_session_domain_events_without_graph_events() -> None:
+    """Headless SessionRunner runs emit domain/session events without graph.node_* events."""
+    events = [
+        _event(1, "run.created", {}),
+        _event(2, "session.started", {}),
+        _event(3, "intake.triaged", {"maturity": "raw_intent"}),
+        _event(4, "spec.saved", {"spec_id": "gs-1", "version": 1}),
+        _event(5, "approval.recorded", {"target": "goal_spec"}),
+        _event(6, "design.saved", {"design_id": "ds-1", "version": 1}),
+        _event(7, "approval.recorded", {"target": "design_spec"}),
+        _event(8, "plan.saved", {"plan_id": "tp-1", "version": 1}),
+        _event(9, "approval.recorded", {"target": "task_plan"}),
+        _event(10, "task.leased", {"task_id": "T1"}),
+        _event(11, "task.accepted", {"task_id": "T1"}),
+        _event(12, "product.verified", {"passed": True}),
+        _event(13, "session.paused", {"gate": None, "node": None, "pause_kind": "blocked"}),
+    ]
+    paused_view = build_workflow_view(
+        "full_sdlc_tdd",
+        events,
+        RunStatus.AWAITING_HUMAN,
+        spec_approved=True,
+        design_approved=True,
+        plan_approved=True,
+    )
+    for completed in (
+        "intake",
+        "align",
+        "gate_spec",
+        "design",
+        "validate_design",
+        "gate_design",
+        "plan",
+        "validate_plan",
+        "gate_plan",
+    ):
+        assert paused_view["node_statuses"][completed] == "completed"
+    assert paused_view["node_statuses"]["critic"] == "skipped"
+    assert paused_view["node_statuses"]["execute"] == "paused"
+    assert paused_view["paused"] == {"node": "execute", "reason": "blocked"}
+    assert {"source": "intake", "target": "align"} in paused_view["traversed_edges"]
+    assert {"source": "gate_plan", "target": "execute"} in paused_view["traversed_edges"]
+
+    completed_events = [*events[:-1], _event(13, "session.completed", {})]
+    done_view = build_workflow_view(
+        "full_sdlc_tdd",
+        completed_events,
+        RunStatus.COMPLETED,
+        spec_approved=True,
+        design_approved=True,
+        plan_approved=True,
+    )
+    assert done_view["finished"] is True
+    assert done_view["node_statuses"]["critic"] == "skipped"
+    assert done_view["node_statuses"]["execute"] == "completed"
+    assert done_view["paused"] is None
+
+
+def test_build_workflow_view_session_gate_pause_and_revision_reset() -> None:
+    gate_events = [
+        _event(1, "intake.triaged", {"maturity": "raw_intent"}),
+        _event(2, "spec.saved", {"spec_id": "gs-1", "version": 1}),
+        _event(3, "session.paused", {"gate": "spec", "pause_kind": "gate"}),
+    ]
+    gate_view = build_workflow_view(
+        "full_sdlc_tdd",
+        gate_events,
+        RunStatus.AWAITING_HUMAN,
+        spec_approved=False,
+    )
+    assert gate_view["node_statuses"]["intake"] == "completed"
+    assert gate_view["node_statuses"]["align"] == "completed"
+    assert gate_view["node_statuses"]["critic"] == "skipped"
+    assert gate_view["node_statuses"]["gate_spec"] == "paused"
+    assert gate_view["node_statuses"]["design"] == "pending"
+    assert gate_view["paused"] == {"node": "gate_spec", "reason": "gate"}
+
+    revised_events = [
+        *gate_events,
+        _event(4, "approval.recorded", {"target": "goal_spec"}),
+        _event(5, "design.saved", {"design_id": "ds-1", "version": 1}),
+        _event(6, "run.revision_requested", {"feedback": "Add filter"}),
+        _event(7, "spec.saved", {"spec_id": "gs-1", "version": 2}),
+        _event(8, "session.paused", {"gate": "spec", "pause_kind": "gate"}),
+    ]
+    revised_view = build_workflow_view(
+        "full_sdlc_tdd",
+        revised_events,
+        RunStatus.AWAITING_HUMAN,
+        spec_approved=False,
+        design_approved=False,
+    )
+    assert revised_view["node_statuses"]["align"] == "completed"
+    assert revised_view["node_statuses"]["gate_spec"] == "paused"
+    assert revised_view["node_statuses"]["design"] == "pending"
+    assert revised_view["node_statuses"]["validate_design"] == "pending"
+
+
+def test_build_workflow_view_created_run_stays_pending() -> None:
+    view = build_workflow_view(
+        "full_sdlc_tdd",
+        [_event(1, "run.created", {})],
+        RunStatus.CREATED,
+    )
+    assert all(status == "pending" for status in view["node_statuses"].values())
+    assert view["traversed_edges"] == []

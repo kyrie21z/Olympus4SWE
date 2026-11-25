@@ -25,6 +25,7 @@ from olympus.core.contracts import (
     DesignSpec,
     ExecutionStrategy,
     GoalSpec,
+    RequirementItem,
     RunMode,
     RunStatus,
     SpecStatus,
@@ -88,6 +89,28 @@ def _confirmed_run(
                 "description": "Provide feature.py with FLAG = True",
                 "acceptance_criteria": criteria or ["feature.FLAG is True"],
             }
+        ],
+    )
+    store.save_spec(run_id, spec)
+    align = AlignStage(store=store, provider=MockLLMProvider(), workspace_root=tmp_path)
+    align.confirm_spec(run_id=run_id, approver="zeus")
+    return store, run_id
+
+
+def _multi_capability_run(tmp_path: Path, *, count: int) -> tuple[RunStore, str]:
+    """Confirmed run whose GoalSpec carries ``count`` independent user capabilities."""
+    store = RunStore(tmp_path / ".olympus" / "olympus.db")
+    run_id = store.create_run(title="Multi-capability run", mode=RunMode.SIMULATION)
+    spec = GoalSpec(
+        spec_id="spec-multi",
+        goal="Ship independent user capabilities",
+        requirements=[
+            RequirementItem(
+                id=f"R{index}",
+                description=f"Capability {index}",
+                acceptance_criteria=["Works end to end"],
+            )
+            for index in range(1, count + 1)
         ],
     )
     store.save_spec(run_id, spec)
@@ -638,6 +661,14 @@ def test_propose_plan_injects_vertical_tracer_bullet_guidance(
     assert "tracer bullet" in prompts[0].lower()
     assert "depends_on" in prompts[0]
     assert "kind='command'" in prompts[0]
+    assert "1-2 cohesive slices" in prompts[0]
+    assert "per independent capability" in prompts[0]
+    assert "4-6 slices" in prompts[0]
+    assert "auto-discovery" in prompts[0]
+    assert "matching the deliverable kind" in prompts[0]
+    assert "depends_on whenever" in prompts[0]
+    assert "wire core storage/db" not in prompts[0]
+    assert "web/features/*.js" not in prompts[0]
     assert plan.tasks[0].kind == TaskKind.IMPLEMENT
 
 
@@ -678,6 +709,57 @@ def test_propose_plan_vertical_topologies_reject_slices_without_command(
 
     legacy = orch.propose_plan(run_id=run_id)
     assert legacy.tasks[0].acceptance_checks[0].kind == CheckKind.INDEPENDENT_REVIEW
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_propose_plan_vertical_topology_rejects_monolithic_requirement_collapse(
+    tmp_path: Path, topology: str
+) -> None:
+    store, run_id = _multi_capability_run(tmp_path, count=4)
+    spec = store.get_run(run_id)["spec"]
+    assert spec is not None
+    prompts: list[str] = []
+
+    def responder(messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]) -> LLMResponse:
+        del tools
+        prompts.append(messages[-1].content)
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "plan_id": "plan-monolith",
+                    "spec_id": spec.spec_id,
+                    "spec_hash": spec.content_hash,
+                    "tasks": [
+                        {
+                            "task_id": "T1-everything",
+                            "title": "Catch-all implementation",
+                            "objective": "Build every capability in one ticket",
+                            "requirement_refs": [req.id for req in spec.requirements],
+                            "write_scope": ["src/everything.py"],
+                            "acceptance_checks": [
+                                {
+                                    "id": "CHK-SEAM",
+                                    "kind": CheckKind.COMMAND.value,
+                                    "description": "Exercise the seam",
+                                    "command": "python -m pytest -q",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        )
+
+    orch = OrchestrateStage(
+        store=store,
+        provider=MockLLMProvider(responder=responder),
+        workspace_root=tmp_path,
+    )
+    with pytest.raises(PlanValidationError, match="collapses 4/4 requirements"):
+        orch.propose_plan(run_id=run_id, topology=topology)
+    assert len(prompts) > 1
+    assert "[PLAN VALIDATION FAILED]" in prompts[1]
+    assert "collapses 4/4 requirements" in prompts[1]
 
 
 def test_propose_plan_legacy_topologies_keep_their_guidance(tmp_path: Path) -> None:

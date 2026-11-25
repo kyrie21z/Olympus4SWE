@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from olympus.core.contracts import (
@@ -28,6 +30,7 @@ from olympus.core.dag import (
     scopes_overlap,
     validate_goal_spec,
     validate_plan,
+    validate_plan_topology,
 )
 
 
@@ -312,6 +315,191 @@ def _vertical_slices_plan(spec: GoalSpec, design: DesignSpec) -> TaskPlan:
     )
 
 
+def _multi_requirement_spec(*, spec_id: str, count: int) -> GoalSpec:
+    return GoalSpec(
+        spec_id=spec_id,
+        goal="Ship independent user capabilities",
+        requirements=[
+            RequirementItem(
+                id=f"R{index}",
+                description=f"Capability {index}",
+                acceptance_criteria=["Works end to end"],
+            )
+            for index in range(1, count + 1)
+        ],
+    )
+
+
+def _slice_wave_plan(spec: GoalSpec, groups: list[list[str]]) -> TaskPlan:
+    """Thin Slice 1 plus parallel vertical slices with disjoint per-feature scope."""
+    return TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id=f"T{index}-slice",
+                title=f"Slice {index}",
+                objective=f"Deliver {', '.join(refs)} end to end",
+                requirement_refs=refs,
+                depends_on=["T1-slice"] if index > 1 else [],
+                write_scope=[f"src/feature_{index}.py", f"tests/test_feature_{index}.py"],
+                acceptance_checks=[_check(f"C{index}")],
+            )
+            for index, refs in enumerate(groups, start=1)
+        ],
+    )
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+@pytest.mark.parametrize(
+    "gate", [validate_plan, validate_plan_topology], ids=["validate_plan", "validate_plan_topology"]
+)
+def test_vertical_gate_rejects_monolithic_implement_collapsing_most_requirements(
+    topology: str, gate: Callable[..., list[str]]
+) -> None:
+    spec = _multi_requirement_spec(spec_id="spec-monolith", count=4)
+    monolithic = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T1-everything",
+                title="Catch-all implementation",
+                objective="Build every capability in one ticket",
+                requirement_refs=["R1", "R2", "R3", "R4"],
+                write_scope=["src/everything.py"],
+                acceptance_checks=[_check()],
+            )
+        ],
+    )
+    violations = gate(monolithic, spec, topology=topology)
+    assert any("collapses 4/4 requirements" in violation for violation in violations)
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_vertical_gate_rejects_slice_at_three_quarters_of_eight_requirements(
+    topology: str,
+) -> None:
+    spec = _multi_requirement_spec(spec_id="spec-eight", count=8)
+    plan = _slice_wave_plan(
+        spec, [["R1", "R2", "R3", "R4", "R5", "R6"], ["R7", "R8"]]
+    )
+    violations = validate_plan(plan, spec, topology=topology)
+    assert any("collapses 6/8 requirements" in violation for violation in violations)
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_vertical_gate_accepts_parallel_slices_where_no_slice_exceeds_half(
+    topology: str,
+) -> None:
+    spec = _multi_requirement_spec(spec_id="spec-eight", count=8)
+    plan = _slice_wave_plan(spec, [["R1"], ["R2", "R3"], ["R4", "R5", "R6"], ["R7", "R8"]])
+    assert validate_plan(plan, spec, topology=topology) == []
+    assert validate_plan_topology(plan, spec, topology=topology) == []
+
+    half = _slice_wave_plan(spec, [["R1", "R2", "R3", "R4"], ["R5", "R6", "R7", "R8"]])
+    assert validate_plan(half, spec, topology=topology) == []
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_vertical_gate_keeps_small_requirement_specs_cohesive(topology: str) -> None:
+    spec = _multi_requirement_spec(spec_id="spec-three", count=3)
+    cohesive = _slice_wave_plan(spec, [["R1", "R2", "R3"]])
+    assert validate_plan(cohesive, spec, topology=topology) == []
+    assert validate_plan_topology(cohesive, spec, topology=topology) == []
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+def test_vertical_gate_exempts_contract_and_integrate_spanners(topology: str) -> None:
+    spec = _multi_requirement_spec(spec_id="spec-spanners", count=4)
+    all_refs = ["R1", "R2", "R3", "R4"]
+    plan = TaskPlan(
+        spec_id=spec.spec_id,
+        spec_hash=spec.content_hash,
+        tasks=[
+            TaskNode(
+                task_id="T0-contract",
+                title="Pin the shared contract",
+                objective="Publish the contract every slice builds against",
+                requirement_refs=all_refs,
+                kind=TaskKind.CONTRACT,
+                write_scope=["contracts/api.md"],
+                acceptance_checks=[_check("C0", "test -s contracts/api.md")],
+            ),
+            TaskNode(
+                task_id="T1-core",
+                title="Runnable skeleton",
+                objective="Wire storage to one observable seam",
+                requirement_refs=["R1"],
+                depends_on=["T0-contract"],
+                write_scope=["src/core.py"],
+                acceptance_checks=[_check("C1")],
+            ),
+            TaskNode(
+                task_id="T2-items",
+                title="Items slice",
+                objective="Deliver items end to end",
+                requirement_refs=["R2", "R3"],
+                depends_on=["T1-core"],
+                write_scope=["src/items.py"],
+                acceptance_checks=[_check("C2")],
+            ),
+            TaskNode(
+                task_id="T3-count",
+                title="Count slice",
+                objective="Deliver count end to end",
+                requirement_refs=["R4"],
+                depends_on=["T1-core"],
+                write_scope=["src/count.py"],
+                acceptance_checks=[_check("C3")],
+            ),
+            TaskNode(
+                task_id="T4-integrate",
+                title="Full-app integration",
+                objective="Wire the slices through the shared shell",
+                requirement_refs=all_refs,
+                kind=TaskKind.INTEGRATE,
+                depends_on=["T2-items", "T3-count"],
+                write_scope=["src/app.py"],
+                acceptance_checks=[_check("C4", "python -m pytest tests/test_app.py -q")],
+            ),
+        ],
+    )
+    assert validate_plan(plan, spec, topology=topology) == []
+    assert validate_plan_topology(plan, spec, topology=topology) == []
+
+
+@pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
+@pytest.mark.parametrize(
+    "gate", [validate_plan, validate_plan_topology], ids=["validate_plan", "validate_plan_topology"]
+)
+def test_vertical_gate_counts_actual_spec_items_with_repeated_requirement_ids(
+    topology: str, gate: Callable[..., list[str]]
+) -> None:
+    four_with_dup = GoalSpec(
+        spec_id="spec-dup-four",
+        goal="Repeated ID four-item spec",
+        requirements=[
+            RequirementItem(id=rid, description=f"Item {idx}", acceptance_criteria=["Works"])
+            for idx, rid in enumerate(["R1", "R2", "R3", "R3"], start=1)
+        ],
+    )
+    monolithic = _slice_wave_plan(four_with_dup, [["R1", "R2", "R3"]])
+    violations = gate(monolithic, four_with_dup, topology=topology)
+    assert any("collapses 4/4 requirements" in violation for violation in violations)
+
+    six_with_dup = GoalSpec(
+        spec_id="spec-dup-six",
+        goal="Repeated ID six-item spec",
+        requirements=[
+            RequirementItem(id=rid, description=f"Item {idx}", acceptance_criteria=["Works"])
+            for idx, rid in enumerate(["R1", "R2", "R3", "R4", "R5", "R5"], start=1)
+        ],
+    )
+    split = _slice_wave_plan(six_with_dup, [["R1", "R2", "R3", "R4"], ["R5"]])
+    assert gate(split, six_with_dup, topology=topology) == []
+
+
 @pytest.mark.parametrize("topology", ["tdd_first", "vertical_slices"])
 @pytest.mark.parametrize("kind", [TaskKind.IMPLEMENT, TaskKind.INTEGRATE])
 def test_validate_plan_vertical_gate_requires_executable_command_per_slice(
@@ -443,6 +631,7 @@ def test_validate_plan_vertical_gate_is_noop_for_legacy_topologies(
     )
     assert validate_plan(monolithic, spec=spec, design=design) == []
     assert validate_plan(monolithic, spec=spec, design=design, topology=topology) == []
+    assert validate_plan_topology(monolithic, spec=spec, topology=topology) == []
 
 
 def test_prose_and_shell_shape_pass_while_hard_dag_invariants_still_fail() -> None:

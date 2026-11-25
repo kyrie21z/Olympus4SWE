@@ -181,19 +181,38 @@ def _has_executable_command(task: TaskNode) -> bool:
     return False
 
 
+_MONOLITHIC_SLICE_FLOOR = 4
+
+
 def _is_human_gate_task(task: TaskNode) -> bool:
     return task.role.strip().lower() == "human" and all(
         check.kind == CheckKind.HUMAN for check in task.acceptance_checks
     )
 
 
-def _validate_vertical_slices(plan: TaskPlan, ancestors: dict[str, set[str]]) -> list[str]:
+def _validate_vertical_slices(
+    plan: TaskPlan,
+    ancestors: dict[str, set[str]],
+    spec: GoalSpec | None = None,
+) -> list[str]:
     issues: list[str] = []
     by_id = {task.task_id: task for task in plan.tasks}
+    spec_req_ids = [req.id for req in spec.requirements] if spec is not None else []
+    total_reqs = len(spec_req_ids)
+    guard_monolith = total_reqs >= _MONOLITHIC_SLICE_FLOOR
     for task in plan.tasks:
         slices = task.kind in (TaskKind.IMPLEMENT, TaskKind.INTEGRATE)
         if slices and not _is_human_gate_task(task) and not _has_executable_command(task):
             issues.append(f"Vertical slice {task.task_id} needs an executable command check")
+        if guard_monolith and task.kind == TaskKind.IMPLEMENT and not _is_human_gate_task(task):
+            task_refs = set(task.requirement_refs)
+            covered = sum(1 for req_id in spec_req_ids if req_id in task_refs)
+            if covered >= _MONOLITHIC_SLICE_FLOOR and covered * 4 >= total_reqs * 3:
+                issues.append(
+                    f"Vertical slice {task.task_id} collapses {covered}/{total_reqs} "
+                    "requirements into one implement task; split into thin Slice 1 plus "
+                    "parallel vertical feature slices"
+                )
         if task.kind != TaskKind.TEST:
             continue
         upstream = [by_id.get(dep) for dep in sorted(ancestors.get(task.task_id, set()))]
@@ -218,10 +237,10 @@ def validate_plan_topology(
     topology: str | None = None,
 ) -> list[str]:
     """Run only the topology-specific structural gate for ``plan``."""
-    del spec, design
+    del design
     if topology not in VERTICAL_SLICE_TOPOLOGIES:
         return []
-    return _validate_vertical_slices(plan, _build_ancestors(plan.tasks))
+    return _validate_vertical_slices(plan, _build_ancestors(plan.tasks), spec=spec)
 
 
 def validate_plan(
@@ -303,7 +322,7 @@ def validate_plan(
                 label = f"{task_a.task_id}/{task_b.task_id}"
                 issues.append(f"Concurrent-eligible {label} have overlapping write_scope: {pairs}")
     if topology in VERTICAL_SLICE_TOPOLOGIES:
-        issues.extend(_validate_vertical_slices(plan, ancestors))
+        issues.extend(_validate_vertical_slices(plan, ancestors, spec=spec))
     return issues
 
 

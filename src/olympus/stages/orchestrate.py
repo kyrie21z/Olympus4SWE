@@ -782,24 +782,39 @@ Modular product decomposition (topology={topology}):
 
 _VERTICAL_PLANNER_GUIDANCE = """
 Vertical tracer-bullet decomposition (topology={topology}):
-- Keep total slice count minimal (1-2 cohesive slices for single-package or focused changes, at
-  most 3 for multi-module work) so execution avoids redundant cold-start exploration and review
-  overhead across tiny serial slices; group closely related capabilities sharing the same files
-  into one cohesive slice instead of emitting one task per requirement.
+- Scale the slice count to independent user capabilities, never to a fixed cap of 3:
+  a focused change (1-2 requirements inside one package) stays 1-2 cohesive slices to avoid
+  cold-start overhead, while a multi-capability product (>= 4 requirements) becomes a thin
+  runnable Slice 1 plus one vertical user-story slice per independent capability (typically
+  4-6 slices). NEVER collapse most requirements into one catch-all implement task.
 - If the approved DesignSpec declares non-empty `shared_contract_paths`, emit one Wave 0
-  `kind='contract'` task owning those paths before Slice 1.
-- Emit Slice 1 as ONE runnable end-to-end tracer bullet (kind='implement', role='engineer')
-  that wires core storage/logic to an observable user-facing seam named by GoalSpec.test_seams
-  or observable_surfaces, with at least one executable kind='command' seam check proving the
-  path runs.
-- Emit additional Slices 2..N only when distinct capabilities or modules genuinely merit separate
-  deliveries (each carrying its own executable kind='command' seam test).
-- NEVER slice horizontally: no models/schema-only wave, no backend-layer wave, no separate
-  routes/templates/static wave, and no bulk test-only wave after unverified code waves.
-- NEVER emit a catch-all mega-ticket spanning 3+ design modules alongside repo-root scope,
-  4+ top-level scopes, or 4+ requirements across 4+ write scopes; split into vertical slices.
-- Sequence shared entrypoints with explicit depends_on edges. Concurrent-eligible slices MUST
-  have strictly disjoint write_scope.
+  `kind='contract'` task owning those paths before Slice 1, carrying a lightweight
+  `kind='command'` check that the contract artifact(s) exist and are non-empty.
+- Slice 1 (kind='implement', role='engineer') is ONE THIN runnable end-to-end tracer bullet:
+  wire the minimal core logic, entrypoint, and ONE primary user journey to an observable
+  seam named by GoalSpec.test_seams or observable_surfaces, with an executable
+  kind='command' seam check. When downstream vertical slices will follow, Slice 1 MUST
+  establish thin runtime auto-discovery extension seams matching the deliverable kind and
+  constraints (for example, a subcommand/handler registry for a CLI or library, or a route
+  registry plus runtime-loaded feature assets for a web app) so parallel downstream slices
+  NEVER need to edit shared entrypoint files.
+- Slices 2..N (kind='implement', role='engineer') are independent vertical user stories:
+  each delivers ONE cohesive end-to-end capability (its own core logic, matching surface
+  files for the deliverable kind, and its own executable kind='command' seam test).
+  Sub-scope write_scope into strictly disjoint per-feature files or subdirs inside
+  DesignSpec directories; never hand the same whole top-level package or surface directory
+  to two parallel slices.
+- Declare depends_on whenever slice B reads or computes over data slice A produces
+  (engagement-weighted ranking depends on engagement, a following feed depends on the
+  follow graph), and keep slices parallel whenever they only need Slice 1's base skeleton
+  (a follow graph only needs users).
+- Add a final kind='integrate' task (role='engineer') depending on the parallel slices ONLY
+  when cross-slice wiring or full-app E2E/surface verification is needed; it MAY include
+  shared shell or entrypoint files as a wiring fallback, while every upstream slice still
+  carries its own passing kind='command' check.
+- NEVER slice horizontally: no models/schema-only wave, no backend-only wave followed by a
+  monolithic all-UI wave, and no bulk test-only deferral.
+- NEVER emit duplicate identical kind='command' checks on the same task.
 """
 
 

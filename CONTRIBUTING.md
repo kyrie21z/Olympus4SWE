@@ -88,15 +88,18 @@ Evaluation and the Core Engine collaborate tightly — and **deliberately remain
    pnpm --dir web build
    ```
 6. **Open a Focused PR**
-   - Include `Closes #<issue-id>` in the PR description.
-   - Keep PRs small and scoped to the agreed `write_scope`.
-   - Wait for CI (`check` and `frontend`) and required Code Owner review to pass.
+   - Follow `.github/pull_request_template.md`: include `Closes #<issue-id>`, and fill in **What changed**, **How tested** (commands run and observed results), and **Risks**.
+   - Keep PRs small and strictly scoped to the agreed `write_scope`. External contributors (including HW3 tracks) must not modify `src/olympus/**/*.py` or `src/olympus/web/openapi.json` without a contract Issue pre-approved by `@kyrie21z` (see `B4` in [docs/REVIEW.md](docs/REVIEW.md)).
+   - **Web UI screenshots (required)**: Any PR touching Web UI or visual behavior under `web/` must attach real browser screenshots directly in the PR description (light and dark themes recommended; see `B13` in [docs/REVIEW.md](docs/REVIEW.md)).
+   - Mark the PR **Ready for review** (Draft PRs skip automated review) and wait for required CI checks (`check`, `frontend`, and `browser`) plus review under [docs/REVIEW.md](docs/REVIEW.md) to pass.
    - PRs are merged via **Squash and merge** to keep `main` history clean and revertible.
 
 ---
 
 ## 5. Code Review Norms
 
-- **Objective gates first**: Formatting (`ruff`), strict typing (`mypy`), OpenAPI synchronization, and architecture dependency boundaries (`tests/unit/test_architecture_invariants.py`) are enforced automatically by CI so human review stays focused on design and correctness.
-- **Clear severity**: Reviewers distinguish **`[Blocking]`** feedback (correctness bugs, contract violations, missing tests, unintended core mutations) from **`[Nit]`** suggestions (optional style polish).
+- **Canonical PR review standard**: Every PR is evaluated against [docs/REVIEW.md](docs/REVIEW.md), which defines blocking criteria (`B1` through `B14`), maintainer-only approval paths, required CI checks, and how automated `Hydrogen` review works alongside human reviewers and auto-merge.
+- **Objective gates first**: Formatting (`ruff`), strict typing (`mypy`), OpenAPI synchronization, architecture dependency boundaries (`tests/unit/test_architecture_invariants.py`), design-system checks (`tests/unit/test_design_system.py`), and Playwright browser tests (`browser`) are enforced automatically by CI so review stays focused on design and correctness.
+- **Visual evidence for Web UI changes**: Any PR touching Web UI or visual behavior under `web/` must attach real browser screenshots (light and dark themes recommended) directly in the PR description before approval.
+- **Clear severity**: Reviewers distinguish **`[Blocking]`** items (see `B1` through `B14` in [docs/REVIEW.md](docs/REVIEW.md)) from **`[Nit]`** suggestions (optional style polish).
 - **Respectful and fast**: Highlight what works well, keep feedback actionable, and unblock teammates quickly.

@@ -59,8 +59,12 @@ from olympus.web.schemas import WorkflowSummary
 
 @pytest.fixture(autouse=True)
 def _ci_bwrap_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep local Linux tests running under real bwrap; opt in only when CI lacks bwrap."""
+    """Keep local Linux tests running under real bwrap; fail loudly when CI requires isolation."""
     if _probe_bwrap() is None:
+        if os.environ.get("OLYMPUS_REQUIRE_ISOLATION_TESTS") == "1":
+            pytest.fail(
+                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but bwrap isolation is unavailable"
+            )
         monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
 
 

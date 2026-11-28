@@ -504,4 +504,3 @@ def cmd_serve(
         port=port,
         seed_demo=seed_demo,
     )
-

@@ -7,12 +7,15 @@ These tests mechanically protect the layering documented in ``AGENTS.md`` and
 from __future__ import annotations
 
 import ast
+import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OLYMPUS_SRC = REPO_ROOT / "src" / "olympus"
 WORKFLOWS_DIR = OLYMPUS_SRC / "graph" / "workflows"
+SKILLS_DIR = OLYMPUS_SRC / "skills"
 
 VENDOR_LLM_SDKS = frozenset({"openai", "anthropic"})
 WEB_AND_CLI_FRAMEWORKS = frozenset({"fastapi", "uvicorn", "typer"})
@@ -307,3 +310,123 @@ def helper() -> None:
         "olympus.cli",
         "olympus.providers",
     }
+
+
+def test_all_builtin_workflow_manifests_skills_and_nodes_are_valid() -> None:
+    """Auto-discover every builtin workflow YAML and verify manifest, graph, and skill contracts."""
+    from olympus.graph.loader import (
+        _NODE_TYPES,
+        build_graph,
+        describe_workflow,
+        list_builtin_workflows,
+        load_workflow,
+    )
+    from olympus.web.schemas import WorkflowSummary
+
+    yaml_files = sorted(WORKFLOWS_DIR.glob("*.yaml"))
+    assert yaml_files, "expected builtin workflow YAML files under src/olympus/graph/workflows/"
+    discovered_names = [path.stem for path in yaml_files]
+    assert list_builtin_workflows() == discovered_names
+
+    valid_autonomy = {"gated", "autonomous_hard_stops", "read_only"}
+    valid_stop_after = {"goal", "design", "plan", "execute", "verify", "report"}
+    registered_nodes = set(_NODE_TYPES)
+
+    for name in discovered_names:
+        definition = load_workflow(name)
+        assert definition.name == name
+        assert definition.family.strip(), f"workflow '{name}' must declare non-empty family"
+        assert definition.autonomy in valid_autonomy, (
+            f"workflow '{name}' has invalid autonomy: {definition.autonomy!r}"
+        )
+        assert definition.stop_after in valid_stop_after, (
+            f"workflow '{name}' has invalid stop_after: {definition.stop_after!r}"
+        )
+        assert definition.applicable_scenarios, (
+            f"workflow '{name}' must declare non-empty applicable_scenarios"
+        )
+        assert definition.anti_patterns, (
+            f"workflow '{name}' must declare non-empty anti_patterns"
+        )
+
+        for node in definition.nodes:
+            assert node.type in registered_nodes, (
+                f"workflow '{name}' node '{node.name}' uses unregistered type '{node.type}'"
+            )
+            for ref in node.skill_refs:
+                skill_path = (SKILLS_DIR / f"{ref}.md").resolve()
+                assert skill_path.is_relative_to(SKILLS_DIR.resolve()), (
+                    f"workflow '{name}' node '{node.name}' skill_ref '{ref}' escapes skills dir"
+                )
+                assert skill_path.is_file(), (
+                    f"workflow '{name}' node '{node.name}' references missing skill '{ref}' "
+                    f"(expected {skill_path.relative_to(REPO_ROOT)})"
+                )
+                assert skill_path.read_text(encoding="utf-8").strip(), (
+                    f"skill file {skill_path.relative_to(REPO_ROOT)} is empty"
+                )
+
+        # Graph construction and public Web API summary projection must both succeed cleanly.
+        graph = build_graph(definition)
+        assert graph.describe()["nodes"], f"workflow '{name}' produced an empty graph"
+        summary = WorkflowSummary.model_validate(describe_workflow(definition))
+        assert summary.name == name
+        assert summary.family == definition.family
+        assert summary.autonomy == definition.autonomy
+        assert summary.stop_after == definition.stop_after
+
+
+def test_legacy_workflow_execution_hashes_are_pinned_and_manifest_independent() -> None:
+    """Protect legacy SDLC resume compatibility by pinning executable graph fingerprints."""
+    from olympus.graph.loader import load_workflow
+
+    pinned_legacy_hashes = {
+        "full_sdlc_tdd": (
+            "sha256:291faa5f5f3fb4d33efe1c28a579e04c4bc3ae0e085f0bce5c8110bf06a3cd7d"
+        ),
+        "product_blueprint": (
+            "sha256:26841aed6e876cf8b7773727cc96e867053412b50c6851710ee1598987b2fae7"
+        ),
+        "repo_fast_patch": (
+            "sha256:87aa62e27d58fb5fdea94754dace076bffbac8e458228d25b02f9f03d0b424a5"
+        ),
+    }
+    for name, expected_hash in pinned_legacy_hashes.items():
+        definition = load_workflow(name)
+        assert definition.execution_hash() == expected_hash
+        # Descriptive manifest metadata must never perturb execution_hash().
+        mutated = definition.model_copy(
+            update={
+                "family": "custom_family",
+                "autonomy": "read_only",
+                "applicable_scenarios": ["synthetic scenario"],
+                "anti_patterns": ["synthetic anti-pattern"],
+            }
+        )
+        assert mutated.execution_hash() == expected_hash
+
+
+def test_pydantic_minimum_version_supports_exclude_if() -> None:
+    """Require pydantic>=2.12 in pyproject.toml when src/olympus uses Field(exclude_if=)."""
+    uses_exclude_if = any(
+        "exclude_if=" in py_file.read_text(encoding="utf-8")
+        for py_file in sorted(OLYMPUS_SRC.rglob("*.py"))
+        if "__pycache__" not in py_file.parts
+    )
+    if not uses_exclude_if:
+        return
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps: list[str] = list(pyproject.get("project", {}).get("dependencies", []))
+    pydantic_specs = [
+        dep for dep in deps if re.match(r"^pydantic(?:\[[^\]]+\])?(?:[<>=!~]|$)", dep)
+    ]
+    assert pydantic_specs, "pyproject.toml must declare a pydantic dependency"
+
+    match = re.search(r">=\s*(\d+)\.(\d+)(?:\.(\d+))?", pydantic_specs[0])
+    assert match is not None, f"expected >= minimum version bound on {pydantic_specs[0]!r}"
+    major, minor = int(match.group(1)), int(match.group(2))
+    assert (major, minor) >= (2, 12), (
+        f"src/olympus/ uses Pydantic 2.12+ Field(exclude_if=...), "
+        f"but pyproject.toml declares {pydantic_specs[0]!r}"
+    )

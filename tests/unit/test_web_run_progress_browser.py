@@ -613,10 +613,20 @@ def test_plan_review_rejects_stale_approval_and_retains_approved_checks(export_p
     store, run_id, url, plan = export_plan
     page = browser.new_page()
     expect = playwright.expect
+    snapshot_url = f"{url}/api/runs/{run_id}"
+    snapshot_fetches: list[str] = []
+    page.on(
+        "request",
+        lambda req: snapshot_fetches.append(req.url)
+        if req.method == "GET" and req.url == snapshot_url
+        else None,
+    )
     page.goto(f"{url}/?run={run_id}&nosse=1&lang=zh")
 
     old_review = page.get_by_role("article", name="任务计划 · v1")
     expect(old_review).to_be_visible()
+    page.wait_for_load_state("networkidle")
+    assert len(snapshot_fetches) == 1
     old_revision = store.get_run(run_id)["state_revision"]
     new_command = "pytest tests/test_export.py -k denied_and_allowed_members"
     revised = plan.model_copy(update={

@@ -1525,7 +1525,3 @@ def test_recover_blocked_note_bumps_revision_blocking_concurrent_approve(tmp_pat
     assert rev_after > rev_before
     with pytest.raises(ConcurrencyConflictError):
         runner._approve_gate(run_id, "spec", expected_revision=rev_before)
-
-
-
-

@@ -35,6 +35,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      - name: Hygiene check
+        run: |
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD -- \
+            src/olympus tests .github web/src pyproject.toml \
+            ':!src/olympus/web/static'
+
       - name: Lint
         run: uv run --no-sync ruff check .
 
@@ -42,7 +49,42 @@ jobs:
         run: uv run --no-sync mypy src
 
       - name: Test
-        run: uv run --no-sync pytest -q
+        env:
+          OLYMPUS_REQUIRE_ISOLATION_TESTS: "1"
+          CHECK_JUNIT: ${{ runner.temp }}/check-junit.xml
+        run: |
+          set +e
+          uv run --no-sync pytest -q -rs \
+            --ignore-glob="tests/unit/test_web_*_browser.py" \
+            -m "not live_api" \
+            --junitxml="$CHECK_JUNIT"
+          status=$?
+          set -e
+          uv run --no-sync python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report = os.environ["CHECK_JUNIT"]
+          if not os.path.exists(report):
+              sys.exit(f"missing JUnit report: {report}")
+          root = ET.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          if not suites:
+              sys.exit(f"JUnit report has no testsuite: {report}")
+          tests = sum(int(s.get("tests", "0")) for s in suites)
+          skipped = sum(int(s.get("skipped", "0")) for s in suites)
+          errors = sum(int(s.get("errors", "0")) for s in suites)
+          failures = sum(int(s.get("failures", "0")) for s in suites)
+          executed = max(0, tests - skipped - errors)
+          print(
+              f"executed={executed} passed={max(0, executed - failures)} "
+              f"failed={failures} errors={errors} skipped={skipped}"
+          )
+          if tests == 0 or skipped > 0:
+              sys.exit("check suite executed no tests or silently skipped tests")
+          PY
+          exit "$status"
 
   browser:
     runs-on: ubuntu-latest

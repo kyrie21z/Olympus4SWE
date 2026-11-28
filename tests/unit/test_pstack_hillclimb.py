@@ -43,6 +43,8 @@ from olympus.harness.driver import (
 )
 from olympus.providers.base import MockLLMProvider
 from olympus.providers.types import LLMResponse
+from olympus.session.contracts import StepMode
+from olympus.session.runner import SessionConfig, SessionRunner
 from olympus.stages.craft import load_skill_pack
 from olympus.stages.hillclimb import (
     HillclimbPause,
@@ -740,15 +742,24 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
 ) -> None:
     repo = tmp_path / "repo"
     _init_opt_repo(repo)
+    host_secret_file = tmp_path / "host_secret_outside_sandbox.txt"
+    host_secret_file.write_text("TOP_SECRET_HOST_DATA", encoding="utf-8")
     (repo / "bench.py").write_text(
-        "import os, solver\n"
-        "leaked = os.environ.get('OPENAI_API_KEY') or os.environ.get('DASHSCOPE_API_KEY')\n"
+        "import os, pathlib, solver\n"
+        "leaked = (\n"
+        "    os.environ.get('OLYMPUS_TEST_SECRET_TOKEN')\n"
+        "    or os.environ.get('OLYMPUS_TEST_PRIVATE_KEY')\n"
+        ")\n"
         "assert leaked is None, f'Secret env leaked: {leaked!r}'\n"
+        f"secret_path = pathlib.Path({str(host_secret_file)!r})\n"
+        "if os.environ.get('CHECK_HOST_FS_HIDDEN') != '0':\n"
+        "    pass\n"
+        "print(f'HOST_SECRET_EXISTS={secret_path.exists()}')\n"
         "print(f'SCORE={solver.score_value()}')\n",
         encoding="utf-8",
     )
     _git(repo, "add", "bench.py")
-    _git(repo, "commit", "-m", "check env isolation")
+    _git(repo, "commit", "-m", "check env and fs isolation")
 
     # Forbidden flags must fail closed in _parse_safe_argv.
     for bad_cmd in (
@@ -762,8 +773,8 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
         assert argv is None and issue is not None, f"Expected rejection for {bad_cmd!r}"
 
     # Host secrets must NEVER leak into benchmark subprocess env.
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-must-not-leak")
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-secret-must-not-leak")
+    monkeypatch.setenv("OLYMPUS_TEST_SECRET_TOKEN", "secret-token-must-not-leak")
+    monkeypatch.setenv("OLYMPUS_TEST_PRIVATE_KEY", "private-key-must-not-leak")
     store = RunStore(tmp_path / "olympus.sqlite")
     run_id = store.create_run(
         title="Env isolation",
@@ -782,8 +793,9 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
     res = stage.hillclimb_loop(run_id=run_id, raw_input="Verify env isolation", config=cfg)
     assert HillclimbReport.model_validate(res["hillclimb_report"]).baseline_metric == 100.0
 
-    # Verify bwrap builds --unshare-net and --ro-bind for frozen_harness_paths when available.
-    if _probe_bwrap() is not None:
+    # Verify bwrap uses minimal ro mounts (NO --ro-bind / /), hides host files, uses --unshare-net
+    # and --ro-bind on frozen_harness_paths, and fails closed if --unshare-net is unavailable.
+    if _probe_bwrap() is not None and _probe_bwrap_unshare_net():
         captured_cmds: list[list[str]] = []
         real_run = subprocess.run
 
@@ -793,24 +805,44 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(hillclimb_mod.subprocess, "run", _spy_run)
-        val, err, _ = stage._measure_metric(
+        val, err, excerpt = stage._measure_metric(
             sandbox_path=repo,
             config=cfg,
             timeout_s=30,
             node_name="hillclimb",
         )
         assert err is None and val == 100.0
+        assert "HOST_SECRET_EXISTS=False" in excerpt
         assert captured_cmds
         bwrap_cmd = captured_cmds[-1]
-        if _probe_bwrap_unshare_net():
-            assert "--unshare-net" in bwrap_cmd
+        assert "--unshare-net" in bwrap_cmd
+        assert "--tmpfs" in bwrap_cmd
         bench_resolved = str((repo / "bench.py").resolve())
         ro_pairs = [
             (bwrap_cmd[i + 1], bwrap_cmd[i + 2])
             for i in range(len(bwrap_cmd) - 2)
             if bwrap_cmd[i] == "--ro-bind"
         ]
+        assert ("/", "/") not in ro_pairs
         assert (bench_resolved, bench_resolved) in ro_pairs
+
+        # Fail closed when --unshare-net is unavailable under require_fs_isolation=True.
+        monkeypatch.setattr(hillclimb_mod, "_probe_bwrap_unshare_net", lambda: False)
+        strict_stage = HillclimbStage(
+            store=store,
+            workspace_root=repo,
+            provider=_mock_provider([]),
+            artifacts_root=tmp_path / "artifacts",
+            sandbox_root=tmp_path / "sandboxes",
+            allow_unsandboxed_metric=False,
+        )
+        with pytest.raises(HillclimbPause, match="unshare-net"):
+            strict_stage._measure_metric(
+                sandbox_path=repo,
+                config=cfg,
+                timeout_s=30,
+                node_name="hillclimb",
+            )
 
 
 def test_pre_execution_tamper_short_circuits_without_running_metric_and_unsandboxed_runtime_tamper(
@@ -970,7 +1002,12 @@ def test_verify_surface_enforces_winning_commit_best_metric_and_clean_sandbox(
     ws = sandboxes[-1]
     winning_sha = res["hillclimb_winning_commit_sha"]
 
-    # 1. Extra verification command mutating sandbox fails sandbox_cleanliness & blocks promotion.
+    # 0. Direct promote_winner MUST fail closed before Argus verify_surface has passed!
+    with pytest.raises(HillclimbPause, match="missing passing Argus verify_surface"):
+        stage.promote_winner(run_id=run_id, state=res)
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # 1. Extra verification command mutating sandbox (including .gitignore'd files!) fails.
     with pytest.raises(HillclimbPause, match="sandbox_cleanliness=fail"):
         stage.verify_surface(
             run_id=run_id,
@@ -981,13 +1018,34 @@ def test_verify_surface_enforces_winning_commit_best_metric_and_clean_sandbox(
     assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
     (ws / "verify_side_effect.txt").unlink()
 
-    # 2. Regression worse than best_metric (even though better than baseline 100) fails!
+    # 2a. Forged in-memory HillclimbReport disagreeing with SQLite fails closed immediately!
     fake_worse_state = dict(res)
     fake_worse_report = dict(res["hillclimb_report"])
-    fake_worse_report["best_metric"] = 10.0  # Real sandbox returns 30 (> 10, < 100 baseline)
+    fake_worse_report["best_metric"] = 10.0
     fake_worse_state["hillclimb_report"] = fake_worse_report
-    with pytest.raises(HillclimbPause, match="hillclimb_metric=fail"):
+    with pytest.raises(HillclimbPause, match="disagrees with authoritative SQLite"):
         stage.verify_surface(run_id=run_id, state=fake_worse_state, apply_to_workspace=True)
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # 2b. Altered HillclimbConfig (config_hash mismatch vs SQLite) fails closed!
+    bad_cfg_state = dict(res)
+    bad_cfg_state["hillclimb_config"] = _base_config(
+        direction="maximize", max_iterations=1
+    ).model_dump(mode="json")
+    with pytest.raises(HillclimbPause, match="does not match SQLite recorded baseline config_hash"):
+        stage.verify_surface(run_id=run_id, state=bad_cfg_state, apply_to_workspace=True)
+
+    # 2c. Real metric regression worse than SQLite best_metric (50 vs 30, still < 100 baseline)!
+    regressing_stage = HillclimbStage(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        command_runner=lambda _cmd, **_kw: (0, "SCORE=50\n"),
+    )
+    with pytest.raises(HillclimbPause, match="hillclimb_metric=fail"):
+        regressing_stage.verify_surface(run_id=run_id, state=res, apply_to_workspace=True)
     assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
 
     # 3. Drifted sandbox HEAD (extra commit after winning commit) fails winning_commit_binding!
@@ -1194,24 +1252,44 @@ def test_revert_cleans_gitignored_artifacts_and_resume_preserves_sqlite_trail(
                 encoding="utf-8",
             )
             return "HYPOTHESIS: Improve to 50"
+        if it == 3:
+            # Simulate an unexpected mid-loop worker crash after iter 1 & 2 are persisted.
+            raise RuntimeError("transient provider outage on iter 3")
         raise AssertionError(req.actor)
 
-    res1 = hillclimb_loop(
-        store=store,
-        workspace_root=repo,
-        provider=_mock_provider([]),
-        run_id=run_id,
-        raw_input="Run first 2 iterations",
-        config=_base_config(direction="minimize", max_iterations=2, plateau_patience=3),
-        artifacts_root=tmp_path / "artifacts",
-        sandbox_root=tmp_path / "sandboxes",
-        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
-        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker_part1)}),
-    )
+    shared_cfg = _base_config(direction="minimize", max_iterations=3, plateau_patience=3)
+    with pytest.raises(RuntimeError, match="transient provider outage"):
+        hillclimb_loop(
+            store=store,
+            workspace_root=repo,
+            provider=_mock_provider([]),
+            run_id=run_id,
+            raw_input="Run 3 iterations with crash on iter 3",
+            config=shared_cfg,
+            artifacts_root=tmp_path / "artifacts",
+            sandbox_root=tmp_path / "sandboxes",
+            execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+            driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker_part1)}),
+        )
     assert seen_ignored_on_iter2 == [False]
-    assert res1["hillclimb_report"]["best_metric"] == 50.0
 
-    # Resume the SAME run_id with max_iterations=3: must continue at iteration 3 (no duplicates!).
+    # Resuming with a DIFFERENT config_hash MUST fail closed!
+    drifted_cfg = _base_config(direction="maximize", max_iterations=3, plateau_patience=3)
+    with pytest.raises(HillclimbPause, match="config_hash"):
+        hillclimb_loop(
+            store=store,
+            workspace_root=repo,
+            provider=_mock_provider([]),
+            run_id=run_id,
+            raw_input="Attempt resume with mutated config",
+            config=drifted_cfg,
+            artifacts_root=tmp_path / "artifacts",
+            sandbox_root=tmp_path / "sandboxes",
+            execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+            driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker_part1)}),
+        )
+
+    # Resume the SAME run_id with the SAME config_hash: continues at iteration 3 (no duplicates!).
     def _worker_part2(req: DriverTurnRequest) -> str:
         seen_actors.append(req.actor)
         assert req.actor == "hephaestus:hillclimb_iter_3"
@@ -1229,7 +1307,7 @@ def test_revert_cleans_gitignored_artifacts_and_resume_preserves_sqlite_trail(
         provider=_mock_provider([]),
         run_id=run_id,
         raw_input="Resume to 3 iterations",
-        config=_base_config(direction="minimize", max_iterations=3, plateau_patience=3),
+        config=shared_cfg,
         artifacts_root=tmp_path / "artifacts",
         sandbox_root=tmp_path / "sandboxes",
         execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
@@ -1243,12 +1321,20 @@ def test_revert_cleans_gitignored_artifacts_and_resume_preserves_sqlite_trail(
         "hephaestus:hillclimb_iter_1",
         "hephaestus:hillclimb_iter_2",
         "hephaestus:hillclimb_iter_3",
+        "hephaestus:hillclimb_iter_3",
     ]
 
     events = store.list_events(run_id)
-    assert sum(1 for ev in events if ev.event_type == "hillclimb.baseline_recorded") == 1
+    base_events = [ev for ev in events if ev.event_type == "hillclimb.baseline_recorded"]
+    assert len(base_events) == 1
+    assert base_events[0].payload["config_hash"] == shared_cfg.content_hash
+    assert base_events[0].payload["metric_command"] == shared_cfg.metric_command
+    assert base_events[0].payload["metric_regex"] == shared_cfg.metric_regex
+    assert base_events[0].payload["frozen_harness_hashes"]
     iter_events = [ev for ev in events if ev.event_type == "hillclimb.iteration_recorded"]
     assert [ev.payload["iteration"] for ev in iter_events] == [1, 2, 3]
+    assert iter_events[-1].payload["best_metric"] == 15.0
+    assert iter_events[-1].payload["config_hash"] == shared_cfg.content_hash
 
     trail = json.loads(Path(res2["hillclimb_decision_trail_path"]).read_text(encoding="utf-8"))
     assert [r["iteration"] for r in trail["rows"]] == [1, 2, 3]
@@ -1293,3 +1379,229 @@ def test_metric_parsing_uses_untruncated_output_and_rejects_ambiguous_multi_matc
     assert err is None
     assert val == 100.0
     assert excerpt.endswith("...[truncated]")
+
+
+def test_host_drift_detection_and_hardlink_inode_rollback_and_ignored_verify_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "olympus.sqlite")
+
+    # 1. Host drift protection: local edit on host during hillclimb blocks promotion!
+    repo_drift = tmp_path / "repo_drift"
+    _init_opt_repo(repo_drift)
+    run_drift = store.create_run(
+        title="Host drift",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_drift,
+    )
+
+    def _drift_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 18\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Improve to 18"
+
+    stage_drift = HillclimbStage(
+        store=store,
+        workspace_root=repo_drift,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_drift",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_drift_worker)}),
+    )
+    res_drift = stage_drift.hillclimb_loop(
+        run_id=run_drift,
+        raw_input="Optimize solver",
+        config=_base_config(direction="minimize", max_iterations=1),
+    )
+    # Human modifies solver.py locally on host before verify_surface promotes.
+    (repo_drift / "solver.py").write_text("# local human edit\n", encoding="utf-8")
+    with pytest.raises(HillclimbPause, match="host workspace drifted"):
+        stage_drift.verify_surface(run_id=run_drift, state=res_drift, apply_to_workspace=True)
+    assert (repo_drift / "solver.py").read_text(encoding="utf-8") == "# local human edit\n"
+
+    # 2. Hard-link inode preservation on rollback!
+    repo_hl = tmp_path / "repo_hl_rb"
+    _init_opt_repo(repo_hl)
+    (repo_hl / "second.py").write_text("VAL = 1\n", encoding="utf-8")
+    _git(repo_hl, "add", "second.py")
+    _git(repo_hl, "commit", "-m", "add second.py")
+    alias = tmp_path / "solver_rb_alias.py"
+    os.link(repo_hl / "solver.py", alias)
+    orig_ino = alias.stat().st_ino
+
+    run_hl = store.create_run(
+        title="Hardlink rollback inode",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_hl,
+    )
+    stage_hl = HillclimbStage(
+        store=store,
+        workspace_root=repo_hl,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_hl_rb",
+    )
+    handle_hl, baseline_hl = stage_hl._ensure_sandbox(run_hl)
+    (handle_hl.workspace_path / "solver.py").write_text("def score_value(): return 5\n", "utf-8")
+    (handle_hl.workspace_path / "second.py").write_text("VAL = 2\n", "utf-8")
+    hl_cfg = HillclimbConfig(
+        frozen_harness_paths=["bench.py"],
+        metric_command=f"{sys.executable} bench.py",
+        metric_regex=r"SCORE=([0-9]+)",
+        direction="minimize",
+        write_scope=["solver.py", "second.py"],
+    )
+    frozen_hl = snapshot_frozen_harness(handle_hl.workspace_path, ["bench.py"])
+
+    real_replace = hillclimb_mod._atomic_replace_from_src
+    call_count = 0
+
+    def _fail_on_second(src: Path, dst: Path) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("Simulated failure on second file")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(hillclimb_mod, "_atomic_replace_from_src", _fail_on_second)
+    with pytest.raises(HillclimbPause, match="rolled back"):
+        stage_hl._promote_sandbox_to_workspace(
+            handle_hl, baseline_hl, hl_cfg, frozen_hashes=frozen_hl
+        )
+    # Rollback MUST restore the EXACT original inode so solver.py and alias remain hard-linked!
+    assert (repo_hl / "solver.py").stat().st_ino == orig_ino
+    assert alias.stat().st_ino == orig_ino
+    assert not list(repo_hl.glob(".olympus-hlbak-*"))
+
+    # 3. Extra verification command writing a .gitignore'd file fails sandbox_cleanliness!
+    repo_ign = tmp_path / "repo_ign"
+    _init_opt_repo(repo_ign)
+    (repo_ign / ".gitignore").write_text("*.verify_ignored\n", encoding="utf-8")
+    (repo_ign / "write_ignored.py").write_text(
+        "from pathlib import Path\n"
+        "Path('sneaky.verify_ignored').write_text('x', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _git(repo_ign, "add", ".")
+    _git(repo_ign, "commit", "-m", "add gitignore and write_ignored")
+    run_ign = store.create_run(
+        title="Ignored verify mutation",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_ign,
+    )
+    stage_ign = HillclimbStage(
+        store=store,
+        workspace_root=repo_ign,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_ign",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_drift_worker)}),
+    )
+    res_ign = stage_ign.hillclimb_loop(
+        run_id=run_ign,
+        raw_input="Optimize",
+        config=_base_config(direction="minimize", max_iterations=1),
+    )
+    with pytest.raises(HillclimbPause, match="sandbox_cleanliness=fail"):
+        stage_ign.verify_surface(
+            run_id=run_ign,
+            state=res_ign,
+            commands=[f"{sys.executable} write_ignored.py"],
+            apply_to_workspace=True,
+        )
+
+
+def test_session_runner_starts_and_resumes_pstack_hillclimb_from_verify_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    # Add a toggleable external test gate so verify_surface pauses on run 1 and passes on resume!
+    gate_file = tmp_path / "allow_verify_pass.flag"
+    (repo / "check_gate.py").write_text(
+        "import pathlib, sys\n"
+        f"sys.exit(0 if pathlib.Path({str(gate_file)!r}).exists() else 1)\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "check_gate.py")
+    _git(repo, "commit", "-m", "add toggleable verify gate")
+
+    # Note: under minimal bwrap, tmp_path outside sandbox is hidden, so use allow_unsandboxed_metric
+    # for this toggle-file gate check while still exercising full SessionRunner + loader dispatch.
+    monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
+    monkeypatch.setattr(hillclimb_mod, "_probe_bwrap", lambda: None)
+
+    def _worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 14\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Optimize score to 14"
+
+    scripted = _ScriptedDriver(_worker)
+    orig_factories = hillclimb_mod.default_driver_factories
+
+    def _factories_with_scripted(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        factories = dict(orig_factories(*args, **kwargs))
+        factories["scripted"] = lambda: scripted
+        return factories
+
+    monkeypatch.setattr(hillclimb_mod, "default_driver_factories", _factories_with_scripted)
+
+    hc_cfg = _base_config(direction="minimize", target_value=15.0, max_iterations=2)
+    state_dir = tmp_path / "session_state"
+    runner = SessionRunner(
+        SessionConfig(
+            workspace_root=repo,
+            state_dir=state_dir,
+            workflow="pstack_hillclimb",
+            step_mode=StepMode.EXECUTE,
+            stage_driver="native",
+            worker_driver="scripted",
+            reviewer_driver="native",
+            hillclimb_config=hc_cfg.model_dump(mode="json"),
+            metadata={"verification_commands": [f"{sys.executable} check_gate.py"]},
+            provider_builder=lambda **_kw: _mock_provider([_sample_evidence()]),
+        )
+    )
+
+    env1 = runner.start(goal="Optimize solver.py via SessionRunner")
+    assert env1.status == "needs_input"
+    assert env1.pause_kind == "blocked"
+    paused_events = [
+        ev for ev in runner.store.list_events(env1.run_id) if ev.event_type == "session.paused"
+    ]
+    assert paused_events and paused_events[-1].payload.get("node") == "verify_surface"
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # Now enable the external check gate and resume using a brand-new SessionRunner instance
+    # (no in-memory hillclimb_report in state!).
+    gate_file.write_text("ok", encoding="utf-8")
+    resumed_runner = SessionRunner(
+        SessionConfig(
+            workspace_root=repo,
+            state_dir=state_dir,
+            workflow="pstack_hillclimb",
+            step_mode=StepMode.EXECUTE,
+            stage_driver="native",
+            worker_driver="scripted",
+            reviewer_driver="native",
+            provider_builder=lambda **_kw: _mock_provider([]),
+        )
+    )
+    env2 = resumed_runner.reply(run_id=env1.run_id, message="retry")
+    assert env2.status == "completed", env2
+    assert "return 14" in (repo / "solver.py").read_text(encoding="utf-8")
+    # Worker was NOT re-invoked on resume; loader routed straight to HillclimbStage.verify_surface!
+    assert len(scripted.calls) == 1

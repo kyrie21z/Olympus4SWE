@@ -716,10 +716,35 @@ def _hillclimb_stage(runtime: WorkflowRuntime) -> HillclimbStage:
     )
 
 
+def _is_hillclimb_run(runtime: WorkflowRuntime, run_id: str, state: Mapping[str, Any]) -> bool:
+    """Identify hillclimb runs even on direct resume at ``verify_surface`` with fresh state."""
+    if "architect_sketch" in state:
+        return False
+    if "hillclimb_report" in state or "hillclimb_config" in state:
+        return True
+    if (runtime.artifacts_root / run_id / "hillclimb" / "state.json").is_file():
+        return True
+    for event in runtime.store.list_events(run_id):
+        if event.event_type in {
+            "hillclimb.baseline_recorded",
+            "hillclimb.iteration_recorded",
+            "hillclimb.completed",
+        }:
+            return True
+    try:
+        snap = runtime.store.get_run(run_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return snap.get("workflow_name") == "pstack_hillclimb"
+
+
 def _node_hillclimb_loop(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
     runtime = _runtime(state)
     run_id = _run_id(state)
     raw_cfg = params.get("hillclimb_config")
+    if not isinstance(raw_cfg, Mapping):
+        extra_cfg = runtime.extra.get("hillclimb_config")
+        raw_cfg = extra_cfg if isinstance(extra_cfg, Mapping) else None
     explicit_cfg: Mapping[str, Any] | None = raw_cfg if isinstance(raw_cfg, Mapping) else None
     try:
         return _hillclimb_stage(runtime).hillclimb_loop(
@@ -745,7 +770,7 @@ def _node_verify_surface(state: dict[str, Any], params: Mapping[str, Any]) -> di
     run_id = _run_id(state)
     raw_commands = params.get("commands")
     commands = list(raw_commands) if isinstance(raw_commands, list) else None
-    if "hillclimb_report" in state and "architect_sketch" not in state:
+    if _is_hillclimb_run(runtime, run_id, state):
         try:
             return _hillclimb_stage(runtime).verify_surface(
                 run_id=run_id,

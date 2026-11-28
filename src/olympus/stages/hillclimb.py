@@ -32,6 +32,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
@@ -187,15 +188,77 @@ def _compose_system_prompt(base_prompt: str, skill_refs: Sequence[str]) -> str:
     return f"{base_prompt}\n\n---\n{pack}"
 
 
+_MINIMAL_SYSTEM_RO_MOUNTS: tuple[str, ...] = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/alternatives",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+)
+
+
+def _minimal_bwrap_ro_mounts(
+    argv: Sequence[str],
+    *,
+    cwd_resolved: Path,
+    metric_tmp: Path,
+) -> list[Path]:
+    """Build minimal read-only system + Python/toolchain mounts (never ``/``)."""
+    raw_candidates: list[Path] = [Path(item) for item in _MINIMAL_SYSTEM_RO_MOUNTS]
+    for prefix in (sys.prefix, sys.base_prefix):
+        if prefix:
+            raw_candidates.append(Path(prefix))
+    exe_path = Path(sys.executable)
+    raw_candidates.append(exe_path.parent)
+    raw_candidates.append(exe_path.resolve(strict=False).parent)
+    if argv:
+        bin_path = Path(argv[0])
+        if bin_path.is_absolute():
+            raw_candidates.append(bin_path.parent)
+            raw_candidates.append(bin_path.resolve(strict=False).parent)
+
+    mounts: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in raw_candidates:
+        if not candidate.exists():
+            continue
+        # Preserve symlinked prefix locations (e.g. /bin -> /usr/bin) when resolving dedup.
+        norm = Path(os.path.abspath(str(candidate)))
+        if norm == Path("/"):
+            continue
+        if norm == cwd_resolved or norm.is_relative_to(cwd_resolved):
+            continue
+        if norm == metric_tmp or norm.is_relative_to(metric_tmp):
+            continue
+        # Never mount an ancestor directory that would expose cwd or host /home root.
+        if cwd_resolved.is_relative_to(norm) or metric_tmp.is_relative_to(norm):
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            mounts.append(norm)
+    return mounts
+
+
 @functools.lru_cache(maxsize=1)
 def _probe_bwrap() -> str | None:
-    """Return the path to ``bwrap`` when Linux user-namespace read-only mounting works."""
+    """Return the path to ``bwrap`` when Linux user-namespace minimal mounting works."""
     bwrap_bin = shutil.which("bwrap", path="/usr/bin:/bin:/usr/local/bin")
     if bwrap_bin is None:
         return None
+    cmd: list[str] = [bwrap_bin, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for item in _MINIMAL_SYSTEM_RO_MOUNTS:
+        if Path(item).exists():
+            cmd.extend(["--ro-bind", item, item])
+    cmd.extend(["--", "/bin/true"])
     try:
         probe = subprocess.run(
-            [bwrap_bin, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "/bin/true"],
+            cmd,
             shell=False,
             capture_output=True,
             timeout=5,
@@ -209,24 +272,27 @@ def _probe_bwrap() -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def _probe_bwrap_unshare_net() -> bool:
-    """Return True when ``bwrap --unshare-net`` works in this environment."""
+    """Return True when ``bwrap --unshare-net`` works with minimal read-only mounts."""
     bwrap_bin = _probe_bwrap()
     if bwrap_bin is None:
         return False
+    cmd: list[str] = [
+        bwrap_bin,
+        "--unshare-net",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]
+    for item in _MINIMAL_SYSTEM_RO_MOUNTS:
+        if Path(item).exists():
+            cmd.extend(["--ro-bind", item, item])
+    cmd.extend(["--", "/bin/true"])
     try:
         probe = subprocess.run(
-            [
-                bwrap_bin,
-                "--unshare-net",
-                "--ro-bind",
-                "/",
-                "/",
-                "--dev",
-                "/dev",
-                "--proc",
-                "/proc",
-                "/bin/true",
-            ],
+            cmd,
             shell=False,
             capture_output=True,
             timeout=5,
@@ -445,19 +511,23 @@ def _run_argv_command(
 
     cmd: list[str] = list(argv)
     if bwrap_bin is not None:
+        unshare_net_ok = _probe_bwrap_unshare_net()
+        if not unshare_net_ok and require_fs_isolation:
+            shutil.rmtree(metric_tmp, ignore_errors=True)
+            raise _SandboxIsolationUnavailableError(
+                "bwrap --unshare-net is unavailable; refusing network-enabled metric "
+                "execution (set allow_unsandboxed_metric=True or "
+                "OLYMPUS_ALLOW_UNSANDBOXED_REPRO=1 to opt in explicitly)"
+            )
         bwrap_cmd: list[str] = [bwrap_bin]
-        if _probe_bwrap_unshare_net():
+        if unshare_net_ok:
             bwrap_cmd.append("--unshare-net")
-        bwrap_cmd.extend(
-            [
-                "--ro-bind",
-                "/",
-                "/",
-                "--bind",
-                str(cwd_resolved),
-                str(cwd_resolved),
-            ]
-        )
+        bwrap_cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+        for ro_mount in _minimal_bwrap_ro_mounts(
+            argv, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp
+        ):
+            bwrap_cmd.extend(["--ro-bind", str(ro_mount), str(ro_mount)])
+        bwrap_cmd.extend(["--bind", str(cwd_resolved), str(cwd_resolved)])
         # Overlay frozen harness files read-only inside the sandbox mount namespace.
         for ro_file in read_only_files:
             ro_resolved = ro_file.resolve()
@@ -468,10 +538,6 @@ def _run_argv_command(
                 "--bind",
                 str(metric_tmp),
                 str(metric_tmp),
-                "--dev",
-                "/dev",
-                "--proc",
-                "/proc",
                 "--chdir",
                 str(cwd_resolved),
                 "--",
@@ -527,11 +593,94 @@ def _git_head_sha(cwd: Path) -> str:
     return proc.stdout.strip()
 
 
-def _git_has_changes(cwd: Path) -> bool:
-    proc = _run_git(cwd, "status", "--porcelain", "--untracked-files=all")
+def _git_has_changes(cwd: Path, *, include_ignored: bool = False) -> bool:
+    args = ["status", "--porcelain", "--untracked-files=all"]
+    if include_ignored:
+        args.append("--ignored")
+    proc = _run_git(cwd, *args)
     if proc.returncode != 0:
         raise RuntimeError(f"git status failed: {proc.stderr.strip()}")
     return bool(proc.stdout.strip())
+
+
+def _host_path_fingerprint(path: Path) -> str | None:
+    """Compute host file fingerprint matching ``worktree._file_fingerprint`` semantics."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return f"symlink:{os.readlink(path)}"
+    if not stat.S_ISREG(info.st_mode):
+        return f"other:{stat.S_IFMT(info.st_mode):o}"
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return f"{stat.S_IMODE(info.st_mode):o}:{digest.hexdigest()}"
+
+
+def _git_blob_fingerprint(repo_root: Path, base_commit: str, rel: str) -> str | None:
+    """Return expected ``mode:sha256`` or ``symlink:<target>`` from ``base_commit`` in git."""
+    tree_proc = _run_git(repo_root, "ls-tree", base_commit, "--", rel)
+    if tree_proc.returncode != 0:
+        raise RuntimeError(f"git ls-tree {base_commit} -- {rel} failed: {tree_proc.stderr.strip()}")
+    line = tree_proc.stdout.strip()
+    if not line:
+        return None
+    header = line.split("\t", 1)[0].split()
+    if len(header) < 3:
+        return None
+    git_mode = header[0]
+    blob_proc = subprocess.run(
+        ["git", "cat-file", "-p", f"{base_commit}:{rel}"],
+        cwd=str(repo_root),
+        shell=False,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    if blob_proc.returncode != 0:
+        raise RuntimeError(f"git cat-file -p {base_commit}:{rel} failed")
+    raw = blob_proc.stdout
+    if git_mode == "120000":
+        return f"symlink:{raw.decode('utf-8', errors='surrogateescape')}"
+    digest = hashlib.sha256(raw).hexdigest()
+    # Compare digest ignoring umask differences on tracked non-exec files while keeping exec bit.
+    is_exec = git_mode == "100755"
+    return f"git:{'x' if is_exec else 'f'}:{digest}"
+
+
+def _host_matches_baseline(
+    *,
+    ws_root: Path,
+    rel: str,
+    baseline: SandboxBaseline,
+) -> bool:
+    """Return True iff host ``ws_root / rel`` has not drifted since ``baseline``."""
+    dst = ws_root / rel
+    before_map = baseline.mapping()
+    current = _host_path_fingerprint(dst)
+    if rel in before_map:
+        return current == before_map[rel]
+    if baseline.is_git and baseline.base_commit is not None:
+        expected = _git_blob_fingerprint(ws_root, baseline.base_commit, rel)
+        if expected is None:
+            return current is None
+        if expected.startswith("symlink:"):
+            return current == expected
+        if current is None or not expected.startswith("git:"):
+            return False
+        if ":" not in current or current.startswith(("symlink:", "other:")):
+            return False
+        cur_mode_str, cur_digest = current.split(":", 1)
+        _, exp_kind, exp_digest = expected.split(":", 2)
+        if cur_digest != exp_digest:
+            return False
+        cur_is_exec = bool(int(cur_mode_str, 8) & 0o111)
+        return cur_is_exec == (exp_kind == "x")
+    # Non-git fallback: missing from baseline.mapping() means file did not exist at baseline.
+    return current is None
 
 
 def _git_commit_all(cwd: Path, *, iteration: int, hypothesis: str) -> str:
@@ -1005,6 +1154,28 @@ class HillclimbStage:
             return None, f"{parse_err} (output={tail!r})", excerpt
         return value, None, excerpt
 
+    def _has_verified_argus_record(
+        self,
+        *,
+        run_id: str,
+        expected_commit_sha: str,
+        expected_config_hash: str,
+    ) -> bool:
+        """Return True iff SQLite holds a passing Argus verify_surface bound to commit+config."""
+        for event in reversed(self.store.list_events(run_id)):
+            if event.event_type != "craft.verify_recorded":
+                continue
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            if (
+                payload.get("passed") is True
+                and payload.get("winning_commit_sha") == expected_commit_sha
+                and payload.get("config_hash") == expected_config_hash
+            ):
+                return True
+        return False
+
     def _promote_sandbox_to_workspace(
         self,
         handle: SandboxHandle,
@@ -1013,8 +1184,32 @@ class HillclimbStage:
         *,
         frozen_hashes: Mapping[str, str],
         expected_commit_sha: str | None = None,
+        run_id: str | None = None,
+        require_verified: bool = False,
         node_name: str = "hillclimb",
     ) -> list[str]:
+        if require_verified:
+            if not run_id or not expected_commit_sha:
+                raise HillclimbPause(
+                    node_name,
+                    "Refusing to promote: run_id and expected_commit_sha are required for "
+                    "Argus verification binding",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            if not self._has_verified_argus_record(
+                run_id=run_id,
+                expected_commit_sha=expected_commit_sha,
+                expected_config_hash=config.content_hash,
+            ):
+                raise HillclimbPause(
+                    node_name,
+                    "Refusing to promote: missing passing Argus verify_surface record in "
+                    f"SQLite for commit {expected_commit_sha[:8]} and config_hash "
+                    f"{config.content_hash[:12]}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
         if expected_commit_sha is not None:
             if not handle.is_git_worktree:
                 raise HillclimbPause(
@@ -1032,10 +1227,11 @@ class HillclimbStage:
                     route="blocked",
                     pause_kind="blocked",
                 )
-            if _git_has_changes(handle.workspace_path):
+            if _git_has_changes(handle.workspace_path, include_ignored=True):
                 raise HillclimbPause(
                     node_name,
-                    "Refusing to promote: sandbox working tree has uncommitted mutations",
+                    "Refusing to promote: sandbox working tree has uncommitted or ignored "
+                    "mutations",
                     route="blocked",
                     pause_kind="blocked",
                 )
@@ -1168,8 +1364,26 @@ class HillclimbStage:
                     )
                 ancestor = ancestor.parent
 
-        # Phase 2: transactional apply with full backup+mode rollback on any OSError.
-        backups: list[tuple[Path, str, tuple[bytes, int] | str | int | None]] = []
+        # Phase 1b: verify host workspace has NOT drifted since baseline on any mutated path.
+        drifted_paths = [
+            rel
+            for rel in changed
+            if not _host_matches_baseline(ws_root=ws_root, rel=rel, baseline=baseline)
+        ]
+        if drifted_paths:
+            raise HillclimbPause(
+                node_name,
+                "Refusing to promote: host workspace drifted since hillclimb baseline on "
+                + ", ".join(sorted(drifted_paths)),
+                route="blocked",
+                pause_kind="blocked",
+            )
+
+        # Phase 2: transactional apply with full backup+mode+hardlink rollback on any OSError.
+        backups: list[
+            tuple[Path, str, tuple[bytes, int] | tuple[Path, bytes, int] | str | int | None]
+        ] = []
+        temp_backup_links: list[Path] = []
         created_dirs: list[Path] = []
         try:
             for target in delete_plan:
@@ -1177,8 +1391,16 @@ class HillclimbStage:
                     backups.append((target, "symlink", os.readlink(target)))
                     target.unlink()
                 elif target.is_file():
-                    mode = stat.S_IMODE(target.stat().st_mode)
-                    backups.append((target, "file", (target.read_bytes(), mode)))
+                    st = target.stat()
+                    mode = stat.S_IMODE(st.st_mode)
+                    data = target.read_bytes()
+                    if st.st_nlink > 1:
+                        hl_bak = target.parent / f".olympus-hlbak-{target.name}.{uuid4().hex[:8]}"
+                        os.link(target, hl_bak)
+                        temp_backup_links.append(hl_bak)
+                        backups.append((target, "hardlink_file", (hl_bak, data, mode)))
+                    else:
+                        backups.append((target, "file", (data, mode)))
                     target.unlink()
                 parent = target.parent
                 while parent != ws_root and parent.is_relative_to(ws_root):
@@ -1202,8 +1424,17 @@ class HillclimbStage:
                     backups.append((dst, "symlink", os.readlink(dst)))
                     dst.unlink()
                 elif dst.is_file():
-                    mode = stat.S_IMODE(dst.stat().st_mode)
-                    backups.append((dst, "file", (dst.read_bytes(), mode)))
+                    st = dst.stat()
+                    mode = stat.S_IMODE(st.st_mode)
+                    data = dst.read_bytes()
+                    if st.st_nlink > 1:
+                        # Retain original inode hard link so rollback restores alias identity.
+                        hl_bak = dst.parent / f".olympus-hlbak-{dst.name}.{uuid4().hex[:8]}"
+                        os.link(dst, hl_bak)
+                        temp_backup_links.append(hl_bak)
+                        backups.append((dst, "hardlink_file", (hl_bak, data, mode)))
+                    else:
+                        backups.append((dst, "file", (data, mode)))
                 else:
                     backups.append((dst, "missing", None))
                 if link_target is not None:
@@ -1233,7 +1464,15 @@ class HillclimbStage:
                             path.unlink(missing_ok=True)
                         path.parent.mkdir(parents=True, exist_ok=True)
                         os.symlink(saved, path)
-                    elif kind == "file" and isinstance(saved, tuple):
+                    elif kind == "hardlink_file" and isinstance(saved, tuple) and len(saved) == 3:
+                        hl_bak, data, saved_mode = saved
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        if hl_bak.exists():
+                            os.replace(hl_bak, path)
+                            os.chmod(path, saved_mode)
+                        else:
+                            _atomic_replace_bytes(path, data, saved_mode)
+                    elif kind == "file" and isinstance(saved, tuple) and len(saved) == 2:
                         data, saved_mode = saved
                         if path.is_symlink():
                             path.unlink(missing_ok=True)
@@ -1247,6 +1486,8 @@ class HillclimbStage:
                         _atomic_replace_bytes(path, data, saved_mode)
                 except OSError as rb_exc:
                     rollback_errors.append(f"{path.name}: {rb_exc}")
+            for hl_bak in temp_backup_links:
+                hl_bak.unlink(missing_ok=True)
             for dir_path, dir_mode in sorted(
                 restore_dir_modes, key=lambda item: len(item[0].parts), reverse=True
             ):
@@ -1272,7 +1513,40 @@ class HillclimbStage:
                 route="blocked",
                 pause_kind="blocked",
             ) from exc
+        for hl_bak in temp_backup_links:
+            hl_bak.unlink(missing_ok=True)
         return sorted(set(applied))
+
+    def promote_winner(
+        self,
+        *,
+        run_id: str,
+        state: Mapping[str, Any] | None = None,
+        config: HillclimbConfig | Mapping[str, Any] | None = None,
+        node_name: str = "verify_surface",
+    ) -> list[str]:
+        """Atomically promote the SQLite-bound winning commit AFTER Argus verification."""
+        state_map: Mapping[str, Any] = state or {}
+        cfg = self._resolve_config(
+            run_id=run_id,
+            state=state_map,
+            explicit_config=config,
+            node_name=node_name,
+        )
+        auth = self._load_authoritative_sqlite_state(run_id, cfg, node_name=node_name)
+        handle, baseline = self._ensure_sandbox(run_id)
+        applied_paths = self._promote_sandbox_to_workspace(
+            handle,
+            baseline,
+            cfg,
+            frozen_hashes=auth["frozen_hashes"],
+            expected_commit_sha=auth["expected_commit_sha"],
+            run_id=run_id,
+            require_verified=True,
+            node_name=node_name,
+        )
+        remove_sandbox(handle)
+        return applied_paths
 
     # ------------------------------------------------------------------ config resolution
 
@@ -1290,8 +1564,24 @@ class HillclimbStage:
         persisted = self._load_persisted(run_id).get("hillclimb_config")
         if isinstance(persisted, Mapping):
             merged.update(persisted)
+        for event in self.store.list_events(run_id):
+            if event.event_type != "session.started" or not isinstance(event.payload, Mapping):
+                continue
+            ev_hc = event.payload.get("hillclimb_config")
+            if isinstance(ev_hc, Mapping):
+                merged.update(ev_hc)
+            ev_meta = event.payload.get("metadata")
+            if isinstance(ev_meta, Mapping) and isinstance(
+                ev_meta.get("hillclimb_config"), Mapping
+            ):
+                merged.update(ev_meta["hillclimb_config"])
         if isinstance(explicit_config, Mapping):
             merged.update(explicit_config)
+        state_meta = state.get("metadata")
+        if isinstance(state_meta, Mapping) and isinstance(
+            state_meta.get("hillclimb_config"), Mapping
+        ):
+            merged.update(state_meta["hillclimb_config"])
         state_cfg = state.get("hillclimb_config")
         if isinstance(state_cfg, HillclimbConfig):
             return state_cfg
@@ -1300,7 +1590,7 @@ class HillclimbStage:
         if not merged:
             raise HillclimbPause(
                 node_name,
-                "HillclimbConfig is required in state['hillclimb_config'] or node params",
+                "HillclimbConfig is required in state['hillclimb_config'], metadata, or params",
                 route="blocked",
                 pause_kind="blocked",
             )
@@ -1320,6 +1610,7 @@ class HillclimbStage:
         """Load baseline payload and recorded iteration rows from SQLite for resume/verification."""
         baseline_payload: dict[str, Any] | None = None
         prior_rows: list[HillclimbIterationRow] = []
+        row_fields = set(HillclimbIterationRow.model_fields)
         for event in self.store.list_events(run_id):
             if (
                 event.event_type == "hillclimb.baseline_recorded"
@@ -1331,8 +1622,94 @@ class HillclimbStage:
                 event.event_type == "hillclimb.iteration_recorded"
                 and isinstance(event.payload, Mapping)
             ):
-                prior_rows.append(HillclimbIterationRow.model_validate(event.payload))
+                row_data = {k: v for k, v in event.payload.items() if k in row_fields}
+                prior_rows.append(HillclimbIterationRow.model_validate(row_data))
         return baseline_payload, prior_rows
+
+    def _load_authoritative_sqlite_state(
+        self,
+        run_id: str,
+        cfg: HillclimbConfig,
+        *,
+        node_name: str,
+    ) -> dict[str, Any]:
+        """Reconstruct authoritative metrics, frozen hashes, and winning commit from SQLite."""
+        baseline_payload, sqlite_rows = self._load_sqlite_history(run_id)
+        if baseline_payload is None:
+            raise HillclimbPause(
+                node_name,
+                "Missing SQLite hillclimb.baseline_recorded audit event",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        recorded_hash = baseline_payload.get("config_hash")
+        if recorded_hash != cfg.content_hash:
+            raise HillclimbPause(
+                node_name,
+                f"HillclimbConfig hash ({cfg.content_hash[:12]}) does not match SQLite "
+                f"recorded baseline config_hash ({str(recorded_hash)[:12]})",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        if (
+            baseline_payload.get("direction") != cfg.direction
+            or baseline_payload.get("metric_command") != cfg.metric_command
+            or baseline_payload.get("metric_regex") != cfg.metric_regex
+        ):
+            raise HillclimbPause(
+                node_name,
+                "HillclimbConfig metric parameters disagree with SQLite recorded baseline",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        raw_hashes = baseline_payload.get("frozen_harness_hashes") or baseline_payload.get(
+            "frozen_hashes"
+        )
+        if not isinstance(raw_hashes, Mapping) or not raw_hashes:
+            raise HillclimbPause(
+                node_name,
+                "SQLite hillclimb.baseline_recorded event is missing frozen_harness_hashes",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        frozen_hashes = {str(k): str(v) for k, v in raw_hashes.items()}
+        if sorted(frozen_hashes) != sorted(cfg.frozen_harness_paths):
+            raise HillclimbPause(
+                node_name,
+                "HillclimbConfig frozen_harness_paths disagree with SQLite recorded baseline",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        raw_base_metric = baseline_payload.get("baseline_metric")
+        raw_base_commit = baseline_payload.get("base_commit")
+        if not isinstance(raw_base_metric, (int, float)) or not isinstance(raw_base_commit, str):
+            raise HillclimbPause(
+                node_name,
+                "SQLite hillclimb.baseline_recorded event is missing baseline_metric/base_commit",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        baseline_metric = float(raw_base_metric)
+        best_metric = baseline_metric
+        expected_commit_sha = raw_base_commit.strip()
+        consecutive_non_improving = 0
+        for row in sqlite_rows:
+            if row.decision == "keep":
+                assert row.metric_after is not None and row.commit_sha is not None
+                best_metric = row.metric_after
+                expected_commit_sha = row.commit_sha
+                consecutive_non_improving = 0
+            else:
+                consecutive_non_improving += 1
+        return {
+            "baseline_payload": baseline_payload,
+            "rows": sqlite_rows,
+            "frozen_hashes": frozen_hashes,
+            "baseline_metric": baseline_metric,
+            "best_metric": best_metric,
+            "expected_commit_sha": expected_commit_sha,
+            "consecutive_non_improving": consecutive_non_improving,
+        }
 
     # ------------------------------------------------------------------ composite primitive
 
@@ -1372,49 +1749,17 @@ class HillclimbStage:
         consecutive_non_improving = 0
 
         if prior_baseline is not None:
-            # Resume/retry on an existing run_id: preserve prior SQLite rows & baseline.
-            raw_frozen = prior_baseline.get("frozen_hashes")
-            if not isinstance(raw_frozen, Mapping) or not raw_frozen:
-                raise HillclimbPause(
-                    node_name,
-                    "Recorded hillclimb baseline is missing frozen_hashes on resume",
-                    route="blocked",
-                    pause_kind="blocked",
-                )
-            frozen_hashes = {str(k): str(v) for k, v in raw_frozen.items()}
-            if sorted(frozen_hashes) != sorted(cfg.frozen_harness_paths):
-                raise HillclimbPause(
-                    node_name,
-                    "Cannot resume hillclimb_loop: frozen_harness_paths changed since baseline",
-                    route="blocked",
-                    pause_kind="blocked",
-                )
-            raw_base_metric = prior_baseline.get("baseline_metric")
-            raw_base_commit = prior_baseline.get("base_commit")
-            if not isinstance(raw_base_metric, (int, float)) or not isinstance(
-                raw_base_commit, str
-            ):
-                raise HillclimbPause(
-                    node_name,
-                    "Recorded hillclimb baseline is malformed on resume",
-                    route="blocked",
-                    pause_kind="blocked",
-                )
-            baseline_metric = float(raw_base_metric)
-            best_metric = baseline_metric
-            last_kept_sha = raw_base_commit
-            for prev_row in rows:
-                if prev_row.decision == "keep":
-                    assert prev_row.metric_after is not None and prev_row.commit_sha is not None
-                    best_metric = prev_row.metric_after
-                    last_kept_sha = prev_row.commit_sha
-                    consecutive_non_improving = 0
-                else:
-                    consecutive_non_improving += 1
+            # Resume/retry on an existing run_id: enforce config_hash parity and preserve rows.
+            auth = self._load_authoritative_sqlite_state(run_id, cfg, node_name=node_name)
+            frozen_hashes = auth["frozen_hashes"]
+            baseline_metric = auth["baseline_metric"]
+            best_metric = auth["best_metric"]
+            last_kept_sha = auth["expected_commit_sha"]
+            consecutive_non_improving = auth["consecutive_non_improving"]
             # Reconcile worktree cleanly back to last_kept_sha before resuming.
             if (
                 _git_head_sha(handle.workspace_path) != last_kept_sha
-                or _git_has_changes(handle.workspace_path)
+                or _git_has_changes(handle.workspace_path, include_ignored=True)
             ):
                 _git_revert_to_commit(handle.workspace_path, last_kept_sha)
             resume_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
@@ -1476,10 +1821,15 @@ class HillclimbStage:
                     "config_id": cfg.config_id,
                     "config_hash": cfg.content_hash,
                     "baseline_metric": baseline_metric,
+                    "best_metric": baseline_metric,
                     "direction": cfg.direction,
                     "target_value": cfg.target_value,
+                    "metric_command": cfg.metric_command,
+                    "metric_regex": cfg.metric_regex,
+                    "write_scope": list(cfg.write_scope),
                     "base_commit": last_kept_sha,
                     "frozen_hashes": dict(frozen_hashes),
+                    "frozen_harness_hashes": dict(frozen_hashes),
                 },
             )
             best_metric = baseline_metric
@@ -1731,12 +2081,22 @@ class HillclimbStage:
                 )
                 rows.append(row)
 
+                iter_payload = {
+                    **row.model_dump(mode="json"),
+                    "config_hash": cfg.content_hash,
+                    "baseline_metric": baseline_metric,
+                    "best_metric": best_metric,
+                    "direction": cfg.direction,
+                    "frozen_harness_hashes": dict(frozen_hashes),
+                    "metric_command": cfg.metric_command,
+                    "metric_regex": cfg.metric_regex,
+                }
                 self.store.append_event(
                     run_id=run_id,
                     stage="hillclimb",
                     event_type="hillclimb.iteration_recorded",
                     actor="hephaestus",
-                    payload=row.model_dump(mode="json"),
+                    payload=iter_payload,
                 )
                 trail_path = self._write_decision_trail(
                     run_id,
@@ -1806,83 +2166,29 @@ class HillclimbStage:
             },
         )
 
-        applied_paths: list[str] = []
-        if apply_to_workspace:
-            clean_ephemeral_artifacts(
-                handle,
-                baseline,
-                write_scope=[*cfg.write_scope, *cfg.frozen_harness_paths],
-            )
-            applied_paths = self._promote_sandbox_to_workspace(
-                handle,
-                baseline,
-                cfg,
-                frozen_hashes=frozen_hashes,
-                expected_commit_sha=last_kept_sha,
-                node_name=node_name,
-            )
-            remove_sandbox(handle)
-
-        return {
+        result_state: dict[str, Any] = {
             "hillclimb_config": dumped_cfg,
             "hillclimb_report": dumped_report,
             "hillclimb_frozen_hashes": dict(frozen_hashes),
             "hillclimb_winning_commit_sha": last_kept_sha,
             "hillclimb_decision_trail_path": str(trail_path),
-            "applied_paths": applied_paths,
+            "applied_paths": [],
             "route": "done",
         }
+        if apply_to_workspace:
+            # Never bypass Argus verify_surface before promoting to host workspace.
+            verify_out = self.verify_surface(
+                run_id=run_id,
+                state=result_state,
+                node_name=node_name,
+                apply_to_workspace=True,
+                timeout_s=metric_timeout_s,
+            )
+            result_state["surface_verification"] = verify_out["surface_verification"]
+            result_state["applied_paths"] = verify_out["applied_paths"]
+        return result_state
 
     # ------------------------------------------------------------------ verify_surface
-
-    def _resolve_winning_commit_sha(
-        self,
-        run_id: str,
-        report: HillclimbReport,
-        *,
-        node_name: str,
-    ) -> str:
-        """Bind verification and promotion strictly to the SQLite-recorded winning commit."""
-        baseline_payload, sqlite_rows = self._load_sqlite_history(run_id)
-        if baseline_payload is None:
-            raise HillclimbPause(
-                node_name,
-                "Missing SQLite hillclimb.baseline_recorded audit event for verification",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        base_commit = baseline_payload.get("base_commit")
-        if not isinstance(base_commit, str) or not base_commit.strip():
-            raise HillclimbPause(
-                node_name,
-                "SQLite hillclimb.baseline_recorded event is missing base_commit",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        kept_sqlite = [row for row in sqlite_rows if row.decision == "keep"]
-        expected_sha = (
-            kept_sqlite[-1].commit_sha
-            if kept_sqlite and kept_sqlite[-1].commit_sha
-            else base_commit.strip()
-        )
-        kept_report = [row for row in report.rows if row.decision == "keep"]
-        if len(kept_report) != len(kept_sqlite):
-            raise HillclimbPause(
-                node_name,
-                f"HillclimbReport kept count ({len(kept_report)}) disagrees with SQLite "
-                f"decision trail ({len(kept_sqlite)})",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        if kept_report and kept_report[-1].commit_sha != expected_sha:
-            raise HillclimbPause(
-                node_name,
-                f"HillclimbReport winning commit ({kept_report[-1].commit_sha}) disagrees "
-                f"with SQLite winning commit ({expected_sha})",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        return expected_sha
 
     def verify_surface(
         self,
@@ -1896,35 +2202,39 @@ class HillclimbStage:
         timeout_s: int = 120,
     ) -> dict[str, Any]:
         """Real-surface Argus verification after ``hillclimb_loop`` plus atomic promotion."""
-        cfg = self._hydrate_model(run_id, state, "hillclimb_config", HillclimbConfig)
-        report = self._hydrate_model(run_id, state, "hillclimb_report", HillclimbReport)
-        if cfg is None or report is None:
-            raise HillclimbPause(
-                node_name,
-                "Hillclimb verification requires hillclimb_config and hillclimb_report in state",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        persisted = self._load_persisted(run_id)
-        baseline_payload, _ = self._load_sqlite_history(run_id)
-        raw_hashes = (
-            (baseline_payload or {}).get("frozen_hashes")
-            or state.get("hillclimb_frozen_hashes")
-            or persisted.get("frozen_hashes")
+        cfg = self._resolve_config(
+            run_id=run_id,
+            state=state,
+            explicit_config=None,
+            node_name=node_name,
         )
-        if not isinstance(raw_hashes, Mapping) or not raw_hashes:
-            raise HillclimbPause(
-                node_name,
-                "Missing frozen harness SHA-256 baseline for hillclimb verification",
-                route="blocked",
-                pause_kind="blocked",
-            )
-        frozen_hashes = {str(k): str(v) for k, v in raw_hashes.items()}
-        expected_commit_sha = self._resolve_winning_commit_sha(
-            run_id, report, node_name=node_name
-        )
+        auth = self._load_authoritative_sqlite_state(run_id, cfg, node_name=node_name)
+        frozen_hashes: dict[str, str] = auth["frozen_hashes"]
+        auth_baseline_metric: float = auth["baseline_metric"]
+        auth_best_metric: float = auth["best_metric"]
+        expected_commit_sha: str = auth["expected_commit_sha"]
+        sqlite_rows: list[HillclimbIterationRow] = auth["rows"]
 
-        handle, baseline = self._ensure_sandbox(run_id)
+        # Cross-check optional caller-supplied report against SQLite authoritative state so
+        # forged or stale in-memory state cannot override metric thresholds or commits.
+        supplied_report = self._hydrate_model(run_id, state, "hillclimb_report", HillclimbReport)
+        if supplied_report is not None:
+            kept_sqlite = [row for row in sqlite_rows if row.decision == "keep"]
+            kept_report = [row for row in supplied_report.rows if row.decision == "keep"]
+            if (
+                len(kept_report) != len(kept_sqlite)
+                or (kept_report and kept_report[-1].commit_sha != expected_commit_sha)
+                or supplied_report.baseline_metric != auth_baseline_metric
+                or supplied_report.best_metric != auth_best_metric
+            ):
+                raise HillclimbPause(
+                    node_name,
+                    "Supplied HillclimbReport disagrees with authoritative SQLite audit trail",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+
+        handle, _baseline = self._ensure_sandbox(run_id)
         if not handle.is_git_worktree:
             raise HillclimbPause(
                 node_name,
@@ -1965,14 +2275,14 @@ class HillclimbStage:
         # 2. Bind sandbox explicitly to the SQLite-recorded winning commit & clean tree.
         if not short_circuit:
             current_head = _git_head_sha(handle.workspace_path)
-            dirty_before = _git_has_changes(handle.workspace_path)
+            dirty_before = _git_has_changes(handle.workspace_path, include_ignored=True)
             binding_ok = (current_head == expected_commit_sha) and not dirty_before
             if not binding_ok:
                 short_circuit = True
             checks.append(
                 SurfaceCheckResult(
                     surface="winning_commit_binding",
-                    command="git rev-parse HEAD && git status --porcelain",
+                    command="git rev-parse HEAD && git status --porcelain --ignored",
                     status="pass" if binding_ok else "fail",
                     exit_code=0 if binding_ok else 1,
                     evidence=(
@@ -1987,7 +2297,7 @@ class HillclimbStage:
                 )
             )
 
-        # 3. Re-run frozen metric command (with --ro-bind frozen harness) & check vs best_metric.
+        # 3. Re-run frozen metric command (with --ro-bind frozen harness) & check vs SQLite best.
         if not short_circuit:
             measured, measure_err, measure_out = self._measure_metric(
                 sandbox_path=handle.workspace_path,
@@ -2023,10 +2333,10 @@ class HillclimbStage:
                 )
             else:
                 regressed_vs_best = is_strictly_better(
-                    report.best_metric, measured, cfg.direction
+                    auth_best_metric, measured, cfg.direction
                 )
                 regressed_vs_baseline = is_strictly_better(
-                    report.baseline_metric, measured, cfg.direction
+                    auth_baseline_metric, measured, cfg.direction
                 )
                 failed_metric = regressed_vs_best or regressed_vs_baseline
                 checks.append(
@@ -2036,8 +2346,8 @@ class HillclimbStage:
                         status="fail" if failed_metric else "pass",
                         exit_code=1 if failed_metric else 0,
                         evidence=(
-                            f"Verified metric={measured:g} vs best={report.best_metric:g} "
-                            f"and baseline={report.baseline_metric:g} ({cfg.direction}); "
+                            f"Verified metric={measured:g} vs best={auth_best_metric:g} "
+                            f"and baseline={auth_baseline_metric:g} ({cfg.direction}); "
                             f"output={measure_out[:400]}"
                         ),
                     )
@@ -2087,9 +2397,9 @@ class HillclimbStage:
                     )
                 )
 
-            # 5. Reject if any verification command mutated the sandbox working tree or HEAD.
+            # 5. Reject if any check mutated tracked, untracked, or gitignored sandbox files.
             post_head = _git_head_sha(handle.workspace_path)
-            dirty_after = _git_has_changes(handle.workspace_path)
+            dirty_after = _git_has_changes(handle.workspace_path, include_ignored=True)
             post_all_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
             clean_ok = (
                 post_head == expected_commit_sha
@@ -2099,7 +2409,7 @@ class HillclimbStage:
             checks.append(
                 SurfaceCheckResult(
                     surface="sandbox_cleanliness",
-                    command="git rev-parse HEAD && git status --porcelain",
+                    command="git rev-parse HEAD && git status --porcelain --ignored",
                     status="pass" if clean_ok else "fail",
                     exit_code=0 if clean_ok else 1,
                     evidence=(
@@ -2142,6 +2452,7 @@ class HillclimbStage:
                 "passed": verification.passed,
                 "check_count": len(verification.checks),
                 "winning_commit_sha": expected_commit_sha,
+                "config_hash": cfg.content_hash,
                 "summary": verification.summary,
             },
         )
@@ -2156,15 +2467,12 @@ class HillclimbStage:
 
         applied_paths: list[str] = []
         if apply_to_workspace:
-            applied_paths = self._promote_sandbox_to_workspace(
-                handle,
-                baseline,
-                cfg,
-                frozen_hashes=frozen_hashes,
-                expected_commit_sha=expected_commit_sha,
+            applied_paths = self.promote_winner(
+                run_id=run_id,
+                state=state,
+                config=cfg,
                 node_name=node_name,
             )
-            remove_sandbox(handle)
 
         return {
             "surface_verification": dumped,

@@ -78,6 +78,7 @@ _EXECUTE_TYPES = frozenset(
         "hygiene_pass",
         "interrogate_review",
         "verify_surface",
+        "hillclimb_loop",
     }
 )
 _PLAN_ONLY_STOP = "plan"
@@ -151,6 +152,8 @@ class SessionConfig:
     scope_paths: list[str] = field(default_factory=list)
     provider_builder: ProviderBuilder | None = None
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
+    hillclimb_config: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _assert_state_outside_workspace(
@@ -333,6 +336,8 @@ class SessionRunner:
         goal: str,
         title: str | None = None,
         constraints: list[str] | None = None,
+        hillclimb_config: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SessionEnvelope:
         """Create a run and drive it until a pause or completion."""
         clean_goal = goal.strip()
@@ -349,6 +354,25 @@ class SessionRunner:
             )
         workflow_path = _yaml_workflow_path(self.config.workflow)
         clean_constraints = [str(item).strip() for item in (constraints or []) if str(item).strip()]
+        merged_metadata: dict[str, Any] = {
+            **dict(self.config.metadata),
+            **dict(metadata or {}),
+        }
+        effective_hillclimb_cfg = (
+            dict(hillclimb_config)
+            if hillclimb_config is not None
+            else (
+                dict(self.config.hillclimb_config)
+                if self.config.hillclimb_config is not None
+                else (
+                    dict(merged_metadata["hillclimb_config"])
+                    if isinstance(merged_metadata.get("hillclimb_config"), dict)
+                    else None
+                )
+            )
+        )
+        if effective_hillclimb_cfg is not None:
+            merged_metadata["hillclimb_config"] = effective_hillclimb_cfg
         drivers = self._drivers_config()
         provider_config = self._provider_config()
         run_id = self.store.create_run(
@@ -366,22 +390,27 @@ class SessionRunner:
             actor="session",
         )
         toplevel = _git_toplevel(self.workspace_root)
+        started_payload: dict[str, Any] = {
+            "raw_input": clean_goal,
+            "constraints": clean_constraints,
+            "workflow": definition.name,
+            "workflow_path": str(workflow_path) if workflow_path is not None else None,
+            "workflow_hash": definition.execution_hash(),
+            "workspace_root": str(self.workspace_root),
+            "git_toplevel": str(toplevel) if toplevel is not None else None,
+            "step_mode": self.config.step_mode.value,
+            "gate_policy": self._resolved_gate_policy(run_id).value,
+        }
+        if effective_hillclimb_cfg is not None:
+            started_payload["hillclimb_config"] = effective_hillclimb_cfg
+        if merged_metadata:
+            started_payload["metadata"] = merged_metadata
         self.store.append_event(
             run_id=run_id,
             stage="session",
             event_type="session.started",
             actor="session",
-            payload={
-                "raw_input": clean_goal,
-                "constraints": clean_constraints,
-                "workflow": definition.name,
-                "workflow_path": str(workflow_path) if workflow_path is not None else None,
-                "workflow_hash": definition.execution_hash(),
-                "workspace_root": str(self.workspace_root),
-                "git_toplevel": str(toplevel) if toplevel is not None else None,
-                "step_mode": self.config.step_mode.value,
-                "gate_policy": self._resolved_gate_policy(run_id).value,
-            },
+            payload=started_payload,
         )
         return self._drive(
             run_id=run_id,
@@ -720,6 +749,23 @@ class SessionRunner:
         except Exception as exc:  # noqa: BLE001 -- surface graph/runtime setup failure as SessionEnvelope
             return self._fail(run_id, exc)
         snap = self.store.get_run(run_id)
+        session_metadata: dict[str, Any] = dict(self.config.metadata)
+        hillclimb_cfg: dict[str, Any] | None = (
+            dict(self.config.hillclimb_config)
+            if self.config.hillclimb_config is not None
+            else None
+        )
+        for event in self.store.list_events(run_id):
+            if event.event_type != "session.started":
+                continue
+            ev_meta = event.payload.get("metadata")
+            if isinstance(ev_meta, dict):
+                session_metadata = {**ev_meta, **session_metadata}
+            ev_hc = event.payload.get("hillclimb_config")
+            if hillclimb_cfg is None and isinstance(ev_hc, dict):
+                hillclimb_cfg = dict(ev_hc)
+        if hillclimb_cfg is None and isinstance(session_metadata.get("hillclimb_config"), dict):
+            hillclimb_cfg = dict(session_metadata["hillclimb_config"])
         state: dict[str, Any] = {
             "run_id": run_id,
             "raw_input": raw_input,
@@ -733,6 +779,12 @@ class SessionRunner:
             "scope_paths": list(snap.get("scope_paths") or self.config.scope_paths),
             "_runtime": runtime,
         }
+        if session_metadata:
+            state["metadata"] = session_metadata
+            if isinstance(session_metadata.get("verification_commands"), list):
+                state["verification_commands"] = list(session_metadata["verification_commands"])
+        if hillclimb_cfg is not None:
+            state["hillclimb_config"] = hillclimb_cfg
         for key in ("spec", "design", "plan"):
             artifact = snap.get(key)
             if artifact is not None:

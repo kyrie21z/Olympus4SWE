@@ -26,7 +26,6 @@ nodes:
       - pstack/explore
     params:
       require_repro: false
-      max_steps: 8
   - name: architect
     type: architect_sketch
     god: athena
@@ -34,8 +33,6 @@ nodes:
     role: architect
     skill_refs:
       - pstack/architect
-    params:
-      max_steps: 6
   - name: build
     type: build_direct
     god: hephaestus
@@ -44,8 +41,6 @@ nodes:
     skill_refs:
       - pstack/build
     max_visits: 3
-    params:
-      max_steps: 24
   - name: hygiene
     type: hygiene_pass
     god: hephaestus
@@ -54,8 +49,6 @@ nodes:
     skill_refs:
       - pstack/hygiene
     max_visits: 3
-    params:
-      max_steps: 4
   - name: interrogate
     type: interrogate_review
     god: momus
@@ -68,7 +61,6 @@ nodes:
     params:
       enable_thermo: false
       max_cycles: 3
-      max_steps: 6
   - name: verify_surface
     type: verify_surface
     god: argus

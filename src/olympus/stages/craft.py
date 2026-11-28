@@ -28,6 +28,8 @@ from pydantic import BaseModel
 
 from olympus.core.contracts import (
     ArchitectSketch,
+    BudgetLedger,
+    BudgetPolicy,
     EvidenceBrief,
     InterrogateFinding,
     InterrogateReport,
@@ -136,13 +138,29 @@ _FORBIDDEN_REPRO_FLAGS: frozenset[str] = frozenset(
         "--python-executable",
         "--shadow-file",
         "--custom-typeshed-dir",
+        "-h",
+        "--help",
+        "--version",
+        "--collect-only",
+        "--co",
+        "--fixtures",
+        "--fixtures-per-test",
+        "--markers",
+        "--setup-plan",
+        "--setup-only",
+        "--setup-show",
+        "--list",
+        "--list-tests",
+        "--show-files",
+        "--show-settings",
+        "--show-fixes",
     }
 )
 _TRUSTED_SYSTEM_BIN_DIRS: frozenset[Path] = frozenset(
     {Path("/usr/bin"), Path("/bin"), Path("/usr/local/bin")}
 )
 _UNTRUSTED_PATH_PREFIXES: tuple[Path, ...] = (Path("/tmp"), Path("/var/tmp"))
-_FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "o", "p", "w"})
+_FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "h", "o", "p", "w"})
 _ABS_PATH_LITERAL_RE = re.compile(r"(?:^|[\s'\"=(,])/(?:etc|home|root|tmp|var|usr|opt|Users)/")
 _NON_PROOF_EXIT_CODES: frozenset[int] = frozenset({126, 127})
 _PYTEST_NON_FAILURE_EXIT_CODES: frozenset[int] = frozenset({2, 3, 4, 5})
@@ -441,6 +459,13 @@ def _has_forbidden_flag(arg: str) -> str | None:
     """Detect forbidden long, attached-value, or bundled short flags."""
     if not arg.startswith("-") or arg == "-":
         return None
+    if arg == "-V" or (
+        not arg.startswith("--")
+        and len(arg) > 1
+        and arg[1].lower() not in {"k", "m"}
+        and "V" in arg[1:]
+    ):
+        return f"short flag -V (in {arg!r}) is forbidden in read-only repro_command"
     flag_name = arg.split("=", 1)[0].lower()
     if flag_name in _FORBIDDEN_REPRO_FLAGS:
         return f"flag {flag_name!r} is forbidden in read-only repro_command"
@@ -761,6 +786,18 @@ class CraftStage:
         )
         driver, ext_model = registry.resolve_external(resolved_spec)
         return driver, ext_model, resolved_spec
+
+    def _has_remaining_budget(self, run_id: str) -> bool:
+        """Return True when the run ledger still permits reserving one more LLM call."""
+        try:
+            snap = self.store.get_run(run_id)
+        except Exception:  # noqa: BLE001
+            return True
+        ledger = snap.get("budget_ledger")
+        policy = snap.get("budget_policy")
+        if isinstance(ledger, BudgetLedger) and isinstance(policy, BudgetPolicy):
+            return ledger.can_reserve(policy)
+        return True
 
     def _run_structured[T: BaseModel](
         self,
@@ -1358,38 +1395,42 @@ class CraftStage:
         )
         valid_cmds, rejected_cmds = self._partition_verification_plan(sketch.verification_plan)
         if rejected_cmds:
-            repair_details = "\n".join(
-                f"- {cmd!r}: {reason}" for cmd, reason in rejected_cmds
-            )
-            repair_prompt = (
-                f"{user_prompt}\n\n"
-                f"Previous ArchitectSketch JSON had invalid verification_plan commands that fail "
-                f"the deterministic read-only sandbox allowlist:\n{repair_details}\n\n"
-                f"Keep your chosen architecture and write_scope, and replace verification_plan "
-                f"with ONLY valid allowlisted commands (e.g. `python -m unittest <test_file>`, "
-                f"`pytest -q`, `ruff check .`). Return ONLY valid ArchitectSketch JSON."
-            )
-            try:
-                repaired, _ = self._run_structured(
-                    run_id=run_id,
-                    node_name=node_name,
-                    role=role,
-                    actor="athena:architect",
-                    workspace_path=self.workspace_root,
-                    system_prompt=system_prompt,
-                    user_prompt=repair_prompt,
-                    model_cls=ArchitectSketch,
-                    max_steps=3,
-                    trace_name="architect_repair",
+            if self._has_remaining_budget(run_id):
+                repair_details = "\n".join(
+                    f"- {cmd!r}: {reason}" for cmd, reason in rejected_cmds
                 )
-                repaired_valid, repaired_rejected = self._partition_verification_plan(
-                    repaired.verification_plan
+                repair_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"Previous ArchitectSketch JSON had invalid verification_plan commands that "
+                    f"fail the deterministic read-only sandbox allowlist:\n{repair_details}\n\n"
+                    f"Keep your chosen architecture and write_scope, and replace ONLY the "
+                    f"rejected verification_plan entries with valid allowlisted commands "
+                    f"(e.g. `python -m unittest <test_file>`, `pytest -q`, `ruff check .`). "
+                    f"Return ONLY valid ArchitectSketch JSON."
                 )
-                if repaired_valid:
-                    sketch = repaired.model_copy(update={"verification_plan": repaired_valid})
-                    valid_cmds, rejected_cmds = repaired_valid, repaired_rejected
-            except Exception:  # noqa: BLE001 - fall back to any valid commands from initial sketch
-                pass
+                try:
+                    repaired, _ = self._run_structured(
+                        run_id=run_id,
+                        node_name=node_name,
+                        role=role,
+                        actor="athena:architect",
+                        workspace_path=self.workspace_root,
+                        system_prompt=system_prompt,
+                        user_prompt=repair_prompt,
+                        model_cls=ArchitectSketch,
+                        max_steps=3,
+                        trace_name="architect_repair",
+                    )
+                    repaired_valid, repaired_rejected = self._partition_verification_plan(
+                        repaired.verification_plan
+                    )
+                    if repaired_valid:
+                        # Preserve all original valid commands and never let the repair turn
+                        # mutate write_scope, forbidden_globs, or architecture fields.
+                        valid_cmds = list(dict.fromkeys([*valid_cmds, *repaired_valid]))
+                        rejected_cmds = repaired_rejected
+                except Exception:  # noqa: BLE001 - fall back to any valid commands from initial sketch
+                    pass
             if not valid_cmds:
                 reasons = "; ".join(f"{cmd!r} ({reason})" for cmd, reason in rejected_cmds)
                 raise CraftPause(
@@ -1399,7 +1440,12 @@ class CraftStage:
                     route="blocked",
                     pause_kind="blocked",
                 )
-            sketch = sketch.model_copy(update={"verification_plan": valid_cmds})
+            sketch = ArchitectSketch.model_validate(
+                {
+                    **sketch.model_dump(mode="json", exclude={"content_hash"}),
+                    "verification_plan": valid_cmds,
+                }
+            )
         dumped = sketch.model_dump(mode="json")
         self._save_persisted(run_id, {"architect_sketch": dumped})
         self.store.append_event(
@@ -1577,7 +1623,7 @@ class CraftStage:
         role: str = "hygiene",
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
-        max_steps: int = 6,
+        max_steps: int = 4,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         if sketch is None:
@@ -1664,7 +1710,7 @@ class CraftStage:
         skill_refs: Sequence[str] = (),
         enable_thermo: bool = False,
         max_cycles: int = 3,
-        max_steps: int = 8,
+        max_steps: int = 6,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         handle, baseline = self._ensure_sandbox(run_id)
@@ -1969,8 +2015,11 @@ class CraftStage:
                         raw_cmd, cwd=handle.workspace_path, timeout_s=timeout_s
                     )
                 status: Literal["pass", "fail", "inconclusive"]
+                runner = _effective_repro_runner(argv)
                 if code is None:
                     status = "inconclusive"
+                elif code == 0 and runner == "unittest" and re.search(r"\bRan 0 tests\b", output):
+                    status = "fail"
                 elif code == 0:
                     status = "pass"
                 else:

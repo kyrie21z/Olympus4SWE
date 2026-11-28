@@ -815,7 +815,6 @@ class EvidenceBrief(FingerprintedModel):
     repro_verified: bool = False
     assumptions: list[str] = Field(
         default_factory=list,
-        exclude_if=lambda value: not value,
         description=(
             "Non-blocking engineering defaults, tie-breakers, or environment observations; "
             "execution continues autonomously without pausing."
@@ -832,7 +831,10 @@ class EvidenceBrief(FingerprintedModel):
     candidate_files: list[str] = Field(default_factory=list)
 
     def _hash_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude={"content_hash", "brief_id"})
+        payload = self.model_dump(mode="json", exclude={"content_hash", "brief_id"})
+        if not payload.get("assumptions"):
+            payload.pop("assumptions", None)
+        return payload
 
 
 class CandidateShape(StrictModel):

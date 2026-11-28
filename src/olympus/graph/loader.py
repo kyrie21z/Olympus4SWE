@@ -539,6 +539,23 @@ def _craft_stage(runtime: WorkflowRuntime) -> CraftStage:
     )
 
 
+def _craft_step_budget(
+    params: Mapping[str, Any],
+    runtime: WorkflowRuntime,
+    default_cap: int,
+    *,
+    use_worker_steps: bool = False,
+) -> int:
+    """Resolve a craft node's step budget without altering builtin workflow YAML hashes."""
+    if params.get("max_steps") is not None:
+        return int(params["max_steps"])
+    if use_worker_steps:
+        if runtime.worker_max_steps is not None:
+            return int(runtime.worker_max_steps)
+        return default_cap if runtime.max_steps == 16 else runtime.max_steps
+    return min(runtime.max_steps, default_cap)
+
+
 def _node_explore_reproduce(
     state: dict[str, Any], params: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -554,7 +571,7 @@ def _node_explore_reproduce(
             role=str(params.get("_node_role") or "explorer"),
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             require_repro=bool(params.get("require_repro", False)),
-            max_steps=int(params.get("max_steps", runtime.max_steps)),
+            max_steps=_craft_step_budget(params, runtime, 8),
         )
     except CraftPause as paused:
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
@@ -575,7 +592,7 @@ def _node_architect_sketch(
             node_name=str(params.get("_node_name") or "architect"),
             role=str(params.get("_node_role") or "architect"),
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
-            max_steps=int(params.get("max_steps", runtime.max_steps)),
+            max_steps=_craft_step_budget(params, runtime, 6),
         )
     except CraftPause as paused:
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
@@ -594,9 +611,7 @@ def _node_build_direct(state: dict[str, Any], params: Mapping[str, Any]) -> dict
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             strict_scope=bool(params.get("strict_scope", True)),
             max_diff_gate_retries=int(params.get("max_diff_gate_retries", 2)),
-            max_steps=int(
-                params.get("max_steps") or runtime.worker_max_steps or runtime.max_steps
-            ),
+            max_steps=_craft_step_budget(params, runtime, 24, use_worker_steps=True),
         )
     except CraftPause as paused:
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
@@ -613,7 +628,7 @@ def _node_hygiene_pass(state: dict[str, Any], params: Mapping[str, Any]) -> dict
             role=str(params.get("_node_role") or "hygiene"),
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             strict_scope=bool(params.get("strict_scope", True)),
-            max_steps=int(params.get("max_steps", runtime.max_steps)),
+            max_steps=_craft_step_budget(params, runtime, 4),
         )
     except CraftPause as paused:
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
@@ -637,7 +652,7 @@ def _node_interrogate_review(
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             enable_thermo=bool(params.get("enable_thermo", False)),
             max_cycles=max_cycles,
-            max_steps=int(params.get("max_steps", runtime.max_steps)),
+            max_steps=_craft_step_budget(params, runtime, 6),
         )
     except CraftPause as paused:
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused

@@ -1,5 +1,6 @@
 import type { RunEvent } from "../api/types";
 import { indexIncidents, positiveAttempt } from "./taskIncidents";
+import { indexMilestones } from "./replayMilestones";
 
 interface ObservedTask {
   id: string;
@@ -60,7 +61,7 @@ export function indexReplay(runId: string, horizon: number, history: RunEvent[])
     if ((index + 1) % CHECKPOINT_INTERVAL === 0) checkpoints.push(new Map(tasks));
   });
   return {
-    events, incidentsAt: indexIncidents(events),
+    events, incidentsAt: indexIncidents(events), milestonesAt: indexMilestones(events),
     tasksAt(cursor: number) {
       const block = Math.floor(cursor / CHECKPOINT_INTERVAL);
       const current = new Map(checkpoints[block]);

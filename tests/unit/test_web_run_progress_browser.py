@@ -209,6 +209,103 @@ def test_failure_review_groups_retries_and_requires_task_acceptance(workbench, b
     expect(page.get_by_role("region", name="Selected event")).to_contain_text("task.accepted")
 
 
+def test_milestone_navigation_skips_routine_events_and_freezes_results(workbench, browser):
+    store, run_id, url = workbench
+
+    def append(kind, **payload):
+        return store.append_event(run_id=run_id, stage="verify", actor="tester",
+                                  event_type=kind, payload=payload).event_seq
+
+    task = {"task_id": "T03-R1"}
+    request = append("task.retried_by_human", **task, hint="not for display")
+    append("task.leased", task_id="other-task", attempt=1)
+    leased = append("task.leased", **task, attempt=3)
+    append("turn.receipt", **task)
+    review = append("review.verdict_recorded", **task, passed=True)
+    accepted = append("task.accepted", **task, status="accepted")
+    append("post_dag.repro_rechecked", checked_count=0, still_failing_count=0)
+    rechecked = append("post_dag.repro_rechecked", checked_count=1, still_failing_count=0)
+    final = append("approval.recorded", target="final_acceptance", target_id="approval-3",
+                   decision="approved")
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}&lang=en")
+    page.get_by_role("button", name="Failure review").click()
+    dialog = page.get_by_role("dialog", name="Failure review")
+    dialog.get_by_role("button", name="Inspect source events").click()
+    prev = dialog.get_by_role("button", name="Previous milestone")
+    nxt = dialog.get_by_role("button", name="Next milestone")
+    selected = dialog.get_by_role("region", name="Selected event")
+    cursor = dialog.get_by_role("slider")
+    expect = playwright.expect
+    expect(selected).to_contain_text("approval-3")
+    expect(selected).to_contain_text("Final acceptance approved")
+    append("task.failed", task_id="FUTURE-ONLY")
+    expect(dialog).to_contain_text("1 new live events")
+    expect(nxt).to_be_disabled()
+    cursor.press("Shift+ArrowLeft")
+    expect(cursor).to_have_value(str(rechecked))
+    expect(selected).to_contain_text("Delivery recheck passed")
+    prev.click()
+    expect(cursor).to_have_value(str(accepted))
+    prev.click()
+    expect(cursor).to_have_value(str(review))
+    expect(selected).to_contain_text("Independent review passed")
+    card = dialog.get_by_role("article", name="T03-R1")
+    expect(card).to_contain_text("No acceptance recorded")
+    prev.click()
+    expect(cursor).to_have_value(str(leased))
+    expect(selected).to_contain_text("Retry started")
+    prev.press("Enter")
+    expect(cursor).to_have_value(str(request))
+    expect(selected).to_contain_text("Human retry requested")
+    expect(card).not_to_contain_text("New execution lease acquired")
+    cursor.press("ArrowRight")
+    expect(cursor).to_have_value(str(request + 1))
+    cursor.press("Shift+ArrowRight")
+    expect(cursor).to_have_value(str(leased))
+    for seq in (review, accepted, rechecked, final):
+        nxt.click()
+        expect(cursor).to_have_value(str(seq))
+    expect(nxt).to_be_disabled()
+    expect(dialog).not_to_contain_text("FUTURE-ONLY")
+
+
+@pytest.mark.parametrize("one_stop", [False, True])
+def test_empty_and_single_milestone_boundaries(workbench, browser, one_stop):
+    store, _, url = workbench
+    run_id = store.create_run(title="Milestone boundaries")
+    if one_stop:
+        stop = store.append_event(
+            run_id=run_id, stage="plan", actor="zeus", event_type="approval.recorded",
+            payload={
+                "target": "task_plan", "target_id": "sk-fixture-hidden", "decision": "approved",
+            },
+        )
+    page = browser.new_page()
+    page.goto(f"{url}/?run={run_id}&lang=en")
+    page.get_by_role("button", name="Failure review").click()
+    dialog = page.get_by_role("dialog", name="Failure review")
+    dialog.get_by_role("button", name="Inspect source events").click()
+    prev = dialog.get_by_role("button", name="Previous milestone")
+    nxt = dialog.get_by_role("button", name="Next milestone")
+    cursor = dialog.get_by_role("slider")
+    expect = playwright.expect
+    expect(prev).to_be_disabled()
+    expect(nxt).to_be_disabled()
+    if one_stop:
+        expect(dialog).to_contain_text("Task plan approved")
+        expect(dialog).not_to_contain_text("sk-fixture-hidden")
+        cursor.press("Home")
+        expect(prev).to_be_disabled()
+        nxt.press("Space")
+        expect(cursor).to_have_value(str(stop.event_seq))
+        expect(nxt).to_be_disabled()
+    else:
+        expect(dialog).to_contain_text("No milestones recorded in this history.")
+        cursor.press("Shift+ArrowLeft")
+        expect(cursor).to_have_value(str(store.list_events(run_id)[-1].event_seq))
+
+
 def test_attempt_evidence_handles_absent_empty_and_retried_reads(workbench, browser, tmp_path):
     store, run_id, url = workbench
     for task, number in [("T01", 6), ("T02", 0)]:

@@ -4,6 +4,7 @@ import { fetchRunEvents } from "../api/client";
 import { AttemptEvidence } from "./AttemptEvidence";
 import { useT } from "../i18n";
 import { statusMeta } from "../lib/labels";
+import { publicId } from "../lib/evidenceId";
 import { indexReplay } from "../lib/taskReplay";
 import type { Workbench } from "../state/workbench";
 import "../styles/replay.css";
@@ -60,14 +61,24 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
     sourceToggle.current?.focus();
   }
   const event = index?.events[cursor - 1];
+  const milestones = raw ? index?.milestonesAt(cursor) : undefined;
+  const currentStop = milestones?.current;
   const step = (delta: number) => setCursor(value => Math.max(0, Math.min(value + delta, horizon)));
   return (
     <dialog id="run-replay" ref={dialog} aria-labelledby="replay-title" onClose={onExit}
       onKeyDown={e => {
-        if (!index || !raw || (e.target instanceof HTMLElement && e.target.closest("input"))) return;
+        if (!index || !raw || e.altKey || e.ctrlKey || e.metaKey) return;
         if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+          const forward = e.key === "ArrowRight";
+          if (e.shiftKey) {
+            e.preventDefault();
+            const destination = forward ? milestones?.next : milestones?.previous;
+            if (destination !== undefined) setCursor(destination);
+            return;
+          }
+          if (e.target instanceof HTMLElement && e.target.closest("input")) return;
           e.preventDefault();
-          step(e.key === "ArrowLeft" ? -1 : 1);
+          step(forward ? 1 : -1);
         }
       }}>
       <header className="replay-head">
@@ -115,16 +126,31 @@ function ReplayDialog({ runId, horizon, liveSeq, onExit }: {
             </div>
             <input type="range" min={0} max={horizon} value={cursor} disabled={!horizon}
               aria-label={t("回放位置")} onChange={e => setCursor(Number(e.target.value))} />
+            <div className="replay-row replay-milestones" role="group" aria-label={t("关键节点跳转")}>
+              <button className="btn" type="button" aria-keyshortcuts="Shift+ArrowLeft"
+                disabled={milestones?.previous === undefined}
+                onClick={() => milestones?.previous !== undefined && setCursor(milestones.previous)}>
+                {t("上一个关键节点")}
+              </button>
+              <button className="btn" type="button" aria-keyshortcuts="Shift+ArrowRight"
+                disabled={milestones?.next === undefined}
+                onClick={() => milestones?.next !== undefined && setCursor(milestones.next)}>
+                {t("下一个关键节点")}
+              </button>
+              <small>{!currentStop && milestones?.previous === undefined && milestones?.next === undefined
+                ? t("这段历史中没有关键节点。") : "Shift + ← / →"}</small>
+            </div>
             <div className="replay-row">
               <button className="btn" type="button" disabled={!cursor} onClick={() => step(-1)}>{t("上一步")}</button>
               <button className="btn" type="button" disabled={cursor >= horizon} onClick={() => step(1)}>{t("下一步")}</button>
             </div>
           </section>
           <section className="replay-event" aria-label={t("当前事件")}>
-            {event ? <><h3>{t("当前事件")} <code>#{event.event_seq}</code></h3>
+            {event ? <><h3 aria-live="polite">{t(currentStop?.label ?? "当前事件")} <code>#{event.event_seq}</code></h3>
               <code>{event.event_type}</code>
               <p>{event.stage} · {event.actor}{event.created_at && <> · <time dateTime={event.created_at}>{event.created_at}</time></>}</p>
-              {typeof event.payload?.task_id === "string" && <code>{event.payload.task_id}</code>}
+              {currentStop?.target ? <code>{currentStop.target}</code>
+                : publicId(event.payload?.task_id) && <code>{event.payload.task_id}</code>}
             </> : <p>{t("尚无事件记录")}</p>}
           </section>
           <section aria-label={t("已观测任务")}>

@@ -17,6 +17,8 @@
 .replay-head code, .replay-event p, .replay-tasks small { color: var(--text-muted); font-size: var(--text-sm); }
 .replay-controls { background: var(--surface-sunk); padding: var(--space-3); border-radius: var(--radius); }
 .replay-controls input { inline-size: 100%; accent-color: var(--accent); margin-block: var(--space-3); }
+.replay-milestones { margin-block-end: var(--space-2); }
+.replay-milestones small { color: var(--text-muted); }
 .replay-summary { justify-content: space-between; padding-block-end: var(--space-2); }
 .incident-card { border-block-start: 1px solid var(--rule); padding-block: var(--space-4); }
 .incident-card header strong { font-family: var(--face-mono); }

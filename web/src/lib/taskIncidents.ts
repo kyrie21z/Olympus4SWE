@@ -18,7 +18,7 @@ export function positiveAttempt(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
-function failureLabel(event: RunEvent) {
+export function taskFailureLabel(event: RunEvent) {
   const p = event.payload ?? {};
   if (event.event_type === "task.diff_gate_rejected") return "文件变更未通过范围检查";
   if (event.event_type === "task.escape_hatch_rejected") return "代码变更未通过门禁检查";
@@ -60,7 +60,7 @@ export function indexIncidents(events: RunEvent[]) {
     }
     const attempt = raw == null ? attempts.get(id) : count;
     const incident = byTask.get(id)?.at(-1)?.card;
-    const failure = failureLabel(event);
+    const failure = taskFailureLabel(event);
     if (failure) {
       if (attempt && incident?.attempt && attempt < incident.attempt) continue;
       // A terminal blocked event can follow the specific rejection in the same attempt.

@@ -1,13 +1,7 @@
 import type { RecordedAttemptArtifacts } from "../api/types";
+import { publicId } from "./evidenceId";
 
 type CheckOutcome = "通过" | "未通过" | "结果未记录";
-const privateLabel = /(?:sk-|gh[pousr]_|github_pat_|akia[0-9a-z]{16}|api[_-]?key|bearer|password|secret|token[=_-])/i;
-
-// Only display short identifiers from the artifact formats. Commands, patch bodies,
-// manifest descriptions, log output and review prose never enter the comparison.
-function publicId(id: string) {
-  return /^[\p{L}\p{N}_.-]{1,96}$/u.test(id) && !privateLabel.test(id);
-}
 
 export function summarizeAttempt(art: RecordedAttemptArtifacts, taskId: string, attempt: number) {
   const checks = new Map<string, CheckOutcome>();

@@ -27,6 +27,7 @@ from olympus.harness.activity import LiveActivity
 from olympus.harness.driver import ActiveTurnHandle, DriverRegistry, ExecutionDriversConfig
 from olympus.providers.base import LLMProvider
 from olympus.stages.align import AlignStage
+from olympus.stages.arena import ArenaStage
 from olympus.stages.craft import CraftPause, CraftStage
 from olympus.stages.design import DesignStage, triage_input
 from olympus.stages.orchestrate import OrchestrateStage
@@ -52,6 +53,7 @@ _NODE_TYPES: tuple[str, ...] = (
     "hygiene_pass",
     "interrogate_review",
     "verify_surface",
+    "arena_race",
 )
 
 
@@ -677,6 +679,54 @@ def _node_verify_surface(state: dict[str, Any], params: Mapping[str, Any]) -> di
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
 
 
+def _arena_stage(runtime: WorkflowRuntime) -> ArenaStage:
+    return ArenaStage(
+        store=runtime.store,
+        workspace_root=runtime.workspace_root,
+        provider=runtime.provider,
+        artifacts_root=runtime.artifacts_root,
+        sandbox_root=runtime.sandbox_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
+        model_provider=runtime.model_provider,
+        on_driver_handle=runtime.on_driver_handle,
+    )
+
+
+def _node_arena_race(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    raw_roles = params.get("candidate_roles")
+    candidate_roles = (
+        [str(item) for item in raw_roles if str(item).strip()]
+        if isinstance(raw_roles, list)
+        else None
+    )
+    raw_base_ref = params.get("base_ref")
+    base_ref = str(raw_base_ref) if isinstance(raw_base_ref, str) else None
+    try:
+        return _arena_stage(runtime).arena_race(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            state=state,
+            constraints=list(state.get("constraints", [])),
+            scope_paths=list(state.get("scope_paths", [])),
+            node_name=str(params.get("_node_name") or "arena_race"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            num_candidates=int(params.get("num_candidates", 2)),
+            candidate_roles=candidate_roles,
+            base_ref=base_ref,
+            strict_scope=bool(params.get("strict_scope", True)),
+            max_steps=int(
+                params.get("max_steps") or runtime.worker_max_steps or runtime.max_steps
+            ),
+            verify_timeout_s=int(params.get("verify_timeout_s", 120)),
+            max_graft_items=int(params.get("max_graft_items", 2)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
 _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any]]] = {
     "intake_triage": _node_intake,
     "align_goal": _node_align,
@@ -693,6 +743,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any
     "hygiene_pass": _node_hygiene_pass,
     "interrogate_review": _node_interrogate_review,
     "verify_surface": _node_verify_surface,
+    "arena_race": _node_arena_race,
 }
 
 
@@ -743,6 +794,7 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
             "hygiene_pass",
             "interrogate_review",
             "verify_surface",
+            "arena_race",
         ):
             params.setdefault("_node_name", node_def.name)
             if node_def.role is not None:

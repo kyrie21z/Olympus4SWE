@@ -7,6 +7,7 @@ Everything here is vendor-neutral: a provider is an ordered pool of
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,11 +122,12 @@ def apply_url_rewrites(raw_url: str, rewrites: Mapping[str, str]) -> str:
 
 
 class CredentialPool:
-    """Ordered endpoints with a sticky active index shared across calls."""
+    """Ordered endpoints with a thread-safe sticky active index shared across calls."""
 
     def __init__(self, endpoints: Sequence[EndpointTarget]) -> None:
         self._endpoints = tuple(endpoints)
         self._active_index = 0
+        self._lock = threading.Lock()
 
     @property
     def endpoints(self) -> tuple[EndpointTarget, ...]:
@@ -133,20 +135,45 @@ class CredentialPool:
 
     @property
     def active_index(self) -> int:
-        return self._active_index
+        with self._lock:
+            return self._active_index
 
     @property
     def active(self) -> EndpointTarget | None:
-        if 0 <= self._active_index < len(self._endpoints):
-            return self._endpoints[self._active_index]
-        return None
+        with self._lock:
+            if 0 <= self._active_index < len(self._endpoints):
+                return self._endpoints[self._active_index]
+            return None
+
+    def active_with_index(self) -> tuple[int, EndpointTarget | None]:
+        """Atomically read the current active index and its endpoint."""
+        with self._lock:
+            idx = self._active_index
+            if 0 <= idx < len(self._endpoints):
+                return idx, self._endpoints[idx]
+            return idx, None
 
     def advance(self) -> bool:
         """Move to the next endpoint; return False when the pool is exhausted."""
-        if self._active_index + 1 < len(self._endpoints):
-            self._active_index += 1
-            return True
-        return False
+        with self._lock:
+            if self._active_index + 1 < len(self._endpoints):
+                self._active_index += 1
+                return True
+            return False
+
+    def advance_from(self, failed_index: int) -> bool:
+        """Compare-and-advance failover: advance only if ``failed_index`` is still active.
+
+        If another thread already advanced past ``failed_index``, do not skip the newly
+        selected endpoint; return True so the caller retries on the new active endpoint.
+        """
+        with self._lock:
+            if self._active_index != failed_index:
+                return 0 <= self._active_index < len(self._endpoints)
+            if self._active_index + 1 < len(self._endpoints):
+                self._active_index += 1
+                return True
+            return False
 
     def should_failover(self, exc: HttpStatusError) -> bool:
         """Return True when a failure looks like credential or quota exhaustion."""
@@ -214,7 +241,7 @@ class PooledProvider:
             )
         effective_timeout = self.timeout if timeout is None else timeout
         while True:
-            endpoint = self.pool.active
+            attempt_index, endpoint = self.pool.active_with_index()
             if endpoint is None:
                 raise ProviderError("All configured provider endpoints are exhausted.")
             try:
@@ -229,5 +256,5 @@ class PooledProvider:
                     stream=stream,
                 )
             except HttpStatusError as exc:
-                if not self.pool.should_failover(exc) or not self.pool.advance():
+                if not self.pool.should_failover(exc) or not self.pool.advance_from(attempt_index):
                     raise

@@ -175,6 +175,7 @@ def test_all_builtin_workflows_load_and_describe() -> None:
         "full_sdlc_tdd",
         "repo_fast_patch",
         "pstack_craft",
+        "pstack_arena",
     }
 
     blueprint = load_workflow("product_blueprint")

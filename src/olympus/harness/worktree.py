@@ -107,20 +107,29 @@ def _safe_label(label: str) -> str:
 
 def _open_retained_sandbox(root: Path, sandbox_dir: Path) -> SandboxHandle | None:
     if is_git_repo(root):
-        if not is_git_repo(sandbox_dir):
-            return None
-        probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
-        saved = load_sandbox_baseline(probe)
-        if saved is not None and saved.base_commit is not None:
-            base_commit = saved.base_commit
-        else:
-            head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
-            if head_proc.returncode != 0:
-                return None
-            base_commit = head_proc.stdout.strip()
-        return SandboxHandle(
-            root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
-        )
+        # A genuine git worktree created by ``git worktree add`` always has its own ``.git`` entry
+        # inside ``sandbox_dir`` (preventing parent-repo walk-up on copied sandboxes under
+        # ``root/.olympus/sandboxes``).
+        if (sandbox_dir / ".git").exists() and is_git_repo(sandbox_dir):
+            probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
+            saved = load_sandbox_baseline(probe)
+            if saved is not None and saved.base_commit is not None:
+                base_commit = saved.base_commit
+            else:
+                head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
+                if head_proc.returncode != 0:
+                    return None
+                base_commit = head_proc.stdout.strip()
+            return SandboxHandle(
+                root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
+            )
+        # Copied sandboxes (e.g. unborn-HEAD git repos or frozen snapshot copies) carry a saved
+        # baseline with ``base_commit=None`` and no ``.git`` inside ``sandbox_dir``.
+        copy_probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
+        saved_copy = load_sandbox_baseline(copy_probe)
+        if saved_copy is not None and saved_copy.base_commit is None:
+            return copy_probe
+        return None
     return SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
 
 
@@ -130,6 +139,8 @@ def create_sandbox(
     label: str,
     reuse: bool = False,
     sandbox_root: Path | str | None = None,
+    base_ref: str | None = None,
+    force_copy: bool = False,
 ) -> SandboxHandle:
     """Create an isolated git worktree when inside a git repo, else copy workspace.
 
@@ -137,6 +148,10 @@ def create_sandbox(
     attempt keeps every uncommitted file from its previous turn. ``sandbox_root``
     keeps sandbox worktrees (and their baselines/tmp dirs) outside the target
     repository so headless sessions never pollute the repo with ``.olympus``.
+    When ``base_ref`` is provided, creation fails closed if ``repo_root`` is not a
+    git repository, ``base_ref`` cannot be resolved to a commit, or ``git worktree
+    add`` fails. When ``force_copy=True``, git worktree lookup is bypassed entirely
+    and ``repo_root`` is copied directly (used for frozen unborn-HEAD snapshots).
     """
     root = Path(repo_root).resolve()
     safe_label = _safe_label(label)
@@ -145,48 +160,92 @@ def create_sandbox(
         if sandbox_root is not None
         else root / ".olympus" / "sandboxes" / safe_label
     )
+    explicit_ref = base_ref.strip() if base_ref is not None and base_ref.strip() else None
+    if force_copy and explicit_ref is not None:
+        raise ValueError("force_copy=True cannot be combined with an explicit base_ref")
+    git_repo = False if force_copy else is_git_repo(root)
+    if explicit_ref is not None and not git_repo:
+        raise ValueError(
+            f"Explicit base_ref {explicit_ref!r} cannot be resolved because "
+            f"{root} is not a git repository"
+        )
+
     if sandbox_dir.exists():
         if reuse:
             retained = _open_retained_sandbox(root, sandbox_dir)
             if retained is not None:
                 return retained
-        remove_sandbox(SandboxHandle(root, sandbox_dir, None, is_git_repo(root)))
+        remove_sandbox(SandboxHandle(root, sandbox_dir, None, git_repo))
 
-    if is_git_repo(root):
-        head_proc = _run_git(root, "rev-parse", "HEAD")
+    if git_repo:
+        target_ref = explicit_ref or "HEAD"
+        rev_arg = f"{target_ref}^{{commit}}" if explicit_ref is not None else "HEAD"
+        head_proc = _run_git(root, "rev-parse", "--verify", rev_arg)
         if head_proc.returncode == 0:
             base_commit = head_proc.stdout.strip()
             sandbox_dir.parent.mkdir(parents=True, exist_ok=True)
-            add_proc = _run_git(
-                root,
-                "worktree",
-                "add",
-                "--detach",
-                str(sandbox_dir),
-                base_commit,
-            )
-            if add_proc.returncode == 0:
-                return SandboxHandle(
-                    repo_root=root,
-                    workspace_path=sandbox_dir,
-                    base_commit=base_commit,
-                    is_git_worktree=True,
+            try:
+                add_proc = _run_git(
+                    root,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(sandbox_dir),
+                    base_commit,
                 )
+                if add_proc.returncode == 0:
+                    return SandboxHandle(
+                        repo_root=root,
+                        workspace_path=sandbox_dir,
+                        base_commit=base_commit,
+                        is_git_worktree=True,
+                    )
+            except BaseException:
+                _cleanup_partial_sandbox(root, sandbox_dir, is_git_worktree=True)
+                raise
+            _cleanup_partial_sandbox(root, sandbox_dir, is_git_worktree=True)
+            if explicit_ref is not None:
+                detail = (add_proc.stderr or add_proc.stdout).strip() or "git worktree add failed"
+                raise RuntimeError(
+                    f"Failed to create git worktree at base_ref {explicit_ref!r}: {detail}"
+                )
+        elif explicit_ref is not None:
+            detail = (
+                (head_proc.stderr or head_proc.stdout).strip()
+                or f"unknown ref {explicit_ref!r}"
+            )
+            raise ValueError(f"Invalid base_ref {explicit_ref!r}: {detail}")
 
-    # Fallback for uninitialized or unborn-HEAD repos
+    # Fallback for uninitialized, unborn-HEAD, or force_copy frozen snapshot directories.
     sandbox_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
-        root,
-        sandbox_dir,
-        symlinks=True,
-        ignore=shutil.ignore_patterns(".git", ".venv", ".olympus", "__pycache__"),
-    )
-    return SandboxHandle(
-        repo_root=root,
-        workspace_path=sandbox_dir,
-        base_commit=None,
-        is_git_worktree=False,
-    )
+    try:
+        shutil.copytree(
+            root,
+            sandbox_dir,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".venv", ".olympus", "__pycache__"),
+        )
+        return SandboxHandle(
+            repo_root=root,
+            workspace_path=sandbox_dir,
+            base_commit=None,
+            is_git_worktree=False,
+        )
+    except BaseException:
+        _cleanup_partial_sandbox(root, sandbox_dir, is_git_worktree=False)
+        raise
+
+
+def _cleanup_partial_sandbox(root: Path, sandbox_dir: Path, *, is_git_worktree: bool) -> None:
+    """Best-effort cleanup if sandbox creation fails or is interrupted midway."""
+    if is_git_worktree and is_git_repo(root):
+        rm_proc = _run_git(root, "worktree", "remove", "--force", str(sandbox_dir))
+        if rm_proc.returncode != 0:
+            _run_git(root, "worktree", "remove", "--force", "--force", str(sandbox_dir))
+    if sandbox_dir.exists():
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+    if is_git_worktree and is_git_repo(root):
+        _run_git(root, "worktree", "prune")
 
 
 def save_sandbox_baseline(handle: SandboxHandle, baseline: SandboxBaseline) -> None:
@@ -891,14 +950,121 @@ def absorb_verification_artifacts(
     return replace(baseline, entries=tuple(sorted(merged.items())))
 
 
-def remove_sandbox(handle: SandboxHandle) -> None:
-    """Clean up a worktree or copied sandbox directory plus its temp dir and baseline."""
-    if handle.is_git_worktree and is_git_repo(handle.repo_root):
-        _run_git(handle.repo_root, "worktree", "remove", "--force", str(handle.workspace_path))
+def _is_registered_worktree(
+    repo_root: Path,
+    workspace_path: Path,
+    *,
+    strict: bool = False,
+) -> bool:
+    """Return True if ``workspace_path`` is still registered in ``git worktree list``.
+
+    When ``strict=True``, a non-zero exit from ``git worktree list --porcelain`` raises
+    ``RuntimeError`` instead of silently reporting unregistered.
+    """
+    proc = _run_git(repo_root, "worktree", "list", "--porcelain")
+    if proc.returncode != 0:
+        if strict:
+            detail = (proc.stderr or proc.stdout).strip() or "git worktree list failed"
+            raise RuntimeError(
+                f"git worktree list --porcelain failed (exit={proc.returncode}): {detail}"
+            )
+        return False
+    target = workspace_path.resolve(strict=False)
+    for line in proc.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = Path(line.removeprefix("worktree ").strip()).resolve(strict=False)
+        if listed == target:
+            return True
+    return False
+
+
+def remove_sandbox(handle: SandboxHandle, *, strict: bool = False) -> None:
+    """Clean up a worktree or copied sandbox directory plus its temp dir and baseline.
+
+    When ``strict=True``, verify that both the sandbox directory and any git worktree
+    registration are completely removed, attempting ``git worktree prune`` if needed,
+    and raise ``RuntimeError`` instead of silently swallowing failures or verification
+    errors from ``git worktree list``.
+    """
+    errors: list[str] = []
+    probe_proc = _run_git(handle.repo_root, "rev-parse", "--is-inside-work-tree")
+    git_host = probe_proc.returncode == 0
+    git_probe_error: str | None = None
+    if strict and handle.is_git_worktree and not git_host:
+        detail = (probe_proc.stderr or probe_proc.stdout).strip() or "git repo probe failed"
+        git_probe_error = (
+            f"git rev-parse --is-inside-work-tree failed (exit={probe_proc.returncode}): {detail}"
+        )
+    git_rm_failed = False
+    if handle.is_git_worktree and git_host:
+        rm_proc = _run_git(
+            handle.repo_root, "worktree", "remove", "--force", str(handle.workspace_path)
+        )
+        if rm_proc.returncode != 0:
+            rm_proc = _run_git(
+                handle.repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                str(handle.workspace_path),
+            )
+        if rm_proc.returncode != 0:
+            git_rm_failed = True
+            detail = (rm_proc.stderr or rm_proc.stdout).strip()
+            if detail:
+                errors.append(f"git worktree remove exit={rm_proc.returncode}: {detail}")
     if handle.workspace_path.exists():
-        shutil.rmtree(handle.workspace_path, ignore_errors=True)
+        if strict:
+            try:
+                shutil.rmtree(handle.workspace_path)
+            except OSError as exc:
+                errors.append(f"rmtree({handle.workspace_path}): {exc}")
+        else:
+            shutil.rmtree(handle.workspace_path, ignore_errors=True)
+    if git_host and (
+        git_rm_failed or _is_registered_worktree(handle.repo_root, handle.workspace_path)
+    ):
+        prune_proc = _run_git(handle.repo_root, "worktree", "prune")
+        if prune_proc.returncode != 0:
+            detail = (prune_proc.stderr or prune_proc.stdout).strip()
+            if detail:
+                errors.append(f"git worktree prune exit={prune_proc.returncode}: {detail}")
     shutil.rmtree(handle.tmp_dir, ignore_errors=True)
     handle.baseline_path.unlink(missing_ok=True)
+    if strict:
+        still_exists = handle.workspace_path.exists()
+        still_registered = False
+        verify_error: str | None = None
+        if git_host:
+            try:
+                still_registered = _is_registered_worktree(
+                    handle.repo_root,
+                    handle.workspace_path,
+                    strict=True,
+                )
+            except RuntimeError as exc:
+                verify_error = str(exc)
+        if (
+            still_exists
+            or still_registered
+            or verify_error is not None
+            or git_probe_error is not None
+        ):
+            reasons: list[str] = []
+            if still_exists:
+                reasons.append(f"directory still exists: {handle.workspace_path}")
+            if still_registered:
+                reasons.append(f"still registered in git worktree list: {handle.workspace_path}")
+            if git_probe_error is not None:
+                reasons.append(git_probe_error)
+            if verify_error is not None:
+                reasons.append(verify_error)
+            reasons.extend(errors)
+            raise RuntimeError(
+                f"Failed to remove sandbox {handle.workspace_path}: " + "; ".join(reasons)
+            )
 
 
 def remove_run_sandboxes(

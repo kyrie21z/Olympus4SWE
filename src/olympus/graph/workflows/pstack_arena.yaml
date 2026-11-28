@@ -1,0 +1,66 @@
+name: pstack_arena
+description: >-
+  Multi-worktree competitive arena workflow distilled from t3-pstack: read-only
+  evidence exploration, N >= 2 isolated parallel worktree candidates scored by
+  an independent cold-start Rubric Judge (Athena) with optional cross-candidate
+  grafting, diff hygiene (Hephaestus), and real-surface verification (Argus).
+family: pstack
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - contested architectural design or high-leverage refactor with multiple viable shapes
+  - cross-model or multi-strategy competition where upfront speculation underperforms
+  - structural changes that benefit from grafting the best ideas across competing implementations
+anti_patterns:
+  - trivial single-line patch or typo fix where multi-worktree cost is unjustified
+  - unknown-cause bug requiring failing reproduction before design competition
+  - vague greenfield product idea requiring upfront GoalSpec and DesignSpec approval gates
+stop_after: verify
+topology: arena_race
+nodes:
+  - name: explore
+    type: explore_reproduce
+    god: prometheus
+    phase: align
+    role: explorer
+    skill_refs:
+      - pstack/explore
+    params:
+      require_repro: false
+  - name: arena_race
+    type: arena_race
+    god: athena
+    phase: execute
+    role: arena_judge
+    skill_refs:
+      - pstack/arena
+    params:
+      num_candidates: 2
+      strict_scope: true
+      max_graft_items: 2
+  - name: hygiene
+    type: hygiene_pass
+    god: hephaestus
+    phase: execute
+    role: hygiene
+    skill_refs:
+      - pstack/hygiene
+  - name: verify_surface
+    type: verify_surface
+    god: argus
+    phase: verify
+    role: verifier
+    skill_refs:
+      - pstack/verify
+edges:
+  - source: START
+    target: explore
+  - source: explore
+    target: arena_race
+  - source: arena_race
+    target: hygiene
+  - source: hygiene
+    target: verify_surface
+  - source: verify_surface
+    target: END
+routers: []
+gates: {}

@@ -117,6 +117,19 @@ def test_builtin_workflows_keep_backward_compatible_manifests() -> None:
         assert summary.anti_patterns == []
         assert all(node.god is None and node.phase is None for node in summary.graph.nodes)
 
+    arena_def = load_workflow("pstack_arena")
+    arena_summary = WorkflowSummary.model_validate(describe_workflow(arena_def))
+    assert arena_summary.family == "pstack"
+    assert arena_summary.autonomy == "autonomous_hard_stops"
+    assert arena_summary.stop_after == "verify"
+    assert arena_summary.applicable_scenarios
+    assert arena_summary.anti_patterns
+    arena_nodes = {node.name: node for node in arena_summary.graph.nodes}
+    assert arena_nodes["explore"].god == "prometheus"
+    assert arena_nodes["arena_race"].god == "athena"
+    assert arena_nodes["hygiene"].god == "hephaestus"
+    assert arena_nodes["verify_surface"].god == "argus"
+
 
 def test_custom_workflow_manifest_and_node_metadata_round_trip() -> None:
     definition = _custom_pstack_definition()

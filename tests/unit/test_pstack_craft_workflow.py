@@ -1309,3 +1309,85 @@ def test_pstack_craft_cli_web_clarify_plan_only_and_blocked_recovery(
     assert started_entries == ["build"]
     assert monkeypatch_stage._active_review_cycle(rec_run, {}) == 0
 
+
+def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Assumptions & plan repair",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+    )
+
+    # 1. EvidenceBrief.assumptions must NOT pause explore_reproduce (unlike unresolved_questions).
+    brief_with_assumptions = EvidenceBrief(
+        summary="Ready with sensible defaults",
+        assumptions=["Preserve existing KeyError on missing key", "Preserve insertion order"],
+        unresolved_questions=[],
+        candidate_files=["app.py"],
+    ).model_dump_json()
+    stage_explore = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([brief_with_assumptions]),
+    )
+    explore_out = stage_explore.explore_reproduce(run_id=run_id, raw_input="Fix app.py")
+    assert explore_out["route"] == "ready"
+    assert len(explore_out["evidence_brief"]["assumptions"]) == 2
+
+    # 2. architect_sketch repairs invalid cd/python -c/grep verification_plan before build starts.
+    bad_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="A",
+        rationale="Direct is cleaner",
+        write_scope=["app.py"],
+        verification_plan=[
+            f"cd {repo} && python3 -m unittest test_app.py",
+            "python3 -c 'import app; assert app.add(1, 2) == 3'",
+            "grep -n 'def add' app.py",
+        ],
+    ).model_dump_json()
+    repaired_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="A",
+        rationale="Direct is cleaner",
+        write_scope=["app.py"],
+        verification_plan=[f"{sys.executable} -m unittest test_app.py"],
+    ).model_dump_json()
+    stage_arch = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([bad_sketch, repaired_sketch]),
+    )
+    arch_out = stage_arch.architect_sketch(run_id=run_id, raw_input="Fix app.py", state={})
+    assert arch_out["route"] == "ready"
+    assert arch_out["architect_sketch"]["verification_plan"] == [
+        f"{sys.executable} -m unittest test_app.py"
+    ]
+
+    # 3. If even repair yields zero allowlisted commands, architect_sketch pauses immediately.
+    stage_arch_bad = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([bad_sketch, bad_sketch]),
+    )
+    with pytest.raises(CraftPause, match="no allowlisted read-only commands"):
+        stage_arch_bad.architect_sketch(run_id=run_id, raw_input="Fix app.py", state={})
+
+

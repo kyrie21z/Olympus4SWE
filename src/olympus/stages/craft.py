@@ -152,6 +152,14 @@ class _SandboxIsolationUnavailableError(RuntimeError):
     """Raised when OS-level read-only FS isolation (bwrap) is required but unavailable."""
 _MAX_EXCERPT_CHARS = 1500
 _MAX_DIFF_PROMPT_CHARS = 24000
+_SANDBOXED_COMMAND_RULES = (
+    "Command execution contract (STRICT): commands execute directly from the sandbox repo root "
+    "with shell=False inside a read-only allowlist. Use ONLY direct test/lint/typecheck runners "
+    "such as `python -m unittest <test_file>`, `pytest -q`, `uv run pytest -q`, `ruff check .`, "
+    "`mypy src`, `npm test`, `pnpm test`, `go test ./...`, or `cargo test` with repo-relative "
+    "paths. NEVER use `cd`, `&&`, `;`, `|`, `>`, `python -c`, `grep`, mutating flags (`--fix`, "
+    "`-w`, `-o`), or absolute host workspace paths."
+)
 
 
 class CraftPause(Exception):
@@ -1095,6 +1103,28 @@ class CraftStage:
                     cycle = raw
         return cycle
 
+    def _partition_verification_plan(
+        self, commands: Sequence[str]
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Split verification_plan into allowlisted commands and rejected (cmd, reason) pairs."""
+        valid: list[str] = []
+        rejected: list[tuple[str, str]] = []
+        placeholder_sandbox = (self.sandbox_root or self.workspace_root.parent) / ".verify-plan"
+        for raw_cmd in commands:
+            cleaned = raw_cmd.strip()
+            if not cleaned:
+                continue
+            argv, issue = _parse_sandboxed_repro_argv(
+                cleaned,
+                host_root=self.workspace_root,
+                sandbox_root=placeholder_sandbox,
+            )
+            if issue is not None or argv is None:
+                rejected.append((cleaned, issue or "rejected by sandbox allowlist"))
+            else:
+                valid.append(cleaned)
+        return valid, rejected
+
     # ------------------------------------------------------------------ 6 orthogonal primitives
 
     def explore_reproduce(
@@ -1108,16 +1138,20 @@ class CraftStage:
         role: str = "explorer",
         skill_refs: Sequence[str] = (),
         require_repro: bool = False,
-        max_steps: int = 16,
+        max_steps: int = 8,
     ) -> dict[str, Any]:
         toolkit = WorkspaceToolkit(
             self.workspace_root, read_only=True, env_root=self.workspace_root
         )
         inventory = format_workspace_inventory(toolkit, scope_paths=scope_paths)
         system_prompt = _compose_system_prompt(
-            "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only and "
-            "return ONLY valid EvidenceBrief JSON conforming strictly to the schema. "
-            "Leave repro_verified=false (the deterministic control plane verifies repro commands).",
+            "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only "
+            "(batching file reads efficiently) and return ONLY valid EvidenceBrief JSON conforming "
+            "strictly to the schema. Leave repro_verified=false (the deterministic control plane "
+            "verifies repro commands). Record solvable engineering defaults, tie-breakers, and "
+            "environment notes in `assumptions` and keep `unresolved_questions` as `[]` unless "
+            "execution is genuinely blocked on an unresolvable product/intent decision.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         merged_constraints = [
@@ -1282,7 +1316,7 @@ class CraftStage:
         node_name: str = "architect",
         role: str = "architect",
         skill_refs: Sequence[str] = (),
-        max_steps: int = 16,
+        max_steps: int = 6,
     ) -> dict[str, Any]:
         brief = self._hydrate_model(run_id, state, "evidence_brief", EvidenceBrief)
         toolkit = WorkspaceToolkit(
@@ -1292,7 +1326,8 @@ class CraftStage:
         system_prompt = _compose_system_prompt(
             "You are Athena (Lightweight Architect). Compare at least two candidate shapes and "
             "return ONLY valid ArchitectSketch JSON with a tight write_scope and concrete "
-            "executable verification_plan commands.",
+            "verification_plan commands.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         brief_block = (
@@ -1321,6 +1356,50 @@ class CraftStage:
             max_steps=max_steps,
             trace_name="architect",
         )
+        valid_cmds, rejected_cmds = self._partition_verification_plan(sketch.verification_plan)
+        if rejected_cmds:
+            repair_details = "\n".join(
+                f"- {cmd!r}: {reason}" for cmd, reason in rejected_cmds
+            )
+            repair_prompt = (
+                f"{user_prompt}\n\n"
+                f"Previous ArchitectSketch JSON had invalid verification_plan commands that fail "
+                f"the deterministic read-only sandbox allowlist:\n{repair_details}\n\n"
+                f"Keep your chosen architecture and write_scope, and replace verification_plan "
+                f"with ONLY valid allowlisted commands (e.g. `python -m unittest <test_file>`, "
+                f"`pytest -q`, `ruff check .`). Return ONLY valid ArchitectSketch JSON."
+            )
+            try:
+                repaired, _ = self._run_structured(
+                    run_id=run_id,
+                    node_name=node_name,
+                    role=role,
+                    actor="athena:architect",
+                    workspace_path=self.workspace_root,
+                    system_prompt=system_prompt,
+                    user_prompt=repair_prompt,
+                    model_cls=ArchitectSketch,
+                    max_steps=3,
+                    trace_name="architect_repair",
+                )
+                repaired_valid, repaired_rejected = self._partition_verification_plan(
+                    repaired.verification_plan
+                )
+                if repaired_valid:
+                    sketch = repaired.model_copy(update={"verification_plan": repaired_valid})
+                    valid_cmds, rejected_cmds = repaired_valid, repaired_rejected
+            except Exception:  # noqa: BLE001 - fall back to any valid commands from initial sketch
+                pass
+            if not valid_cmds:
+                reasons = "; ".join(f"{cmd!r} ({reason})" for cmd, reason in rejected_cmds)
+                raise CraftPause(
+                    node_name,
+                    f"ArchitectSketch.verification_plan has no allowlisted read-only commands: "
+                    f"{reasons}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            sketch = sketch.model_copy(update={"verification_plan": valid_cmds})
         dumped = sketch.model_dump(mode="json")
         self._save_persisted(run_id, {"architect_sketch": dumped})
         self.store.append_event(
@@ -1349,7 +1428,7 @@ class CraftStage:
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
         max_diff_gate_retries: int = 2,
-        max_steps: int = 40,
+        max_steps: int = 24,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         if sketch is None:
@@ -1498,7 +1577,7 @@ class CraftStage:
         role: str = "hygiene",
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
-        max_steps: int = 16,
+        max_steps: int = 6,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         if sketch is None:
@@ -1517,7 +1596,8 @@ class CraftStage:
 
         system_prompt = _compose_system_prompt(
             "You are Hephaestus (Diff Hygiene Pass). Clean AI slop and redundant comments in "
-            "the current diff without changing runtime behavior or touching files outside scope.",
+            "the current diff without changing runtime behavior or touching files outside scope. "
+            "If the diff is already clean and concise, finish in 1 step with zero edits.",
             skill_refs,
         )
         user_prompt = (
@@ -1584,7 +1664,7 @@ class CraftStage:
         skill_refs: Sequence[str] = (),
         enable_thermo: bool = False,
         max_cycles: int = 3,
-        max_steps: int = 16,
+        max_steps: int = 8,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         handle, baseline = self._ensure_sandbox(run_id)
@@ -1598,9 +1678,12 @@ class CraftStage:
         )
         system_prompt = _compose_system_prompt(
             "You are Momus (Cold-Start Adversarial Interrogator). You have ZERO builder history. "
-            "Attempt to break this diff and return ONLY valid InterrogateReport JSON. "
-            "Every `important` finding MUST carry a runnable `repro_command` that fails (non-zero "
-            "exit) in the sandbox; unproven claims will be filtered out deterministically.",
+            "This turn is READ-ONLY (no shell tool): read the changed files at most once, do NOT "
+            "loop re-reading the same file, and return ONLY valid InterrogateReport JSON. "
+            "Every `important` finding MUST carry an allowlisted `repro_command` that fails "
+            "(non-zero exit) when the deterministic control plane runs it in the sandbox; unproven "
+            "claims will be filtered out deterministically.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         user_prompt = (
@@ -1904,7 +1987,7 @@ class CraftStage:
 
         passed = bool(checks) and all(item.status == "pass" for item in checks)
         failing_summary = "; ".join(
-            f"{c.surface}={c.status} (exit={c.exit_code})"
+            f"{c.surface} ({c.command})={c.status} (exit={c.exit_code})"
             for c in checks
             if c.status != "pass"
         )

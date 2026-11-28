@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -245,38 +246,63 @@ def _system_ro_mount_args() -> list[str]:
     return args
 
 
-def _collect_ancestor_symlinks(path: Path, *, max_hops: int = 32) -> list[tuple[Path, str]]:
-    """Expand symlinked components across multi-hop directory/file chains (shallowest first)."""
-    found: dict[Path, str] = {}
-    pending: list[Path] = [Path(os.path.abspath(str(path)))]
-    seen_paths: set[Path] = set()
+def _resolve_posix_namei(
+    raw_path: str | Path,
+    *,
+    max_hops: int = 64,
+) -> tuple[Path, list[tuple[Path, str]], list[Path], list[Path]]:
+    """Resolve ``raw_path`` component-by-component following Linux ``namei`` semantics.
+
+    Never collapses ``..`` before dereferencing preceding symlinks (so targets like
+    ``bridge/../second`` dereference ``bridge`` first, record ``bridge`` as a symlink,
+    record ``bridge``'s resolved target directory as a traversed directory for ``--dir``,
+    and only then step to ``..``).
+
+    Returns ``(final_resolved_path, symlinks, hop_parents, traversed_dirs)``.
+    """
+    text = str(raw_path)
+    if not text.startswith("/"):
+        text = str(Path.cwd() / text)
+    cur = Path("/")
+    queue: deque[str] = deque(part for part in text.split("/") if part)
+    symlinks: dict[Path, str] = {}
+    hop_parents: list[Path] = []
+    traversed_dirs: set[Path] = set()
     hops = 0
-    while pending and hops < max_hops:
-        target_path = pending.pop(0)
-        if target_path in seen_paths:
+
+    while queue:
+        part = queue.popleft()
+        if part == ".":
             continue
-        seen_paths.add(target_path)
-        cur = Path("/")
-        for part in target_path.parts[1:]:
-            cur = cur / part
-            if cur.is_symlink():
-                raw = os.readlink(cur)
-                if cur not in found:
-                    found[cur] = raw
-                    hops += 1
-                    if hops >= max_hops:
-                        break
-                nxt = Path(raw) if os.path.isabs(raw) else (cur.parent / raw)
-                nxt_abs = Path(os.path.abspath(str(nxt)))
-                if nxt_abs not in seen_paths:
-                    pending.append(nxt_abs)
-                rest = target_path.relative_to(cur)
-                if rest != Path("."):
-                    combined = Path(os.path.abspath(str(nxt_abs / rest)))
-                    if combined not in seen_paths:
-                        pending.append(combined)
+        if part == "..":
+            if cur != Path("/"):
+                traversed_dirs.add(cur)
+                cur = cur.parent
+            continue
+        nxt = cur / part
+        if os.path.islink(nxt):
+            raw_target = os.readlink(nxt)
+            symlinks.setdefault(nxt, raw_target)
+            if not queue:
+                # Leaf symlink (e.g. venv/bin/python) lives inside cur; mount cur's prefix.
+                hop_parents.append(cur)
+            hops += 1
+            if hops > max_hops:
                 break
-    return sorted(found.items(), key=lambda item: len(item[0].parts))
+            target_parts = [p for p in raw_target.split("/") if p]
+            if raw_target.startswith("/"):
+                cur = Path("/")
+            for tpart in reversed(target_parts):
+                queue.appendleft(tpart)
+            continue
+        cur = nxt
+
+    return (
+        cur,
+        sorted(symlinks.items(), key=lambda item: len(item[0].parts)),
+        hop_parents,
+        sorted(traversed_dirs, key=lambda item: len(item.parts)),
+    )
 
 
 def _minimal_bwrap_mount_args(
@@ -285,59 +311,60 @@ def _minimal_bwrap_mount_args(
     cwd_resolved: Path,
     metric_tmp: Path,
 ) -> list[str]:
-    """Build minimal read-only system + symlink-resolved Python/toolchain bwrap mount args.
+    """Build minimal read-only system + POSIX ``namei`` symlink-resolved bwrap mount args.
 
-    Walks every hop of symlink chains for ``argv[0]`` and ``sys.executable`` as well as
-    ``sys.prefix`` / ``sys.base_prefix`` (including both unresolved and resolved install
-    prefixes such as ``<prefix>/bin`` + ``<prefix>/lib``) without exposing ``/`` or host home.
+    Resolves ``argv[0]``, ``sys.executable``, ``sys.prefix``, and ``sys.base_prefix``
+    component-by-component without pre-collapsing ``..`` so multi-hop and relative
+    ``bridge/../second`` symlink chains mount every hop cleanly without exposing ``/``
+    or host home.
     """
     symlinks: dict[Path, str] = {}
     ro_dirs: list[Path] = []
     seen_dirs: set[Path] = set()
+    traversed_dirs: set[Path] = set()
 
-    def _add_ro_dir(candidate: Path) -> None:
-        if not (candidate.exists() or candidate.is_symlink()):
+    def _add_real_ro_dir(real_dir: Path) -> None:
+        if not real_dir.exists() or real_dir.is_symlink():
             return
-        norm = Path(os.path.abspath(str(candidate)))
-        for anc_link, anc_target in _collect_ancestor_symlinks(norm):
-            symlinks.setdefault(anc_link, anc_target)
-        resolved = norm.resolve(strict=False)
-        if not resolved.exists():
+        if not _is_safe_ro_prefix(real_dir, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp):
             return
-        if not _is_safe_ro_prefix(resolved, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp):
-            return
-        if resolved not in seen_dirs:
-            seen_dirs.add(resolved)
-            ro_dirs.append(resolved)
+        if real_dir not in seen_dirs:
+            seen_dirs.add(real_dir)
+            ro_dirs.append(real_dir)
 
-    def _walk_executable_chain(exe: Path) -> None:
-        cur = Path(os.path.abspath(str(exe)))
-        visited: set[Path] = set()
-        for _ in range(16):
-            if cur in visited or not (cur.exists() or cur.is_symlink()):
-                break
-            visited.add(cur)
-            _add_ro_dir(cur.parent)
-            if cur.parent.name in {"bin", "Scripts"}:
-                _add_ro_dir(cur.parent.parent)
-            if not cur.is_symlink():
-                break
-            raw_target = os.readlink(cur)
-            nxt = Path(raw_target) if os.path.isabs(raw_target) else (cur.parent / raw_target)
-            cur = Path(os.path.abspath(str(nxt)))
+    def _trace_dir(dir_path: Path) -> None:
+        if not (dir_path.exists() or dir_path.is_symlink()):
+            return
+        final_dir, links, _hop_parents, tdirs = _resolve_posix_namei(dir_path)
+        for link_p, target in links:
+            symlinks.setdefault(link_p, target)
+        traversed_dirs.update(tdirs)
+        _add_real_ro_dir(final_dir)
+
+    def _trace_executable(exe_path: Path) -> None:
+        if not (exe_path.exists() or exe_path.is_symlink()):
+            return
+        final_exe, links, hop_parents, tdirs = _resolve_posix_namei(exe_path)
+        for link_p, target in links:
+            symlinks.setdefault(link_p, target)
+        traversed_dirs.update(tdirs)
+        for parent_dir in (*hop_parents, final_exe.parent):
+            _add_real_ro_dir(parent_dir)
+            if parent_dir.name in {"bin", "Scripts"}:
+                _add_real_ro_dir(parent_dir.parent)
 
     for prefix in (sys.prefix, sys.base_prefix):
         if prefix:
-            _add_ro_dir(Path(prefix))
+            _trace_dir(Path(prefix))
 
-    _walk_executable_chain(Path(sys.executable))
+    _trace_executable(Path(sys.executable))
     if argv:
         bin_path = Path(argv[0])
         if bin_path.is_absolute():
-            _walk_executable_chain(bin_path)
+            _trace_executable(bin_path)
 
     args: list[str] = _system_ro_mount_args()
-    # Emit real directory ro-binds first (skipping already-covered subdirs), then symlinks.
+    # Emit real directory ro-binds first (skipping already-covered subdirs).
     system_dirs = {
         Path(raw).resolve(strict=False)
         for raw in _MINIMAL_SYSTEM_RO_MOUNTS
@@ -349,6 +376,16 @@ def _minimal_bwrap_mount_args(
             continue
         args.extend(["--ro-bind", str(ro_dir), str(ro_dir)])
         mounted_dirs.append(ro_dir)
+    # Create empty stub dirs for directories traversed solely to step up via ``..``
+    # (e.g. bridge -> other/sub followed by ..) without exposing any host files inside them.
+    for tdir in sorted(traversed_dirs, key=lambda item: len(item.parts)):
+        if tdir == Path("/") or any(
+            tdir == existing or tdir.is_relative_to(existing) for existing in mounted_dirs
+        ):
+            continue
+        if tdir in symlinks:
+            continue
+        args.extend(["--dir", str(tdir)])
     system_links = {Path(raw) for raw in _MINIMAL_SYSTEM_RO_MOUNTS}
     for link_path, target in sorted(symlinks.items(), key=lambda item: len(item[0].parts)):
         if link_path in system_links or any(
@@ -2005,6 +2042,11 @@ class HillclimbStage:
                 ) from exc
 
             last_kept_sha = _git_head_sha(handle.workspace_path)
+            # Snapshot exact host write_scope modes+hashes BEFORE baseline metric execution so
+            # local host chmod/edits during baseline measurement are caught on promotion.
+            host_baseline_fingerprints = snapshot_host_write_scope(
+                self.workspace_root, cfg.write_scope, cfg.frozen_harness_paths
+            )
 
             # 2. Measure baseline metric inside the isolated worktree (fail closed).
             measured_base, base_err, _base_output = self._measure_metric(
@@ -2031,9 +2073,6 @@ class HillclimbStage:
                 )
             baseline_metric = measured_base
 
-            host_baseline_fingerprints = snapshot_host_write_scope(
-                self.workspace_root, cfg.write_scope, cfg.frozen_harness_paths
-            )
             self.store.append_event(
                 run_id=run_id,
                 stage="hillclimb",

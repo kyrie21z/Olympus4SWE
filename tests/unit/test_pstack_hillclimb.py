@@ -878,15 +878,18 @@ def test_bwrap_mounts_multi_hop_symlinked_interpreter_prefixes_and_hides_host_pi
         encoding="utf-8",
     )
 
-    # Simulate a venv python symlink traversing a TWO-HOP directory symlink chain
-    # (ext_alias_a -> ext_alias_b -> ext_real_py), mirroring nested uv/toolcache layouts.
-    real_py_prefix = tmp_path / "ext_real_py"
-    (real_py_prefix / "bin").mkdir(parents=True)
-    os.symlink(sys.executable, real_py_prefix / "bin" / "python3")
-    alias_py_b = tmp_path / "ext_alias_b"
-    os.symlink(real_py_prefix, alias_py_b)
+    # Simulate a venv python symlink traversing a relative ``bridge/../second`` symlink chain
+    # (ext_alias_a -> bridge/../second where bridge -> other_root/sub), which os.path.abspath()
+    # would wrongly collapse before dereferencing ``bridge``.
+    other_root = tmp_path / "other_root"
+    (other_root / "sub").mkdir(parents=True)
+    second_py_prefix = other_root / "second"
+    (second_py_prefix / "bin").mkdir(parents=True)
+    os.symlink(sys.executable, second_py_prefix / "bin" / "python3")
+    bridge_link = tmp_path / "bridge"
+    os.symlink(other_root / "sub", bridge_link)
     alias_py_a = tmp_path / "ext_alias_a"
-    os.symlink(alias_py_b, alias_py_a)
+    os.symlink("bridge/../second", alias_py_a)
     venv_prefix = tmp_path / "ext_venv"
     (venv_prefix / "bin").mkdir(parents=True)
     venv_python = venv_prefix / "bin" / "python"
@@ -927,7 +930,7 @@ def test_pre_execution_tamper_short_circuits_without_running_metric_and_unsandbo
         del timeout_s
         metric_invocations.append(cmd)
         proc = subprocess.run(
-            [sys.executable, "bench.py"],
+            [sys.executable, "-B", "bench.py"],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -1775,6 +1778,54 @@ def test_latest_argus_gate_host_mode_drift_and_session_start_explicit_override(
     with pytest.raises(HillclimbPause, match="host workspace drifted"):
         stage_dirty.verify_surface(run_id=run_dirty, state=res_dirty, apply_to_workspace=True)
     assert (repo_dirty / "solver.py").read_text(encoding="utf-8") == pre_dirty_content
+
+    # 2c. Local host chmod 0o600 DURING baseline _measure_metric MUST also be caught!
+    repo_mid = tmp_path / "repo_mid_chmod"
+    _init_opt_repo(repo_mid)
+    run_mid = store.create_run(
+        title="Baseline chmod race",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_mid,
+    )
+    chmod_fired = False
+
+    def _chmod_during_baseline(
+        cmd: str, *, cwd: Path, timeout_s: int = 60
+    ) -> tuple[int | None, str]:
+        nonlocal chmod_fired
+        del cmd, timeout_s
+        if not chmod_fired:
+            chmod_fired = True
+            os.chmod(repo_mid / "solver.py", 0o600)
+        proc = subprocess.run(
+            [sys.executable, "-B", "bench.py"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    stage_mid = HillclimbStage(
+        store=store,
+        workspace_root=repo_mid,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_mid",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_ok_worker)}),
+        command_runner=_chmod_during_baseline,
+    )
+    res_mid = stage_mid.hillclimb_loop(
+        run_id=run_mid,
+        raw_input="Opt",
+        config=_base_config(direction="minimize", max_iterations=1),
+    )
+    assert chmod_fired
+    with pytest.raises(HillclimbPause, match="host workspace drifted"):
+        stage_mid.verify_surface(run_id=run_mid, state=res_mid, apply_to_workspace=True)
+    assert stat.S_IMODE((repo_mid / "solver.py").stat().st_mode) == 0o600
 
     # 3. SessionRunner.start(..., hillclimb_config=explicit_cfg) overrides SessionConfig default
     # consistently for both the initial run and a resumed SessionRunner!

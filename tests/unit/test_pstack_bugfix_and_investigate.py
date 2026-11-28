@@ -210,6 +210,7 @@ def test_all_six_builtin_workflows_have_complete_non_overlapping_manifests() -> 
         "pstack_arena": ("pstack", "autonomous_hard_stops", "verify"),
         "pstack_bugfix": ("pstack", "autonomous_hard_stops", "verify"),
         "investigate": ("pstack", "autonomous_hard_stops", "report"),
+        "pstack_hillclimb": ("pstack", "autonomous_hard_stops", "verify"),
     }
     assert set(list_builtin_workflows()) == set(expected)
 

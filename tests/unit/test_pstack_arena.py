@@ -1601,3 +1601,365 @@ def test_arena_verdict_rejects_duplicate_stripped_criteria_and_excess_grafts(
     assert _git_worktree_paths(repo) == [repo.resolve()]
 
 
+# ---------------------------------------------------------------------- 8. Round-2 edge fixes
+
+
+def test_arena_graft_patch_write_failure_and_dir_mode_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 #1: grafted.patch write failure leaves craft untouched; directory mode restored."""
+    import os
+    import stat
+
+    from olympus.harness.worktree import SandboxHandle, snapshot_sandbox_state
+    from olympus.stages import arena as arena_mod
+
+    # Sub-case A: grafted.patch write fails -> craft sandbox keeps pristine winner code.
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena grafted.patch write failure",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    sandbox_root = tmp_path / "sandboxes"
+    artifacts_root = tmp_path / "artifacts"
+    winner_code = "def compute(x: int, y: int) -> int:\n    return x + y\n"
+    graft_code = "def compute(x: int, y: int) -> int:\n    return int(x) + int(y)\n"
+
+    # Pre-create grafted.patch as a directory so write_text raises IsADirectoryError (OSError).
+    (artifacts_root / run_id / "arena" / "grafted.patch").mkdir(parents=True, exist_ok=True)
+
+    def worker(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:arena_graft":
+            (req.workspace_path / "calc.py").write_text(graft_code, encoding="utf-8")
+            return "grafted"
+        (req.workspace_path / "calc.py").write_text(winner_code, encoding="utf-8")
+        return "built"
+
+    def judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.5, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 9.5},
+            },
+            graft_items=[
+                ArenaGraftItem(
+                    source_candidate_id="cand_2",
+                    idea="Coerce inputs with int().",
+                    target_files=["calc.py"],
+                )
+            ],
+            convergence_mode="winner_plus_graft",
+            rationale="cand_1 wins with int() graft.",
+        ).model_dump_json()
+
+    stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=artifacts_root,
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker),
+                "judge": _ScriptedDriver("judge", judge),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="Failed to persist grafted.patch"):
+        stage.arena_race(
+            run_id=run_id,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert (sandbox_root / f"{run_id}-craft" / "calc.py").read_text(
+        encoding="utf-8"
+    ) == winner_code
+    assert not (sandbox_root / f"{run_id}-arena-graft").exists()
+
+    # Sub-case B: _mirror_sandbox_changes deletes a file inside a 0o700 dir, then hits OSError
+    # on a later copy -> removed 0o700 dir and deleted file are restored with exact mode 0o700.
+    base_dir = tmp_path / "base_ws"
+    src_dir = tmp_path / "src_ws"
+    dst_dir = tmp_path / "dst_ws"
+    for d in (base_dir, src_dir, dst_dir):
+        d.mkdir()
+        (d / "keep.py").write_text("v0\n", encoding="utf-8")
+    base_handle = SandboxHandle(base_dir, base_dir, None, False)
+    base_baseline = snapshot_sandbox_state(base_handle)
+
+    secret_dir = dst_dir / "private_dir"
+    secret_dir.mkdir(mode=0o700)
+    os.chmod(secret_dir, 0o700)
+    old_file = secret_dir / "old.py"
+    old_file.write_text("winner-only\n", encoding="utf-8")
+    os.chmod(old_file, 0o600)
+
+    # Source removes private_dir/old.py and updates keep.py; inject OSError on copy2(keep.py).
+    (src_dir / "keep.py").write_text("v1-graft\n", encoding="utf-8")
+
+    def boom_copy2(_src: Any, _dst: Any) -> None:
+        raise OSError("disk full during mirror")
+
+    monkeypatch.setattr(arena_mod.shutil, "copy2", boom_copy2)
+    with pytest.raises(CraftPause, match="rolled back"):
+        arena_mod._mirror_sandbox_changes(
+            source_handle=SandboxHandle(base_dir, src_dir, None, False),
+            target_handle=SandboxHandle(base_dir, dst_dir, None, False),
+            base_baseline=base_baseline,
+            allowed_write_scope=["private_dir/old.py", "keep.py"],
+            forbidden_globs=[],
+            node_name="arena_race",
+        )
+    assert secret_dir.is_dir()
+    assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
+    assert old_file.read_text(encoding="utf-8") == "winner-only\n"
+    assert stat.S_IMODE(old_file.stat().st_mode) == 0o600
+    assert (dst_dir / "keep.py").read_text(encoding="utf-8") == "v0\n"
+
+
+def test_strict_remove_sandbox_fails_when_git_worktree_list_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 #2: non-zero exit from git worktree list --porcelain must fail strict cleanup."""
+    from olympus.harness import worktree as wt_mod
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    handle = wt_mod.create_sandbox(
+        repo,
+        label="strict-verify-test",
+        reuse=False,
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    real_run_git = wt_mod._run_git
+
+    def failing_list_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("worktree", "list"):
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                returncode=128,
+                stdout="",
+                stderr="fatal: unable to read worktree registry",
+            )
+        return real_run_git(cwd, *args)
+
+    monkeypatch.setattr(wt_mod, "_run_git", failing_list_git)
+    with pytest.raises(RuntimeError, match="git worktree list --porcelain failed \\(exit=128\\)"):
+        wt_mod.remove_sandbox(handle, strict=True)
+
+    # Also verify locked worktree is cleaned cleanly via double --force.
+    monkeypatch.setattr(wt_mod, "_run_git", real_run_git)
+    locked_handle = wt_mod.create_sandbox(
+        repo,
+        label="locked-wt-test",
+        reuse=False,
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    subprocess.run(
+        ["git", "worktree", "lock", str(locked_handle.workspace_path)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    wt_mod.remove_sandbox(locked_handle, strict=True)
+    assert not locked_handle.workspace_path.exists()
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+
+def test_arena_craft_sandbox_init_failure_cleans_up_craft_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 #3: failure during -craft sandbox init immediately cleans up -craft worktree."""
+    from olympus.stages import arena as arena_mod
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena craft init failure cleanup",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    sandbox_root = tmp_path / "sandboxes"
+
+    real_save_baseline = arena_mod.save_sandbox_baseline
+
+    def fail_on_craft_baseline(handle: Any, baseline: Any) -> None:
+        if handle.workspace_path.name.endswith("-craft"):
+            raise OSError("injected craft baseline save failure")
+        real_save_baseline(handle, baseline)
+
+    monkeypatch.setattr(arena_mod, "save_sandbox_baseline", fail_on_craft_baseline)
+
+    def ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def ok_judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 8.0},
+            },
+            rationale="cand_1 wins.",
+        ).model_dump_json()
+
+    stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", ok_worker),
+                "judge": _ScriptedDriver("judge", ok_judge),
+            }
+        ),
+    )
+    with pytest.raises(OSError, match="injected craft baseline save failure"):
+        stage.arena_race(
+            run_id=run_id,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert not (sandbox_root / f"{run_id}-craft").exists()
+    assert not (sandbox_root / f"{run_id}-arena-cand_1").exists()
+    assert not (sandbox_root / f"{run_id}-arena-cand_2").exists()
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+
+def test_arena_unborn_head_git_repo_locks_single_frozen_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-2 #4: unborn-HEAD git repo snapshots one immutable baseline before candidate
+    allocation so a concurrent initial commit never skews baselines across candidates/craft.
+    """
+    from olympus.stages import arena as arena_mod
+
+    repo = tmp_path / "unborn_repo"
+    repo.mkdir()
+    initial_readme = "# Initial Unborn Baseline\n"
+    (repo / "calc.py").write_text(
+        "def compute(x: int, y: int) -> int:\n    return x - y\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text(initial_readme, encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import unittest\n"
+        "import calc\n\n"
+        "class TestCalc(unittest.TestCase):\n"
+        "    def test_add(self) -> None:\n"
+        "        self.assertEqual(calc.compute(2, 3), 5)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    # Intentionally NO git commit yet -> HEAD is unborn.
+
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena unborn HEAD frozen baseline",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    sandbox_root = tmp_path / "sandboxes"
+
+    real_create = arena_mod.create_sandbox
+    created_readmes: list[str] = []
+    committed_first = False
+
+    def create_with_concurrent_first_commit(repo_root: Path | str, **kwargs: Any) -> Any:
+        nonlocal committed_first
+        handle = real_create(repo_root, **kwargs)
+        created_readmes.append((handle.workspace_path / "README.md").read_text(encoding="utf-8"))
+        if not committed_first:
+            committed_first = True
+            # Mutate host repo and create its very first commit right after cand_1 is spawned.
+            (repo / "README.md").write_text("# Mutated After First Commit\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "initial commit mid-race"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+        return handle
+
+    monkeypatch.setattr(arena_mod, "create_sandbox", create_with_concurrent_first_commit)
+
+    def ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def ok_judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 8.0},
+            },
+            rationale="cand_1 wins cleanly.",
+        ).model_dump_json()
+
+    stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", ok_worker),
+                "judge": _ScriptedDriver("judge", ok_judge),
+            }
+        ),
+    )
+    out = stage.arena_race(
+        run_id=run_id,
+        raw_input="Fix calc.compute.",
+        state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+    )
+    assert out["route"] == "pass"
+    # cand_1, cand_2, and -craft ALL saw the exact initial unborn baseline README.
+    assert len(created_readmes) == 3
+    assert all(content == initial_readme for content in created_readmes)
+    # Temporary frozen baseline snapshot dir and candidate dirs are cleaned up.
+    assert not (sandbox_root / f"{run_id}-arena-base").exists()
+    assert not (sandbox_root / f"{run_id}-arena-cand_1").exists()
+    assert not (sandbox_root / f"{run_id}-arena-cand_2").exists()
+    assert (sandbox_root / f"{run_id}-craft" / "README.md").read_text(
+        encoding="utf-8"
+    ) == initial_readme
+
+

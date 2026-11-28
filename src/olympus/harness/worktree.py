@@ -935,10 +935,24 @@ def absorb_verification_artifacts(
     return replace(baseline, entries=tuple(sorted(merged.items())))
 
 
-def _is_registered_worktree(repo_root: Path, workspace_path: Path) -> bool:
-    """Return True if ``workspace_path`` is still registered in ``git worktree list``."""
+def _is_registered_worktree(
+    repo_root: Path,
+    workspace_path: Path,
+    *,
+    strict: bool = False,
+) -> bool:
+    """Return True if ``workspace_path`` is still registered in ``git worktree list``.
+
+    When ``strict=True``, a non-zero exit from ``git worktree list --porcelain`` raises
+    ``RuntimeError`` instead of silently reporting unregistered.
+    """
     proc = _run_git(repo_root, "worktree", "list", "--porcelain")
     if proc.returncode != 0:
+        if strict:
+            detail = (proc.stderr or proc.stdout).strip() or "git worktree list failed"
+            raise RuntimeError(
+                f"git worktree list --porcelain failed (exit={proc.returncode}): {detail}"
+            )
         return False
     target = workspace_path.resolve(strict=False)
     for line in proc.stdout.splitlines():
@@ -955,7 +969,8 @@ def remove_sandbox(handle: SandboxHandle, *, strict: bool = False) -> None:
 
     When ``strict=True``, verify that both the sandbox directory and any git worktree
     registration are completely removed, attempting ``git worktree prune`` if needed,
-    and raise ``RuntimeError`` instead of silently swallowing failures.
+    and raise ``RuntimeError`` instead of silently swallowing failures or verification
+    errors from ``git worktree list``.
     """
     errors: list[str] = []
     git_host = is_git_repo(handle.repo_root)
@@ -964,6 +979,15 @@ def remove_sandbox(handle: SandboxHandle, *, strict: bool = False) -> None:
         rm_proc = _run_git(
             handle.repo_root, "worktree", "remove", "--force", str(handle.workspace_path)
         )
+        if rm_proc.returncode != 0:
+            rm_proc = _run_git(
+                handle.repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                str(handle.workspace_path),
+            )
         if rm_proc.returncode != 0:
             git_rm_failed = True
             detail = (rm_proc.stderr or rm_proc.stdout).strip()
@@ -989,15 +1013,25 @@ def remove_sandbox(handle: SandboxHandle, *, strict: bool = False) -> None:
     handle.baseline_path.unlink(missing_ok=True)
     if strict:
         still_exists = handle.workspace_path.exists()
-        still_registered = git_host and _is_registered_worktree(
-            handle.repo_root, handle.workspace_path
-        )
-        if still_exists or still_registered:
+        still_registered = False
+        verify_error: str | None = None
+        if git_host:
+            try:
+                still_registered = _is_registered_worktree(
+                    handle.repo_root,
+                    handle.workspace_path,
+                    strict=True,
+                )
+            except RuntimeError as exc:
+                verify_error = str(exc)
+        if still_exists or still_registered or verify_error is not None:
             reasons: list[str] = []
             if still_exists:
                 reasons.append(f"directory still exists: {handle.workspace_path}")
             if still_registered:
                 reasons.append(f"still registered in git worktree list: {handle.workspace_path}")
+            if verify_error is not None:
+                reasons.append(verify_error)
             reasons.extend(errors)
             raise RuntimeError(
                 f"Failed to remove sandbox {handle.workspace_path}: " + "; ".join(reasons)

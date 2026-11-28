@@ -325,6 +325,7 @@ def _mirror_sandbox_changes(
 
     backups: list[tuple[Path, str, tuple[bytes, int] | str | None]] = []
     created_dirs: list[Path] = []
+    removed_dirs: list[tuple[Path, int]] = []
     try:
         for target in delete_plan:
             if target.is_symlink():
@@ -337,9 +338,11 @@ def _mirror_sandbox_changes(
             parent = target.parent
             while parent != dst_root and parent.is_relative_to(dst_root):
                 try:
+                    parent_mode = stat.S_IMODE(parent.stat().st_mode)
                     parent.rmdir()
                 except OSError:
                     break
+                removed_dirs.append((parent, parent_mode))
                 parent = parent.parent
         for src, dst, link_target in copy_plan:
             missing_parents: list[Path] = []
@@ -365,6 +368,12 @@ def _mirror_sandbox_changes(
             else:
                 shutil.copy2(src, dst)
     except OSError as exc:
+        # Recreate removed directories shallow-to-deep first so nested files can be restored.
+        for dir_path, _saved_mode in sorted(
+            removed_dirs, key=lambda item: len(item[0].parts)
+        ):
+            with contextlib.suppress(OSError):
+                dir_path.mkdir(parents=True, exist_ok=True)
         for path, kind, saved in reversed(backups):
             try:
                 if kind == "missing":
@@ -387,6 +396,12 @@ def _mirror_sandbox_changes(
         for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
             with contextlib.suppress(OSError):
                 directory.rmdir()
+        # Restore original modes on removed directories deep-to-shallow (after file writes).
+        for dir_path, saved_mode in sorted(
+            removed_dirs, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            with contextlib.suppress(OSError):
+                os.chmod(dir_path, saved_mode)
         raise CraftPause(
             node_name,
             f"Transactional graft commit failed and winner sandbox was rolled back: {exc}",
@@ -1118,6 +1133,7 @@ class ArenaStage:
         candidate_diffs: Mapping[str, str],
         created_handles: list[tuple[str, SandboxHandle]],
         resolved_base_sha: str | None,
+        sandbox_source_root: Path,
         skill_refs: Sequence[str],
         strict_scope: bool,
         max_steps: int,
@@ -1157,16 +1173,14 @@ class ArenaStage:
             self.workspace_root,
             label=graft_label,
             sandbox_root=self.sandbox_root,
-            is_git_worktree=is_git_repo(self.workspace_root),
+            is_git_worktree=resolved_base_sha is not None,
         )
         created_handles.append(("graft", planned_graft))
         graft_idx = len(created_handles) - 1
-        graft_handle = create_sandbox(
-            self.workspace_root,
+        graft_handle = self._create_arena_sandbox(
             label=graft_label,
-            reuse=False,
-            sandbox_root=self.sandbox_root,
-            base_ref=resolved_base_sha,
+            resolved_base_sha=resolved_base_sha,
+            sandbox_source_root=sandbox_source_root,
         )
         created_handles[graft_idx] = ("graft", graft_handle)
         graft_baseline = snapshot_sandbox_state(graft_handle)
@@ -1308,17 +1322,35 @@ class ArenaStage:
             )
         clean_ephemeral_artifacts(graft_handle, graft_baseline, write_scope=rubric.write_scope)
 
-        # Graft passed DiffGate + verification: transactionally commit onto craft_handle.
-        changed = _mirror_sandbox_changes(
-            source_handle=graft_handle,
-            target_handle=craft_handle,
-            base_baseline=craft_baseline,
-            allowed_write_scope=rubric.write_scope,
-            forbidden_globs=rubric.forbidden_globs,
-            node_name=node_name,
-        )
-        grafted_diff = capture_sandbox_diff(craft_handle, craft_baseline)
-        (self._arena_dir(run_id) / "grafted.patch").write_text(grafted_diff, encoding="utf-8")
+        # Persist grafted.patch BEFORE mutating craft_handle so an artifact write failure
+        # never leaves uncommitted graft changes in the winning craft sandbox.
+        grafted_diff = capture_sandbox_diff(graft_handle, graft_baseline)
+        patch_path = self._arena_dir(run_id) / "grafted.patch"
+        try:
+            patch_path.write_text(grafted_diff, encoding="utf-8")
+        except OSError as exc:
+            raise CraftPause(
+                node_name,
+                f"Failed to persist grafted.patch ({exc}); "
+                "winner craft sandbox preserved untouched.",
+                route="blocked",
+                pause_kind="blocked",
+            ) from exc
+
+        # Graft passed DiffGate + verification + artifact write: transactionally commit.
+        try:
+            changed = _mirror_sandbox_changes(
+                source_handle=graft_handle,
+                target_handle=craft_handle,
+                base_baseline=craft_baseline,
+                allowed_write_scope=rubric.write_scope,
+                forbidden_globs=rubric.forbidden_globs,
+                node_name=node_name,
+            )
+        except BaseException:
+            with contextlib.suppress(OSError):
+                patch_path.unlink(missing_ok=True)
+            raise
         self._append_event(
             run_id=run_id,
             event_type="arena.grafted",
@@ -1334,6 +1366,41 @@ class ArenaStage:
         return grafted_diff, changed, active_grafts
 
     # ------------------------------------------------------------------ main composite primitive
+
+    def _create_arena_sandbox(
+        self,
+        *,
+        label: str,
+        resolved_base_sha: str | None,
+        sandbox_source_root: Path,
+    ) -> SandboxHandle:
+        """Create a sandbox locked to ``resolved_base_sha`` or a frozen snapshot directory."""
+        if resolved_base_sha is not None:
+            return create_sandbox(
+                self.workspace_root,
+                label=label,
+                reuse=False,
+                sandbox_root=self.sandbox_root,
+                base_ref=resolved_base_sha,
+            )
+        effective_sandbox_root = (
+            self.sandbox_root
+            if self.sandbox_root is not None
+            else (self.workspace_root / ".olympus" / "sandboxes")
+        )
+        copied = create_sandbox(
+            sandbox_source_root,
+            label=label,
+            reuse=False,
+            sandbox_root=effective_sandbox_root,
+            base_ref=None,
+        )
+        return SandboxHandle(
+            repo_root=self.workspace_root,
+            workspace_path=copied.workspace_path,
+            base_commit=None,
+            is_git_worktree=False,
+        )
 
     def arena_race(
         self,
@@ -1421,9 +1488,33 @@ class ArenaStage:
         cleanup_errors: list[str] = []
         candidate_results: dict[str, ArenaCandidateResult] = {}
         candidate_diffs: dict[str, str] = {}
-        git_repo = is_git_repo(self.workspace_root)
+        sandbox_source_root = self.workspace_root
 
         try:
+            # When no commit SHA exists (unborn-HEAD git repo or non-git workspace), freeze one
+            # immutable baseline snapshot directory so every candidate and craft sandbox sees the
+            # exact same initial tree even if the host repo creates a commit mid-race.
+            if resolved_base_sha is None:
+                base_label = f"{run_id}-arena-base"
+                planned_base = _planned_sandbox_handle(
+                    self.workspace_root,
+                    label=base_label,
+                    sandbox_root=self.sandbox_root,
+                    is_git_worktree=False,
+                )
+                created_handles.append(("base_snapshot", planned_base))
+                base_dir = planned_base.workspace_path
+                if base_dir.exists():
+                    shutil.rmtree(base_dir)
+                base_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    self.workspace_root,
+                    base_dir,
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", ".venv", ".olympus", "__pycache__"),
+                )
+                sandbox_source_root = base_dir
+
             for idx in range(1, num_candidates + 1):
                 cid = f"cand_{idx}"
                 role = resolved_roles[idx - 1]
@@ -1434,16 +1525,14 @@ class ArenaStage:
                     self.workspace_root,
                     label=label,
                     sandbox_root=self.sandbox_root,
-                    is_git_worktree=git_repo,
+                    is_git_worktree=resolved_base_sha is not None,
                 )
                 created_handles.append((cid, planned))
                 handle_idx = len(created_handles) - 1
-                handle = create_sandbox(
-                    self.workspace_root,
+                handle = self._create_arena_sandbox(
                     label=label,
-                    reuse=False,
-                    sandbox_root=self.sandbox_root,
-                    base_ref=resolved_base_sha,
+                    resolved_base_sha=resolved_base_sha,
+                    sandbox_source_root=sandbox_source_root,
                 )
                 created_handles[handle_idx] = (cid, handle)
                 baseline = snapshot_sandbox_state(handle)
@@ -1540,37 +1629,43 @@ class ArenaStage:
                 verification_plan=list(rubric.verification_plan),
             )
 
-            # Create a clean craft sandbox locked at the exact same resolved_base_sha.
-            craft_handle = create_sandbox(
-                self.workspace_root,
-                label=f"{run_id}-craft",
-                reuse=False,
-                sandbox_root=self.sandbox_root,
-                base_ref=resolved_base_sha,
-            )
-            craft_baseline = snapshot_sandbox_state(craft_handle)
-            save_sandbox_baseline(craft_handle, craft_baseline)
+            # Create a clean craft sandbox locked at the exact same baseline; if any init step
+            # (baseline snapshot/save or winner promotion) fails, immediately reclaim -craft.
+            craft_handle: SandboxHandle | None = None
+            try:
+                craft_handle = self._create_arena_sandbox(
+                    label=f"{run_id}-craft",
+                    resolved_base_sha=resolved_base_sha,
+                    sandbox_source_root=sandbox_source_root,
+                )
+                craft_baseline = snapshot_sandbox_state(craft_handle)
+                save_sandbox_baseline(craft_handle, craft_baseline)
 
-            # Reuse CraftStage's transactional atomic workspace promotion into the craft sandbox.
-            sandbox_promoter = CraftStage(
-                store=self.store,
-                workspace_root=craft_handle.workspace_path,
-                provider=self.provider,
-                artifacts_root=self.artifacts_root,
-                sandbox_root=self.sandbox_root,
-                execution_drivers=self.execution_drivers,
-                driver_registry=self.driver_registry,
-                model_provider=self.model_provider,
-                on_driver_handle=self.on_driver_handle,
-                command_runner=self._run_command,
-                allow_unsandboxed_repro=self._allow_unsandboxed_repro,
-            )
-            sandbox_promoter._promote_sandbox_to_workspace(
-                winner_handle,
-                winner_baseline,
-                sketch,
-                node_name=node_name,
-            )
+                # Reuse CraftStage's transactional atomic workspace promotion into craft sandbox.
+                sandbox_promoter = CraftStage(
+                    store=self.store,
+                    workspace_root=craft_handle.workspace_path,
+                    provider=self.provider,
+                    artifacts_root=self.artifacts_root,
+                    sandbox_root=self.sandbox_root,
+                    execution_drivers=self.execution_drivers,
+                    driver_registry=self.driver_registry,
+                    model_provider=self.model_provider,
+                    on_driver_handle=self.on_driver_handle,
+                    command_runner=self._run_command,
+                    allow_unsandboxed_repro=self._allow_unsandboxed_repro,
+                )
+                sandbox_promoter._promote_sandbox_to_workspace(
+                    winner_handle,
+                    winner_baseline,
+                    sketch,
+                    node_name=node_name,
+                )
+            except BaseException:
+                if craft_handle is not None:
+                    with contextlib.suppress(Exception):
+                        remove_sandbox(craft_handle, strict=False)
+                raise
 
             final_diff, final_changed, _applied_grafts = self._apply_graft_turn(
                 run_id=run_id,
@@ -1586,6 +1681,7 @@ class ArenaStage:
                 candidate_diffs=candidate_diffs,
                 created_handles=created_handles,
                 resolved_base_sha=resolved_base_sha,
+                sandbox_source_root=sandbox_source_root,
                 skill_refs=skill_refs,
                 strict_scope=strict_scope,
                 max_steps=max_steps,

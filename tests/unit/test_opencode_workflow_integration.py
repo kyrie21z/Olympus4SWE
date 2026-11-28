@@ -170,6 +170,32 @@ def main() -> int:
         rendezvous_met = _await_rendezvous(rendezvous)
 
     cwd = Path(os.getcwd())
+    agent_cfg = config.get("agent", {{}}).get("olympus_turn", {{}})
+    perms = agent_cfg.get("permission", {{}})
+    if action.get("reject_zero_tools") and perms == {{"*": "deny"}}:
+        session_id = f"ses_{{model.replace('/', '_')}}_{{call_idx}}"
+        _emit(
+            {{
+                "type": "error",
+                "sessionID": session_id,
+                "error": {{
+                    "name": "APIError",
+                    "data": {{"message": "Free usage limit reached."}},
+                }},
+            }}
+        )
+        _append_log(
+            {{
+                "model": model,
+                "call_idx": call_idx,
+                "cwd": str(cwd.resolve()),
+                "permissions": perms,
+                "steps_cap": agent_cfg.get("steps"),
+                "rejected_zero_tools": True,
+            }}
+        )
+        return 1
+
     for rel_path, content in action.get("writes", {{}}).items():
         target = cwd / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1257,3 +1283,187 @@ def test_opencode_pstack_hillclimb_diff_gate_anti_tamper_and_keep_revert(
     ledger = store.get_run(run_id)["budget_ledger"]
     assert ledger.llm_calls_used == 5
     assert ledger.total_tokens == 150
+
+
+def test_structured_turn_falls_back_when_driver_rejects_disable_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero-progress rejection of disable_tools=True falls back once to read_only tools."""
+    from olympus.harness.driver import (
+        AgentDriver,
+        DriverTurnRequest,
+        TurnOutcome,
+        default_driver_factories,
+    )
+    from olympus.harness.loop import AgentLoop
+    from olympus.harness.structured import run_structured_turn
+    from olympus.tools.aci import WorkspaceToolkit
+
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, {"app.py": "def f() -> int:\n    return 1\n"})
+
+    valid_brief = EvidenceBrief(
+        summary="Recovered after zero-tool fallback",
+        candidate_files=["app.py"],
+    ).model_dump_json()
+
+    # 1. Real OpenCodeDriver subprocess rejecting {"*": "deny"} on parse retry recovers cleanly
+    #    and never re-attempts disable_tools=True on a subsequent parse retry.
+    log_path = _install_fake_opencode(
+        tmp_path,
+        monkeypatch,
+        {
+            "fake/free_tier": [
+                {"text": "not valid json #1", "input_tokens": 20, "output_tokens": 10},
+                {"reject_zero_tools": True, "text": ""},
+                {"text": "still not valid json #2", "input_tokens": 20, "output_tokens": 10},
+                {"text": valid_brief, "input_tokens": 20, "output_tokens": 10},
+            ]
+        },
+        tag="free_zero_tools_fallback",
+    )
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="OpenCode zero-tool retry fallback",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+    )
+    registry = DriverRegistry().with_factories(
+        default_driver_factories(store=store, run_id=run_id, provider=MockLLMProvider([]))
+    )
+    driver, ext_model = registry.resolve_external("opencode@fake/free_tier")
+    assert driver is not None
+    loop = AgentLoop(
+        provider=MockLLMProvider([]),
+        toolkit=WorkspaceToolkit(repo, read_only=True),
+        store=store,
+        run_id=run_id,
+        actor="prometheus:explore",
+        max_steps=4,
+    )
+    result = run_structured_turn(
+        loop=loop,
+        driver=driver,
+        driver_model=ext_model,
+        store=store,
+        run_id=run_id,
+        workspace_root=repo,
+        actor="prometheus:explore",
+        system_prompt="Return EvidenceBrief JSON",
+        user_prompt="Inspect app.py",
+        model_cls=EvidenceBrief,
+        max_steps=4,
+        max_parse_retries=2,
+    )
+    assert result.summary == "Recovered after zero-tool fallback"
+    invocations = _read_invocations(log_path)
+    assert len(invocations) == 4
+    # Call 0: read_only (invalid JSON) -> Call 1: disable_tools (rejected) ->
+    # Call 2: read_only fallback (invalid JSON) -> Call 3: stays read_only (valid JSON)!
+    assert invocations[0]["permissions"].get("read") == "allow"
+    assert invocations[1]["permissions"] == {"*": "deny"}
+    assert invocations[1].get("rejected_zero_tools") is True
+    assert invocations[2]["permissions"].get("read") == "allow"
+    assert invocations[2]["permissions"].get("*") == "deny"
+    assert invocations[2]["steps_cap"] == 2
+    assert invocations[3]["permissions"].get("read") == "allow"
+    assert invocations[3]["permissions"].get("*") == "deny"
+    assert invocations[3]["steps_cap"] == 2
+
+    # 2. Budget cap is still strictly enforced before the fallback turn.
+    capped_run = store.create_run(
+        title="Budget capped zero-tool fallback",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=2),
+    )
+
+    class _CountingRejectDriver(AgentDriver):
+        name = "counting_reject"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_turn(self, request: DriverTurnRequest, on_event: Any = None) -> TurnOutcome:
+            self.calls += 1
+            if request.disable_tools:
+                return TurnOutcome(
+                    completed=False,
+                    stop_reason="upstream_error: zero tools rejected",
+                    final_content="",
+                    steps_taken=0,
+                )
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="not json",
+                steps_taken=1,
+                total_input_tokens=10,
+                total_output_tokens=10,
+            )
+
+    capped_driver = _CountingRejectDriver()
+    with pytest.raises(StructuredTurnError, match="budget_exhausted"):
+        run_structured_turn(
+            loop=loop,
+            driver=capped_driver,
+            driver_model=None,
+            store=store,
+            run_id=capped_run,
+            workspace_root=repo,
+            actor="prometheus:explore",
+            system_prompt="Return EvidenceBrief JSON",
+            user_prompt="Inspect app.py",
+            model_cls=EvidenceBrief,
+            max_steps=4,
+            max_parse_retries=2,
+        )
+    assert capped_driver.calls == 2
+
+    # 3. Cancelled or timed-out turns on disable_tools=True must NEVER trigger fallback.
+    class _NonRetryableStopDriver(AgentDriver):
+        name = "non_retryable_ext"
+
+        def __init__(self, stop_reason: str) -> None:
+            self.stop_reason = stop_reason
+            self.calls = 0
+
+        def run_turn(self, request: DriverTurnRequest, on_event: Any = None) -> TurnOutcome:
+            self.calls += 1
+            if request.disable_tools:
+                return TurnOutcome(
+                    completed=False,
+                    stop_reason=self.stop_reason,
+                    final_content="",
+                    steps_taken=0,
+                )
+            return TurnOutcome(
+                completed=True,
+                stop_reason="final_response",
+                final_content="not json",
+                steps_taken=1,
+                total_input_tokens=10,
+                total_output_tokens=10,
+            )
+
+    for non_retryable in ("cancelled", "timed_out", "opencode_error: request timed out"):
+        stop_driver = _NonRetryableStopDriver(non_retryable)
+        with pytest.raises(StructuredTurnError, match=non_retryable):
+            run_structured_turn(
+                loop=loop,
+                driver=stop_driver,
+                driver_model=None,
+                store=None,
+                run_id=None,
+                workspace_root=repo,
+                actor="prometheus:explore",
+                system_prompt="Return EvidenceBrief JSON",
+                user_prompt="Inspect app.py",
+                model_cls=EvidenceBrief,
+                max_steps=4,
+                max_parse_retries=2,
+            )
+        assert stop_driver.calls == 2

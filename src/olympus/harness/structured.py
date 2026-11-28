@@ -45,6 +45,23 @@ def _validation_prompt(
     return f"{user_prompt}\n\n{header}\nViolations: {'; '.join(violations)}\n{instruction}"
 
 
+def _is_non_retryable_stop_reason(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(
+        token in lowered
+        for token in (
+            "cancel",
+            "interrupt",
+            "abort",
+            "budget",
+            "timeout",
+            "timed_out",
+            "timed out",
+            "deadline",
+        )
+    )
+
+
 def _settle_turn_usage(
     *,
     driver: AgentDriver,
@@ -111,6 +128,7 @@ def run_structured_turn[T: BaseModel](
     prompt = user_prompt
     turn_max_steps = max_steps
     turn_disable_tools = False
+    disable_tools_supported = True
     synthesized_after_cap = False
     parse_retries = 0
     validation_retries = 0
@@ -154,6 +172,19 @@ def run_structured_turn[T: BaseModel](
             attempt=attempt,
         )
         if not outcome.completed:
+            if (
+                turn_disable_tools
+                and disable_tools_supported
+                and outcome.steps_taken == 0
+                and outcome.total_output_tokens == 0
+                and not _is_non_retryable_stop_reason(outcome.stop_reason)
+            ):
+                # Some external driver backends (e.g., hosted free-tier CLIs) reject
+                # zero-tool requests before running a step; fall back once to strict
+                # read_only tools while preserving the no-tool prompt & budget guard.
+                disable_tools_supported = False
+                turn_disable_tools = False
+                continue
             if outcome.stop_reason == "max_steps_exceeded" and not synthesized_after_cap:
                 synthesized_after_cap = True
                 prompt = _validation_prompt(
@@ -164,7 +195,7 @@ def run_structured_turn[T: BaseModel](
                     f"conforming to {model_cls.__name__} from the observed workspace context.",
                     previous_output=outcome.final_content,
                 )
-                turn_disable_tools = True
+                turn_disable_tools = disable_tools_supported
                 turn_max_steps = 2
                 continue
             raise StructuredTurnError(
@@ -186,7 +217,7 @@ def run_structured_turn[T: BaseModel](
                     "its source list, or is empty) and output a single raw JSON object.",
                     previous_output=outcome.final_content,
                 )
-                turn_disable_tools = True
+                turn_disable_tools = disable_tools_supported
                 turn_max_steps = 2
                 continue
             raise ValueError(
@@ -206,7 +237,7 @@ def run_structured_turn[T: BaseModel](
                 validation_instruction,
                 previous_output=candidate.model_dump_json(indent=2),
             )
-            turn_disable_tools = True
+            turn_disable_tools = disable_tools_supported
             turn_max_steps = 2
             continue
         if on_validation_exhausted is not None:

@@ -260,6 +260,7 @@ def default_driver_factories(
     execution_drivers: ExecutionDriversConfig | None = None,
 ) -> dict[str, DriverFactory]:
     """Lazily build the external drivers shipped with Olympus (never at import time)."""
+    from olympus.harness.opencode import OpenCodeDriver
     from olympus.harness.pi import PiDriver
 
     settings = execution_drivers or ExecutionDriversConfig()
@@ -274,5 +275,11 @@ def default_driver_factories(
             pi_provider=pi_provider,
             thinking_level=thinking_level,
             context_window=context_window,
-        )
+        ),
+        "opencode": lambda: OpenCodeDriver(
+            store=store,
+            run_id=run_id,
+            provider=provider,
+            context_window=context_window,
+        ),
     }

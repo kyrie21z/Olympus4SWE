@@ -878,17 +878,19 @@ def test_bwrap_mounts_multi_hop_symlinked_interpreter_prefixes_and_hides_host_pi
         encoding="utf-8",
     )
 
-    # Simulate a venv python symlink traversing a symlinked directory into another prefix
-    # (mirroring GitHub Actions uv/toolcache layouts).
+    # Simulate a venv python symlink traversing a TWO-HOP directory symlink chain
+    # (ext_alias_a -> ext_alias_b -> ext_real_py), mirroring nested uv/toolcache layouts.
     real_py_prefix = tmp_path / "ext_real_py"
     (real_py_prefix / "bin").mkdir(parents=True)
     os.symlink(sys.executable, real_py_prefix / "bin" / "python3")
-    alias_py_prefix = tmp_path / "ext_alias_py"
-    os.symlink(real_py_prefix, alias_py_prefix)
+    alias_py_b = tmp_path / "ext_alias_b"
+    os.symlink(real_py_prefix, alias_py_b)
+    alias_py_a = tmp_path / "ext_alias_a"
+    os.symlink(alias_py_b, alias_py_a)
     venv_prefix = tmp_path / "ext_venv"
     (venv_prefix / "bin").mkdir(parents=True)
     venv_python = venv_prefix / "bin" / "python"
-    os.symlink(alias_py_prefix / "bin" / "python3", venv_python)
+    os.symlink(alias_py_a / "bin" / "python3", venv_python)
 
     code, output = _run_argv_command(
         [str(venv_python), "bench.py"],
@@ -1742,6 +1744,37 @@ def test_latest_argus_gate_host_mode_drift_and_session_start_explicit_override(
         stage_gate.verify_surface(run_id=run_gate, state=res_gate, apply_to_workspace=True)
     assert stat.S_IMODE((repo_gate / "solver.py").stat().st_mode) == 0o600
     assert "return 100" in (repo_gate / "solver.py").read_text(encoding="utf-8")
+
+    # 2b. Pre-existing uncommitted local edit BEFORE hillclimb starts MUST also block promotion!
+    repo_dirty = tmp_path / "repo_pre_dirty"
+    _init_opt_repo(repo_dirty)
+    pre_dirty_content = (
+        "# pre-existing uncommitted local edit\n"
+        "def score_value() -> int:\n    return 100\n"
+        "def has_duplicate(nums: list[int]) -> bool:\n"
+        "    return len(set(nums)) < len(nums)\n"
+    )
+    (repo_dirty / "solver.py").write_text(pre_dirty_content, encoding="utf-8")
+    run_dirty = store.create_run(
+        title="Pre-existing dirty host",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_dirty,
+    )
+    stage_dirty = HillclimbStage(
+        store=store,
+        workspace_root=repo_dirty,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_dirty",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_ok_worker)}),
+    )
+    cfg_dirty = _base_config(direction="minimize", max_iterations=1)
+    res_dirty = stage_dirty.hillclimb_loop(run_id=run_dirty, raw_input="Opt", config=cfg_dirty)
+    with pytest.raises(HillclimbPause, match="host workspace drifted"):
+        stage_dirty.verify_surface(run_id=run_dirty, state=res_dirty, apply_to_workspace=True)
+    assert (repo_dirty / "solver.py").read_text(encoding="utf-8") == pre_dirty_content
 
     # 3. SessionRunner.start(..., hillclimb_config=explicit_cfg) overrides SessionConfig default
     # consistently for both the initial run and a resumed SessionRunner!

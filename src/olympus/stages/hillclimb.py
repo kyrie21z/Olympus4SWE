@@ -245,15 +245,38 @@ def _system_ro_mount_args() -> list[str]:
     return args
 
 
-def _collect_ancestor_symlinks(path: Path) -> list[tuple[Path, str]]:
-    """Return any symlinked directory components along ``path`` (shallowest first)."""
-    found: list[tuple[Path, str]] = []
-    cur = Path("/")
-    for part in Path(os.path.abspath(str(path))).parts[1:]:
-        cur = cur / part
-        if cur.is_symlink():
-            found.append((cur, os.readlink(cur)))
-    return found
+def _collect_ancestor_symlinks(path: Path, *, max_hops: int = 32) -> list[tuple[Path, str]]:
+    """Expand symlinked components across multi-hop directory/file chains (shallowest first)."""
+    found: dict[Path, str] = {}
+    pending: list[Path] = [Path(os.path.abspath(str(path)))]
+    seen_paths: set[Path] = set()
+    hops = 0
+    while pending and hops < max_hops:
+        target_path = pending.pop(0)
+        if target_path in seen_paths:
+            continue
+        seen_paths.add(target_path)
+        cur = Path("/")
+        for part in target_path.parts[1:]:
+            cur = cur / part
+            if cur.is_symlink():
+                raw = os.readlink(cur)
+                if cur not in found:
+                    found[cur] = raw
+                    hops += 1
+                    if hops >= max_hops:
+                        break
+                nxt = Path(raw) if os.path.isabs(raw) else (cur.parent / raw)
+                nxt_abs = Path(os.path.abspath(str(nxt)))
+                if nxt_abs not in seen_paths:
+                    pending.append(nxt_abs)
+                rest = target_path.relative_to(cur)
+                if rest != Path("."):
+                    combined = Path(os.path.abspath(str(nxt_abs / rest)))
+                    if combined not in seen_paths:
+                        pending.append(combined)
+                break
+    return sorted(found.items(), key=lambda item: len(item[0].parts))
 
 
 def _minimal_bwrap_mount_args(
@@ -825,15 +848,20 @@ def _host_matches_baseline(
     baseline: SandboxBaseline,
     host_baseline_fingerprints: Mapping[str, str | None] | None = None,
 ) -> bool:
-    """Return True iff host ``ws_root / rel`` has not drifted (content, type, or exact mode)."""
+    """Return True iff host ``ws_root / rel`` matches BOTH git ``base_commit`` and exact mode.
+
+    Checks both:
+    - Exact fingerprint (including ``stat.S_IMODE``) against the start-time snapshot so local
+      mode drift (e.g. ``chmod 0o600``) fails closed.
+    - Existence, type, and content against git ``base_commit`` so pre-existing uncommitted
+      local host edits are never silently overwritten by a worktree-derived promotion.
+    """
     dst = ws_root / rel
     current = _host_path_fingerprint(dst)
     if host_baseline_fingerprints is not None:
         expected_fp = host_baseline_fingerprints.get(rel)
-        return current == expected_fp
-    before_map = baseline.mapping()
-    if rel in before_map:
-        return current == before_map[rel]
+        if current != expected_fp:
+            return False
     if baseline.is_git and baseline.base_commit is not None:
         expected = _git_blob_fingerprint(ws_root, baseline.base_commit, rel)
         if expected is None:
@@ -850,6 +878,9 @@ def _host_matches_baseline(
             return False
         cur_is_exec = bool(int(cur_mode_str, 8) & 0o111)
         return cur_is_exec == (exp_kind == "x")
+    before_map = baseline.mapping()
+    if rel in before_map:
+        return current == before_map[rel]
     # Non-git fallback: missing from baseline.mapping() means file did not exist at baseline.
     return current is None
 

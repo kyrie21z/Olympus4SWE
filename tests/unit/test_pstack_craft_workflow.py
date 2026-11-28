@@ -1515,6 +1515,62 @@ def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
     assert retry_driver.calls == 2
     assert store.get_run(capped_retry_run)["budget_ledger"].llm_calls_used == 2
 
+    # 5b2. Drivers with records_usage_internally=True (like PiDriver) also obey pre-turn budget.
+    class _SelfAccountingDriver(AgentDriver):
+        name = "self_accounting_ext"
+        records_usage_internally = True
+
+        def __init__(self, target_run_id: str, payloads: list[str]) -> None:
+            self.target_run_id = target_run_id
+            self.payloads = list(payloads)
+            self.calls = 0
+
+        def run_turn(self, request: Any, on_event: Any = None) -> TurnOutcome:
+            self.calls += 1
+            store.record_external_llm_usage(
+                self.target_run_id,
+                actor="self_accounting",
+                purpose=f"turn_{self.calls}",
+                input_tokens=15,
+                output_tokens=15,
+            )
+            text = self.payloads.pop(0)
+            return TurnOutcome(
+                completed=True,
+                stop_reason="completed",
+                final_content=text,
+                steps_taken=1,
+                total_input_tokens=15,
+                total_output_tokens=15,
+            )
+
+    pi_like_run = store.create_run(
+        title="Budget capped self-accounting repair retry",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=2, max_total_tokens=60),
+    )
+    pi_like_driver = _SelfAccountingDriver(
+        pi_like_run, [bad_sketch, "not valid json", repaired_sketch]
+    )
+    stage_pi_capped = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        driver_registry=DriverRegistry({"self_accounting_ext": pi_like_driver}),
+        execution_drivers=ExecutionDriversConfig(role_drivers={"architect": "self_accounting_ext"}),
+    )
+    pi_out = stage_pi_capped.architect_sketch(
+        run_id=pi_like_run, raw_input="Fix app.py", state={}
+    )
+    assert pi_out["route"] == "ready"
+    assert pi_like_driver.calls == 2
+    assert store.get_run(pi_like_run)["budget_ledger"].llm_calls_used == 2
+    assert store.get_run(pi_like_run)["budget_ledger"].total_tokens == 60
+
     # 5c. Loader step budget aligns SessionRunner default worker_max_steps=40 to build_direct=24.
     from olympus.graph.loader import WorkflowRuntime, _craft_step_budget
 
@@ -1558,5 +1614,3 @@ def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
             run_id=zero_run,
             state={"architect_sketch": zero_sketch.model_dump(mode="json")},
         )
-
-

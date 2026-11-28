@@ -117,11 +117,7 @@ def run_structured_turn[T: BaseModel](
     attempt = 0
     while True:
         attempt += 1
-        if (
-            store is not None
-            and run_id is not None
-            and not getattr(driver, "records_usage_internally", False)
-        ):
+        if store is not None and run_id is not None:
             snap = store.get_run(run_id)
             ledger = snap.get("budget_ledger")
             policy = snap.get("budget_policy")

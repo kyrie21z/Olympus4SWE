@@ -13,6 +13,7 @@ import os
 import stat
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -40,18 +41,33 @@ from olympus.harness.driver import DriverRegistry, ExecutionDriversConfig
 from olympus.harness.opencode import _reset_opencode_availability_cache
 from olympus.harness.structured import StructuredTurnError
 from olympus.providers.base import MockLLMProvider
-from olympus.stages.craft import CraftPause, CraftStage, _probe_bwrap
-from olympus.stages.hillclimb import snapshot_frozen_harness
+from olympus.stages.craft import CraftPause, CraftStage
+from olympus.stages.craft import _probe_bwrap as _craft_probe_bwrap
+from olympus.stages.hillclimb import (
+    _probe_bwrap as _hillclimb_probe_bwrap,
+)
+from olympus.stages.hillclimb import (
+    _probe_bwrap_unshare_net,
+    _probe_bwrap_unshare_pid,
+    snapshot_frozen_harness,
+)
 
 
 @pytest.fixture(autouse=True)
-def _ci_bwrap_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def _ci_bwrap_fallback(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Use real bwrap on Linux; fail loudly when CI requires OS isolation."""
     _reset_opencode_availability_cache()
-    if _probe_bwrap() is None:
+    craft_ok = _craft_probe_bwrap() is not None
+    hillclimb_ok = (
+        _hillclimb_probe_bwrap() is not None
+        and _probe_bwrap_unshare_net()
+        and _probe_bwrap_unshare_pid()
+    )
+    if not (craft_ok and hillclimb_ok):
         if os.environ.get("OLYMPUS_REQUIRE_ISOLATION_TESTS") == "1":
             pytest.fail(
-                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but bwrap isolation is unavailable"
+                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but craft/hillclimb bwrap "
+                "(--unshare-net/--unshare-pid) isolation is unavailable"
             )
         monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
     yield
@@ -113,7 +129,7 @@ def _append_log(record: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _await_rendezvous(rendezvous: dict[str, object]) -> None:
+def _await_rendezvous(rendezvous: dict[str, object]) -> bool:
     dir_path = Path(str(rendezvous["dir"]))
     marker = str(rendezvous["marker"])
     expected = int(rendezvous["expected"])
@@ -123,8 +139,9 @@ def _await_rendezvous(rendezvous: dict[str, object]) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if len(list(dir_path.glob("*.ready"))) >= expected:
-            return
+            return True
         time.sleep(0.02)
+    return len(list(dir_path.glob("*.ready"))) >= expected
 
 
 def main() -> int:
@@ -148,8 +165,9 @@ def main() -> int:
 
     ts_start = time.time()
     rendezvous = action.get("rendezvous")
+    rendezvous_met: bool | None = None
     if isinstance(rendezvous, dict):
-        _await_rendezvous(rendezvous)
+        rendezvous_met = _await_rendezvous(rendezvous)
 
     cwd = Path(os.getcwd())
     for rel_path, content in action.get("writes", {{}}).items():
@@ -218,6 +236,7 @@ def main() -> int:
             "tmp_dir": os.environ.get("TMPDIR"),
             "permissions": agent_cfg.get("permission", {{}}),
             "steps_cap": agent_cfg.get("steps"),
+            "rendezvous_met": rendezvous_met,
             "ts_start": ts_start,
             "ts_end": ts_end,
         }}
@@ -1029,7 +1048,9 @@ def test_opencode_pstack_arena_concurrent_worktrees_xdg_isolation_and_graft(
     assert cand1["xdg_state"] != cand2["xdg_state"]
     assert cand1["opencode_db"] is None
     assert cand2["opencode_db"] is None
-    # Both candidate rendezvous markers prove concurrent overlap occurred.
+    # Both candidates must observe each other at the barrier before exiting (serial runs fail).
+    assert cand1["rendezvous_met"] is True
+    assert cand2["rendezvous_met"] is True
     assert (rendezvous_dir / "cand1.ready").is_file()
     assert (rendezvous_dir / "cand2.ready").is_file()
     # Ephemeral XDG state dirs must be cleaned up after turn completion.

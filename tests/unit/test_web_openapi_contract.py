@@ -348,4 +348,3 @@ def test_budget_summary_accepts_legacy_wire_payload_without_cache_fields() -> No
     )
     assert summary.cache_read_tokens == 0
     assert summary.cache_write_tokens == 0
-

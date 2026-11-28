@@ -971,5 +971,3 @@ def test_build_workflow_view_prefers_recorded_custom_yaml_even_with_builtin_name
     )
     assert view["family"] == "pstack"
     assert [n["name"] for n in view["graph"]["nodes"]] == ["goal_review"]
-
-

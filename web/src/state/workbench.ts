@@ -434,11 +434,13 @@ export class Workbench {
     this.setTheme(this.state.theme);
     const queryRun = this.params.get("run")?.trim() || null;
 
+    let seeded = false;
     let [wsData, allData] = await Promise.all([
       listWorkspaces().catch(() => ({ ok: true as const, workspaces: [] })),
       listRuns({ includeArchived: true, limit: 200 }),
     ]);
     if (!allData.runs.length) {
+      seeded = true;
       await seedDemo();
       [wsData, allData] = await Promise.all([
         listWorkspaces().catch(() => ({ ok: true as const, workspaces: [] })),
@@ -480,8 +482,16 @@ export class Workbench {
     }
 
     if (queryRun) {
-      s.activeSurface = "oracle";
-      this.loadRun(queryRun);
+      // Constructor already booted Oracle view on `queryRun` (streamGeneration 0); avoid
+      // re-running `loadRun(queryRun)` after startup fetches finish, which would issue a
+      // duplicate `/snapshot` fetch and race with `?nosse=1` stale-revision checks.
+      if (s.activeSurface === "oracle" && s.runId === queryRun && !seeded) {
+        this.syncUrl();
+        this.commit();
+      } else {
+        s.activeSurface = "oracle";
+        this.loadRun(queryRun);
+      }
     } else {
       s.activeSurface = "board";
       s.runId = null;

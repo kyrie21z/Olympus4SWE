@@ -62,8 +62,12 @@ from olympus.stages.hillclimb import (
 
 @pytest.fixture(autouse=True)
 def _ci_bwrap_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Use real bwrap locally when available; opt in only when CI lacks userns bwrap."""
+    """Use real bwrap locally when available; fail loudly when CI requires OS isolation."""
     if _probe_bwrap() is None:
+        if os.environ.get("OLYMPUS_REQUIRE_ISOLATION_TESTS") == "1":
+            pytest.fail(
+                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but bwrap isolation is unavailable"
+            )
         monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
 
 
@@ -863,6 +867,11 @@ def test_bwrap_mounts_multi_hop_symlinked_interpreter_prefixes_and_hides_host_pi
     tmp_path: Path,
 ) -> None:
     if _probe_bwrap() is None or not _probe_bwrap_unshare_net() or not _probe_bwrap_unshare_pid():
+        if os.environ.get("OLYMPUS_REQUIRE_ISOLATION_TESTS") == "1":
+            pytest.fail(
+                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but bwrap --unshare-net/--unshare-pid "
+                "isolation is unavailable"
+            )
         pytest.skip("bwrap with --unshare-net and --unshare-pid unavailable")
 
     repo = tmp_path / "repo"

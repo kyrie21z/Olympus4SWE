@@ -5,6 +5,7 @@ for Issue #191 Part A (``pstack_arena`` multi-worktree race + Rubric Judge + gra
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -51,8 +52,12 @@ from olympus.web.schemas import WorkflowSummary
 
 @pytest.fixture(autouse=True)
 def _ci_bwrap_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep local Linux tests running under real bwrap; opt in only when CI lacks bwrap."""
+    """Keep local Linux tests running under real bwrap; fail loudly when CI requires isolation."""
     if _probe_bwrap() is None:
+        if os.environ.get("OLYMPUS_REQUIRE_ISOLATION_TESTS") == "1":
+            pytest.fail(
+                "OLYMPUS_REQUIRE_ISOLATION_TESTS=1 is set, but bwrap isolation is unavailable"
+            )
         monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
 
 
@@ -2419,5 +2424,3 @@ def test_mirror_nested_mkdir_enospc_rolls_back_created_parent_dirs(
 
     assert not (dst_dir / "brand_new").exists()
     assert (dst_dir / "keep.py").read_text(encoding="utf-8") == "v0\n"
-
-

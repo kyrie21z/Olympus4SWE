@@ -1402,6 +1402,8 @@ def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
         verification_plan=[
             "pytest --version",
             "pytest -V",
+            "pytest --funcargs",
+            "pytest --cache-show",
             "pytest --collect-only",
             f"{sys.executable} -m unittest --help",
         ],
@@ -1415,6 +1417,13 @@ def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
     )
     with pytest.raises(CraftPause, match="no allowlisted read-only commands"):
         stage_arch_bad.architect_sketch(run_id=run_id, raw_input="Fix app.py", state={})
+
+    # pytest --setup-show executes tests and must NOT be blocked by the allowlist.
+    valid_setup_show, rejected_setup_show = stage_arch._partition_verification_plan(
+        ["pytest --setup-show"]
+    )
+    assert valid_setup_show == ["pytest --setup-show"]
+    assert rejected_setup_show == []
 
     # 4. Empty EvidenceBrief.assumptions preserves legacy content_hash (Pydantic 2.9+ safe).
     b_empty = EvidenceBrief(summary="Same", unresolved_questions=[], candidate_files=["app.py"])
@@ -1480,6 +1489,43 @@ def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
     assert capped_out["architect_sketch"]["verification_plan"] == [
         f"{sys.executable} -m unittest test_app.py"
     ]
+
+    # 5b. External driver repair parse-retry must respect max_llm_calls=2 (never calls 3rd time).
+    capped_retry_run = store.create_run(
+        title="Budget capped external repair retry",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=2),
+    )
+    retry_driver = _CountingDriver([bad_sketch, "not valid json", repaired_sketch])
+    stage_retry_capped = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        driver_registry=DriverRegistry({"counting_ext": retry_driver}),
+        execution_drivers=ExecutionDriversConfig(role_drivers={"architect": "counting_ext"}),
+    )
+    retry_out = stage_retry_capped.architect_sketch(
+        run_id=capped_retry_run, raw_input="Fix app.py", state={}
+    )
+    assert retry_out["route"] == "ready"
+    assert retry_driver.calls == 2
+    assert store.get_run(capped_retry_run)["budget_ledger"].llm_calls_used == 2
+
+    # 5c. Loader step budget aligns SessionRunner default worker_max_steps=40 to build_direct=24.
+    from olympus.graph.loader import WorkflowRuntime, _craft_step_budget
+
+    session_like_rt = WorkflowRuntime(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        provider=_mock_provider([]),
+        worker_max_steps=40,
+    )
+    assert _craft_step_budget({}, session_like_rt, 24, use_worker_steps=True) == 24
 
     # 6. Zero-test unittest execution (exit 0 + "Ran 0 tests") must fail verify_surface.
     zero_run = store.create_run(

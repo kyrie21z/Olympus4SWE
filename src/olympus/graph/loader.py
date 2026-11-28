@@ -551,7 +551,7 @@ def _craft_step_budget(
         return int(params["max_steps"])
     if use_worker_steps:
         if runtime.worker_max_steps is not None:
-            return int(runtime.worker_max_steps)
+            return min(int(runtime.worker_max_steps), default_cap)
         return default_cap if runtime.max_steps == 16 else runtime.max_steps
     return min(runtime.max_steps, default_cap)
 

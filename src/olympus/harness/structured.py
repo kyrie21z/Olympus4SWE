@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
+from olympus.core.contracts import BudgetLedger, BudgetPolicy
 from olympus.core.store import RunStore
 from olympus.harness.driver import AgentDriver, DriverEvent, DriverTurnRequest, TurnOutcome
 from olympus.harness.loop import AgentLoop, parse_model_json
@@ -116,6 +117,19 @@ def run_structured_turn[T: BaseModel](
     attempt = 0
     while True:
         attempt += 1
+        if store is not None and run_id is not None:
+            snap = store.get_run(run_id)
+            ledger = snap.get("budget_ledger")
+            policy = snap.get("budget_policy")
+            if (
+                isinstance(ledger, BudgetLedger)
+                and isinstance(policy, BudgetPolicy)
+                and not ledger.can_reserve(policy)
+            ):
+                raise StructuredTurnError(
+                    f"{driver.name} driver stopped before attempt {attempt} for "
+                    f"{model_cls.__name__}: budget_exhausted"
+                )
         outcome = driver.run_turn(
             DriverTurnRequest(
                 workspace_path=workspace_root,

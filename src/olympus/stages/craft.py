@@ -28,6 +28,8 @@ from pydantic import BaseModel
 
 from olympus.core.contracts import (
     ArchitectSketch,
+    BudgetLedger,
+    BudgetPolicy,
     EvidenceBrief,
     InterrogateFinding,
     InterrogateReport,
@@ -136,13 +138,33 @@ _FORBIDDEN_REPRO_FLAGS: frozenset[str] = frozenset(
         "--python-executable",
         "--shadow-file",
         "--custom-typeshed-dir",
+        "-h",
+        "--help",
+        "--version",
+        "--version-verbose",
+        "--collect-only",
+        "--co",
+        "--fixtures",
+        "--funcargs",
+        "--fixtures-per-test",
+        "--markers",
+        "--setup-plan",
+        "--setup-only",
+        "--cache-show",
+        "--cache-clear",
+        "--pastebin",
+        "--list",
+        "--list-tests",
+        "--show-files",
+        "--show-settings",
+        "--show-fixes",
     }
 )
 _TRUSTED_SYSTEM_BIN_DIRS: frozenset[Path] = frozenset(
     {Path("/usr/bin"), Path("/bin"), Path("/usr/local/bin")}
 )
 _UNTRUSTED_PATH_PREFIXES: tuple[Path, ...] = (Path("/tmp"), Path("/var/tmp"))
-_FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "o", "p", "w"})
+_FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "h", "o", "p", "w"})
 _ABS_PATH_LITERAL_RE = re.compile(r"(?:^|[\s'\"=(,])/(?:etc|home|root|tmp|var|usr|opt|Users)/")
 _NON_PROOF_EXIT_CODES: frozenset[int] = frozenset({126, 127})
 _PYTEST_NON_FAILURE_EXIT_CODES: frozenset[int] = frozenset({2, 3, 4, 5})
@@ -152,6 +174,14 @@ class _SandboxIsolationUnavailableError(RuntimeError):
     """Raised when OS-level read-only FS isolation (bwrap) is required but unavailable."""
 _MAX_EXCERPT_CHARS = 1500
 _MAX_DIFF_PROMPT_CHARS = 24000
+_SANDBOXED_COMMAND_RULES = (
+    "Command execution contract (STRICT): commands execute directly from the sandbox repo root "
+    "with shell=False inside a read-only allowlist. Use ONLY direct test/lint/typecheck runners "
+    "such as `python -m unittest <test_file>`, `pytest -q`, `uv run pytest -q`, `ruff check .`, "
+    "`mypy src`, `npm test`, `pnpm test`, `go test ./...`, or `cargo test` with repo-relative "
+    "paths. NEVER use `cd`, `&&`, `;`, `|`, `>`, `python -c`, `grep`, mutating flags (`--fix`, "
+    "`-w`, `-o`), or absolute host workspace paths."
+)
 
 
 class CraftPause(Exception):
@@ -433,6 +463,13 @@ def _has_forbidden_flag(arg: str) -> str | None:
     """Detect forbidden long, attached-value, or bundled short flags."""
     if not arg.startswith("-") or arg == "-":
         return None
+    if arg == "-V" or (
+        not arg.startswith("--")
+        and len(arg) > 1
+        and arg[1].lower() not in {"k", "m"}
+        and "V" in arg[1:]
+    ):
+        return f"short flag -V (in {arg!r}) is forbidden in read-only repro_command"
     flag_name = arg.split("=", 1)[0].lower()
     if flag_name in _FORBIDDEN_REPRO_FLAGS:
         return f"flag {flag_name!r} is forbidden in read-only repro_command"
@@ -753,6 +790,18 @@ class CraftStage:
         )
         driver, ext_model = registry.resolve_external(resolved_spec)
         return driver, ext_model, resolved_spec
+
+    def _has_remaining_budget(self, run_id: str) -> bool:
+        """Return True when the run ledger still permits reserving one more LLM call."""
+        try:
+            snap = self.store.get_run(run_id)
+        except Exception:  # noqa: BLE001
+            return True
+        ledger = snap.get("budget_ledger")
+        policy = snap.get("budget_policy")
+        if isinstance(ledger, BudgetLedger) and isinstance(policy, BudgetPolicy):
+            return ledger.can_reserve(policy)
+        return True
 
     def _run_structured[T: BaseModel](
         self,
@@ -1095,6 +1144,28 @@ class CraftStage:
                     cycle = raw
         return cycle
 
+    def _partition_verification_plan(
+        self, commands: Sequence[str]
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Split verification_plan into allowlisted commands and rejected (cmd, reason) pairs."""
+        valid: list[str] = []
+        rejected: list[tuple[str, str]] = []
+        placeholder_sandbox = (self.sandbox_root or self.workspace_root.parent) / ".verify-plan"
+        for raw_cmd in commands:
+            cleaned = raw_cmd.strip()
+            if not cleaned:
+                continue
+            argv, issue = _parse_sandboxed_repro_argv(
+                cleaned,
+                host_root=self.workspace_root,
+                sandbox_root=placeholder_sandbox,
+            )
+            if issue is not None or argv is None:
+                rejected.append((cleaned, issue or "rejected by sandbox allowlist"))
+            else:
+                valid.append(cleaned)
+        return valid, rejected
+
     # ------------------------------------------------------------------ 6 orthogonal primitives
 
     def explore_reproduce(
@@ -1108,16 +1179,20 @@ class CraftStage:
         role: str = "explorer",
         skill_refs: Sequence[str] = (),
         require_repro: bool = False,
-        max_steps: int = 16,
+        max_steps: int = 8,
     ) -> dict[str, Any]:
         toolkit = WorkspaceToolkit(
             self.workspace_root, read_only=True, env_root=self.workspace_root
         )
         inventory = format_workspace_inventory(toolkit, scope_paths=scope_paths)
         system_prompt = _compose_system_prompt(
-            "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only and "
-            "return ONLY valid EvidenceBrief JSON conforming strictly to the schema. "
-            "Leave repro_verified=false (the deterministic control plane verifies repro commands).",
+            "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only "
+            "(batching file reads efficiently) and return ONLY valid EvidenceBrief JSON conforming "
+            "strictly to the schema. Leave repro_verified=false (the deterministic control plane "
+            "verifies repro commands). Record solvable engineering defaults, tie-breakers, and "
+            "environment notes in `assumptions` and keep `unresolved_questions` as `[]` unless "
+            "execution is genuinely blocked on an unresolvable product/intent decision.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         merged_constraints = [
@@ -1282,7 +1357,7 @@ class CraftStage:
         node_name: str = "architect",
         role: str = "architect",
         skill_refs: Sequence[str] = (),
-        max_steps: int = 16,
+        max_steps: int = 6,
     ) -> dict[str, Any]:
         brief = self._hydrate_model(run_id, state, "evidence_brief", EvidenceBrief)
         toolkit = WorkspaceToolkit(
@@ -1292,7 +1367,8 @@ class CraftStage:
         system_prompt = _compose_system_prompt(
             "You are Athena (Lightweight Architect). Compare at least two candidate shapes and "
             "return ONLY valid ArchitectSketch JSON with a tight write_scope and concrete "
-            "executable verification_plan commands.",
+            "verification_plan commands.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         brief_block = (
@@ -1321,6 +1397,59 @@ class CraftStage:
             max_steps=max_steps,
             trace_name="architect",
         )
+        valid_cmds, rejected_cmds = self._partition_verification_plan(sketch.verification_plan)
+        if rejected_cmds:
+            if self._has_remaining_budget(run_id):
+                repair_details = "\n".join(
+                    f"- {cmd!r}: {reason}" for cmd, reason in rejected_cmds
+                )
+                repair_prompt = (
+                    f"{user_prompt}\n\n"
+                    f"Previous ArchitectSketch JSON had invalid verification_plan commands that "
+                    f"fail the deterministic read-only sandbox allowlist:\n{repair_details}\n\n"
+                    f"Keep your chosen architecture and write_scope, and replace ONLY the "
+                    f"rejected verification_plan entries with valid allowlisted commands "
+                    f"(e.g. `python -m unittest <test_file>`, `pytest -q`, `ruff check .`). "
+                    f"Return ONLY valid ArchitectSketch JSON."
+                )
+                try:
+                    repaired, _ = self._run_structured(
+                        run_id=run_id,
+                        node_name=node_name,
+                        role=role,
+                        actor="athena:architect",
+                        workspace_path=self.workspace_root,
+                        system_prompt=system_prompt,
+                        user_prompt=repair_prompt,
+                        model_cls=ArchitectSketch,
+                        max_steps=3,
+                        trace_name="architect_repair",
+                    )
+                    repaired_valid, repaired_rejected = self._partition_verification_plan(
+                        repaired.verification_plan
+                    )
+                    if repaired_valid:
+                        # Preserve all original valid commands and never let the repair turn
+                        # mutate write_scope, forbidden_globs, or architecture fields.
+                        valid_cmds = list(dict.fromkeys([*valid_cmds, *repaired_valid]))
+                        rejected_cmds = repaired_rejected
+                except Exception:  # noqa: BLE001 - fall back to any valid commands from initial sketch
+                    pass
+            if not valid_cmds:
+                reasons = "; ".join(f"{cmd!r} ({reason})" for cmd, reason in rejected_cmds)
+                raise CraftPause(
+                    node_name,
+                    f"ArchitectSketch.verification_plan has no allowlisted read-only commands: "
+                    f"{reasons}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            sketch = ArchitectSketch.model_validate(
+                {
+                    **sketch.model_dump(mode="json", exclude={"content_hash"}),
+                    "verification_plan": valid_cmds,
+                }
+            )
         dumped = sketch.model_dump(mode="json")
         self._save_persisted(run_id, {"architect_sketch": dumped})
         self.store.append_event(
@@ -1349,7 +1478,7 @@ class CraftStage:
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
         max_diff_gate_retries: int = 2,
-        max_steps: int = 40,
+        max_steps: int = 24,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         if sketch is None:
@@ -1498,7 +1627,7 @@ class CraftStage:
         role: str = "hygiene",
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
-        max_steps: int = 16,
+        max_steps: int = 4,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         if sketch is None:
@@ -1517,7 +1646,8 @@ class CraftStage:
 
         system_prompt = _compose_system_prompt(
             "You are Hephaestus (Diff Hygiene Pass). Clean AI slop and redundant comments in "
-            "the current diff without changing runtime behavior or touching files outside scope.",
+            "the current diff without changing runtime behavior or touching files outside scope. "
+            "If the diff is already clean and concise, finish in 1 step with zero edits.",
             skill_refs,
         )
         user_prompt = (
@@ -1584,7 +1714,7 @@ class CraftStage:
         skill_refs: Sequence[str] = (),
         enable_thermo: bool = False,
         max_cycles: int = 3,
-        max_steps: int = 16,
+        max_steps: int = 6,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
         handle, baseline = self._ensure_sandbox(run_id)
@@ -1598,9 +1728,12 @@ class CraftStage:
         )
         system_prompt = _compose_system_prompt(
             "You are Momus (Cold-Start Adversarial Interrogator). You have ZERO builder history. "
-            "Attempt to break this diff and return ONLY valid InterrogateReport JSON. "
-            "Every `important` finding MUST carry a runnable `repro_command` that fails (non-zero "
-            "exit) in the sandbox; unproven claims will be filtered out deterministically.",
+            "This turn is READ-ONLY (no shell tool): read the changed files at most once, do NOT "
+            "loop re-reading the same file, and return ONLY valid InterrogateReport JSON. "
+            "Every `important` finding MUST carry an allowlisted `repro_command` that fails "
+            "(non-zero exit) when the deterministic control plane runs it in the sandbox; unproven "
+            "claims will be filtered out deterministically.\n"
+            f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
         user_prompt = (
@@ -1886,8 +2019,11 @@ class CraftStage:
                         raw_cmd, cwd=handle.workspace_path, timeout_s=timeout_s
                     )
                 status: Literal["pass", "fail", "inconclusive"]
+                runner = _effective_repro_runner(argv)
                 if code is None:
                     status = "inconclusive"
+                elif code == 0 and runner == "unittest" and re.search(r"\bRan 0 tests\b", output):
+                    status = "fail"
                 elif code == 0:
                     status = "pass"
                 else:
@@ -1904,7 +2040,7 @@ class CraftStage:
 
         passed = bool(checks) and all(item.status == "pass" for item in checks)
         failing_summary = "; ".join(
-            f"{c.surface}={c.status} (exit={c.exit_code})"
+            f"{c.surface} ({c.command})={c.status} (exit={c.exit_code})"
             for c in checks
             if c.status != "pass"
         )

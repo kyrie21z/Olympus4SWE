@@ -802,15 +802,39 @@ class EvidenceBrief(FingerprintedModel):
     brief_id: str = Field(default_factory=lambda: new_id("evid"))
     summary: str = Field(min_length=1)
     facts: list[EvidenceFact] = Field(default_factory=list)
-    repro_command: str | None = None
+    repro_command: str | None = Field(
+        default=None,
+        description=(
+            "Optional direct read-only test/lint/typecheck runner command executed from repo root "
+            "with shell=False (e.g. 'python -m unittest test_foo.py', 'pytest -q'). "
+            "Never use 'cd', '&&', ';', '|', 'python -c', or absolute host paths."
+        ),
+    )
     repro_exit_code: int | None = None
     repro_excerpt: str = ""
     repro_verified: bool = False
-    unresolved_questions: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-blocking engineering defaults, tie-breakers, or environment observations; "
+            "execution continues autonomously without pausing."
+        ),
+    )
+    unresolved_questions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "ONLY genuinely unresolvable product/intent blockers or irreversible external actions "
+            "that CANNOT proceed without human input. Any non-empty entry HALTS the workflow; "
+            "keep [] for solvable engineering defaults, tie-breakers, or environment notes."
+        ),
+    )
     candidate_files: list[str] = Field(default_factory=list)
 
     def _hash_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude={"content_hash", "brief_id"})
+        payload = self.model_dump(mode="json", exclude={"content_hash", "brief_id"})
+        if not payload.get("assumptions"):
+            payload.pop("assumptions", None)
+        return payload
 
 
 class CandidateShape(StrictModel):
@@ -828,7 +852,14 @@ class ArchitectSketch(FingerprintedModel):
     write_scope: list[str] = Field(min_length=1)
     forbidden_globs: list[str] = Field(default_factory=list)
     blast_radius: str = ""
-    verification_plan: list[str] = Field(min_length=1)
+    verification_plan: list[str] = Field(
+        min_length=1,
+        description=(
+            "Direct read-only test/lint/typecheck runner commands executed inside the repo root "
+            "with shell=False (e.g. 'python -m unittest test_foo.py', 'pytest -q', "
+            "'ruff check .'). Never use 'cd', '&&', ';', '|', 'python -c', 'grep', or host paths."
+        ),
+    )
 
     def _hash_payload(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude={"content_hash", "sketch_id"})

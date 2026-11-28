@@ -1309,3 +1309,308 @@ def test_pstack_craft_cli_web_clarify_plan_only_and_blocked_recovery(
     assert started_entries == ["build"]
     assert monkeypatch_stage._active_review_cycle(rec_run, {}) == 0
 
+
+def test_craft_assumptions_non_blocking_and_architect_verification_plan_repair(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Assumptions & plan repair",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+    )
+
+    # 1. EvidenceBrief.assumptions must NOT pause explore_reproduce (unlike unresolved_questions).
+    brief_with_assumptions = EvidenceBrief(
+        summary="Ready with sensible defaults",
+        assumptions=["Preserve existing KeyError on missing key", "Preserve insertion order"],
+        unresolved_questions=[],
+        candidate_files=["app.py"],
+    ).model_dump_json()
+    stage_explore = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([brief_with_assumptions]),
+    )
+    explore_out = stage_explore.explore_reproduce(run_id=run_id, raw_input="Fix app.py")
+    assert explore_out["route"] == "ready"
+    assert len(explore_out["evidence_brief"]["assumptions"]) == 2
+
+    # 2. architect_sketch repairs invalid cd/python -c/grep verification_plan before build starts,
+    #    preserving original valid commands and keeping write_scope/forbidden_globs immutable.
+    bad_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="A",
+        rationale="Direct is cleaner",
+        write_scope=["app.py"],
+        forbidden_globs=["secrets/*"],
+        verification_plan=[
+            f"{sys.executable} -m unittest test_app.py",
+            f"cd {repo} && python3 -m unittest test_app.py",
+            "python3 -c 'import app; assert app.add(1, 2) == 3'",
+            "grep -n 'def add' app.py",
+            "pytest --version",
+        ],
+    ).model_dump_json()
+    repaired_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="B",
+        rationale="Attempted scope expansion",
+        write_scope=["app.py", "other.py"],
+        forbidden_globs=[],
+        verification_plan=[f"{sys.executable} -m unittest -v test_app.py"],
+    ).model_dump_json()
+    stage_arch = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([bad_sketch, repaired_sketch]),
+    )
+    arch_out = stage_arch.architect_sketch(run_id=run_id, raw_input="Fix app.py", state={})
+    assert arch_out["route"] == "ready"
+    assert arch_out["architect_sketch"]["chosen_shape"] == "A"
+    assert arch_out["architect_sketch"]["write_scope"] == ["app.py"]
+    assert arch_out["architect_sketch"]["forbidden_globs"] == ["secrets/*"]
+    assert arch_out["architect_sketch"]["verification_plan"] == [
+        f"{sys.executable} -m unittest test_app.py",
+        f"{sys.executable} -m unittest -v test_app.py",
+    ]
+    rehydrated_sketch = ArchitectSketch.model_validate(arch_out["architect_sketch"])
+    assert rehydrated_sketch.content_hash == arch_out["architect_sketch"]["content_hash"]
+
+    # 3. If even repair yields zero allowlisted commands, architect_sketch pauses immediately.
+    all_bad_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="A",
+        rationale="Direct is cleaner",
+        write_scope=["app.py"],
+        verification_plan=[
+            "pytest --version",
+            "pytest -V",
+            "pytest --funcargs",
+            "pytest --cache-show",
+            "pytest --collect-only",
+            f"{sys.executable} -m unittest --help",
+        ],
+    ).model_dump_json()
+    stage_arch_bad = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([all_bad_sketch, all_bad_sketch]),
+    )
+    with pytest.raises(CraftPause, match="no allowlisted read-only commands"):
+        stage_arch_bad.architect_sketch(run_id=run_id, raw_input="Fix app.py", state={})
+
+    # pytest --setup-show executes tests and must NOT be blocked by the allowlist.
+    valid_setup_show, rejected_setup_show = stage_arch._partition_verification_plan(
+        ["pytest --setup-show"]
+    )
+    assert valid_setup_show == ["pytest --setup-show"]
+    assert rejected_setup_show == []
+
+    # 4. Empty EvidenceBrief.assumptions preserves legacy content_hash (Pydantic 2.9+ safe).
+    b_empty = EvidenceBrief(summary="Same", unresolved_questions=[], candidate_files=["app.py"])
+    assert "assumptions" not in b_empty._hash_payload()
+    b_with = EvidenceBrief(
+        summary="Same",
+        assumptions=["default"],
+        unresolved_questions=[],
+        candidate_files=["app.py"],
+    )
+    assert b_with.content_hash != b_empty.content_hash
+
+    # 5. External driver respects max_llm_calls=1 and never executes an over-budget repair turn.
+    from olympus.core.contracts import BudgetPolicy
+    from olympus.harness.driver import (
+        AgentDriver,
+        DriverRegistry,
+        ExecutionDriversConfig,
+        TurnOutcome,
+    )
+
+    class _CountingDriver(AgentDriver):
+        name = "counting_ext"
+
+        def __init__(self, payloads: list[str]) -> None:
+            self.payloads = list(payloads)
+            self.calls = 0
+
+        def run_turn(self, request: Any, on_event: Any = None) -> TurnOutcome:
+            self.calls += 1
+            text = self.payloads.pop(0)
+            return TurnOutcome(
+                completed=True,
+                stop_reason="completed",
+                final_content=text,
+                steps_taken=1,
+                total_input_tokens=10,
+                total_output_tokens=10,
+            )
+
+    capped_run = store.create_run(
+        title="Budget capped external repair",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=1),
+    )
+    ext_driver = _CountingDriver([bad_sketch, repaired_sketch])
+    registry = DriverRegistry({"counting_ext": ext_driver})
+    stage_capped = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        driver_registry=registry,
+        execution_drivers=ExecutionDriversConfig(role_drivers={"architect": "counting_ext"}),
+    )
+    capped_out = stage_capped.architect_sketch(run_id=capped_run, raw_input="Fix app.py", state={})
+    assert capped_out["route"] == "ready"
+    assert ext_driver.calls == 1
+    assert store.get_run(capped_run)["budget_ledger"].llm_calls_used == 1
+    assert capped_out["architect_sketch"]["verification_plan"] == [
+        f"{sys.executable} -m unittest test_app.py"
+    ]
+
+    # 5b. External driver repair parse-retry must respect max_llm_calls=2 (never calls 3rd time).
+    capped_retry_run = store.create_run(
+        title="Budget capped external repair retry",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=2),
+    )
+    retry_driver = _CountingDriver([bad_sketch, "not valid json", repaired_sketch])
+    stage_retry_capped = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        driver_registry=DriverRegistry({"counting_ext": retry_driver}),
+        execution_drivers=ExecutionDriversConfig(role_drivers={"architect": "counting_ext"}),
+    )
+    retry_out = stage_retry_capped.architect_sketch(
+        run_id=capped_retry_run, raw_input="Fix app.py", state={}
+    )
+    assert retry_out["route"] == "ready"
+    assert retry_driver.calls == 2
+    assert store.get_run(capped_retry_run)["budget_ledger"].llm_calls_used == 2
+
+    # 5b2. Drivers with records_usage_internally=True (like PiDriver) also obey pre-turn budget.
+    class _SelfAccountingDriver(AgentDriver):
+        name = "self_accounting_ext"
+        records_usage_internally = True
+
+        def __init__(self, target_run_id: str, payloads: list[str]) -> None:
+            self.target_run_id = target_run_id
+            self.payloads = list(payloads)
+            self.calls = 0
+
+        def run_turn(self, request: Any, on_event: Any = None) -> TurnOutcome:
+            self.calls += 1
+            store.record_external_llm_usage(
+                self.target_run_id,
+                actor="self_accounting",
+                purpose=f"turn_{self.calls}",
+                input_tokens=15,
+                output_tokens=15,
+            )
+            text = self.payloads.pop(0)
+            return TurnOutcome(
+                completed=True,
+                stop_reason="completed",
+                final_content=text,
+                steps_taken=1,
+                total_input_tokens=15,
+                total_output_tokens=15,
+            )
+
+    pi_like_run = store.create_run(
+        title="Budget capped self-accounting repair retry",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+        budget_policy=BudgetPolicy(max_llm_calls=2, max_total_tokens=60),
+    )
+    pi_like_driver = _SelfAccountingDriver(
+        pi_like_run, [bad_sketch, "not valid json", repaired_sketch]
+    )
+    stage_pi_capped = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        driver_registry=DriverRegistry({"self_accounting_ext": pi_like_driver}),
+        execution_drivers=ExecutionDriversConfig(role_drivers={"architect": "self_accounting_ext"}),
+    )
+    pi_out = stage_pi_capped.architect_sketch(
+        run_id=pi_like_run, raw_input="Fix app.py", state={}
+    )
+    assert pi_out["route"] == "ready"
+    assert pi_like_driver.calls == 2
+    assert store.get_run(pi_like_run)["budget_ledger"].llm_calls_used == 2
+    assert store.get_run(pi_like_run)["budget_ledger"].total_tokens == 60
+
+    # 5c. Loader step budget aligns SessionRunner default worker_max_steps=40 to build_direct=24.
+    from olympus.graph.loader import WorkflowRuntime, _craft_step_budget
+
+    session_like_rt = WorkflowRuntime(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        provider=_mock_provider([]),
+        worker_max_steps=40,
+    )
+    assert _craft_step_budget({}, session_like_rt, 24, use_worker_steps=True) == 24
+
+    # 6. Zero-test unittest execution (exit 0 + "Ran 0 tests") must fail verify_surface.
+    zero_run = store.create_run(
+        title="Zero-test unittest fail",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_craft",
+        workspace_root=repo,
+    )
+    zero_output = "-----------------------------------\nRan 0 tests in 0.000s\n\nOK\n"
+    stage_zero = CraftStage(
+        store=store,
+        workspace_root=repo,
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        provider=_mock_provider([]),
+        command_runner=lambda cmd, cwd, timeout_s: (0, zero_output),
+    )
+    zero_sketch = ArchitectSketch(
+        candidate_shapes=[
+            CandidateShape(name="A", data_flow="direct", tradeoffs="simple"),
+            CandidateShape(name="B", data_flow="wrapper", tradeoffs="indirection"),
+        ],
+        chosen_shape="A",
+        rationale="Direct",
+        write_scope=["app.py"],
+        verification_plan=[f"{sys.executable} -m unittest test_app.py"],
+    )
+    with pytest.raises(CraftPause, match="check_1.*fail"):
+        stage_zero.verify_surface(
+            run_id=zero_run,
+            state={"architect_sketch": zero_sketch.model_dump(mode="json")},
+        )

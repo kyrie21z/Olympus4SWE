@@ -354,12 +354,11 @@ def _mirror_sandbox_changes(
             while cur_parent != dst_root and not cur_parent.exists():
                 missing_parents.append(cur_parent)
                 cur_parent = cur_parent.parent
-            if missing_parents:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                for created in missing_parents:
-                    if created not in removed_dir_set and created not in created_dir_set:
-                        created_dirs.append(created)
-                        created_dir_set.add(created)
+            for missing_dir in reversed(missing_parents):
+                missing_dir.mkdir()
+                if missing_dir not in removed_dir_set and missing_dir not in created_dir_set:
+                    created_dirs.append(missing_dir)
+                    created_dir_set.add(missing_dir)
             if dst.is_symlink():
                 backups.append((dst, "symlink", os.readlink(dst)))
                 dst.unlink()

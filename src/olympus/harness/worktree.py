@@ -107,20 +107,29 @@ def _safe_label(label: str) -> str:
 
 def _open_retained_sandbox(root: Path, sandbox_dir: Path) -> SandboxHandle | None:
     if is_git_repo(root):
-        if not is_git_repo(sandbox_dir):
-            return None
-        probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
-        saved = load_sandbox_baseline(probe)
-        if saved is not None and saved.base_commit is not None:
-            base_commit = saved.base_commit
-        else:
-            head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
-            if head_proc.returncode != 0:
-                return None
-            base_commit = head_proc.stdout.strip()
-        return SandboxHandle(
-            root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
-        )
+        # A genuine git worktree created by ``git worktree add`` always has its own ``.git`` entry
+        # inside ``sandbox_dir`` (preventing parent-repo walk-up on copied sandboxes under
+        # ``root/.olympus/sandboxes``).
+        if (sandbox_dir / ".git").exists() and is_git_repo(sandbox_dir):
+            probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=True, reused=True)
+            saved = load_sandbox_baseline(probe)
+            if saved is not None and saved.base_commit is not None:
+                base_commit = saved.base_commit
+            else:
+                head_proc = _run_git(sandbox_dir, "rev-parse", "HEAD")
+                if head_proc.returncode != 0:
+                    return None
+                base_commit = head_proc.stdout.strip()
+            return SandboxHandle(
+                root, sandbox_dir, base_commit, is_git_worktree=True, reused=True
+            )
+        # Copied sandboxes (e.g. unborn-HEAD git repos or frozen snapshot copies) carry a saved
+        # baseline with ``base_commit=None`` and no ``.git`` inside ``sandbox_dir``.
+        copy_probe = SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
+        saved_copy = load_sandbox_baseline(copy_probe)
+        if saved_copy is not None and saved_copy.base_commit is None:
+            return copy_probe
+        return None
     return SandboxHandle(root, sandbox_dir, None, is_git_worktree=False, reused=True)
 
 

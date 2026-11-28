@@ -2255,3 +2255,169 @@ def test_arena_unborn_head_default_sandbox_root_none_locks_baseline_across_candi
     assert _git_worktree_paths(repo) == [repo.resolve()]
 
 
+# ---------------------------------------------------------------------- 10. Round-4 edge fixes
+
+
+def test_unborn_head_default_sandbox_preserves_graft_through_hygiene_pass(
+    tmp_path: Path,
+) -> None:
+    """Round-4 P1: unborn-HEAD git repo with sandbox_root=None runs arena_race (with graft)
+    followed by CraftStage.hygiene_pass; hygiene reuses -craft and sees grafted code intact.
+    """
+    from olympus.stages.craft import CraftStage
+
+    repo = tmp_path / "unborn_hygiene_repo"
+    repo.mkdir()
+    (repo / "calc.py").write_text(
+        "def compute(x: int, y: int) -> int:\n    return x - y\n",
+        encoding="utf-8",
+    )
+    (repo / "test_calc.py").write_text(
+        "import unittest\n"
+        "import calc\n\n"
+        "class TestCalc(unittest.TestCase):\n"
+        "    def test_add(self) -> None:\n"
+        "        self.assertEqual(calc.compute(2, 3), 5)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    # Intentionally unborn HEAD (no commits).
+
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena unborn HEAD -> hygiene retention",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    artifacts_root = tmp_path / "artifacts"
+    grafted_code = (
+        "def compute(x: int, y: int) -> int:\n"
+        "    # grafted helper comment\n"
+        "    return int(x) + int(y)\n"
+    )
+    hygiene_seen_code: list[str] = []
+
+    def worker(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:arena_graft":
+            (req.workspace_path / "calc.py").write_text(grafted_code, encoding="utf-8")
+            return "grafted"
+        if req.actor == "hephaestus:hygiene":
+            hygiene_seen_code.append((req.workspace_path / "calc.py").read_text(encoding="utf-8"))
+            (req.workspace_path / "calc.py").write_text(
+                "def compute(x: int, y: int) -> int:\n    return int(x) + int(y)\n",
+                encoding="utf-8",
+            )
+            return "hygiene ok"
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.5, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 9.5},
+            },
+            graft_items=[
+                ArenaGraftItem(
+                    source_candidate_id="cand_2",
+                    idea="Coerce inputs with int().",
+                    target_files=["calc.py"],
+                )
+            ],
+            convergence_mode="winner_plus_graft",
+            rationale="cand_1 wins with int() graft.",
+        ).model_dump_json()
+
+    drivers_cfg = ExecutionDriversConfig.resolve(
+        stage_driver="native",
+        worker_driver="worker",
+        reviewer_driver="judge",
+    )
+    registry = DriverRegistry(
+        {
+            "worker": _ScriptedDriver("worker", worker),
+            "judge": _ScriptedDriver("judge", judge),
+        }
+    )
+    arena_stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=artifacts_root,
+        sandbox_root=None,
+        execution_drivers=drivers_cfg,
+        driver_registry=registry,
+    )
+    arena_out = arena_stage.arena_race(
+        run_id=run_id,
+        raw_input="Fix calc.compute.",
+        state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+    )
+    assert arena_out["route"] == "pass"
+
+    craft_stage = CraftStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=artifacts_root,
+        sandbox_root=None,
+        execution_drivers=drivers_cfg,
+        driver_registry=registry,
+    )
+    hygiene_out = craft_stage.hygiene_pass(run_id=run_id, state=arena_out)
+    assert hygiene_out["route"] == "clean"
+    assert hygiene_seen_code == [grafted_code]
+    assert (repo / ".olympus" / "sandboxes" / f"{run_id}-craft" / "calc.py").read_text(
+        encoding="utf-8"
+    ) == "def compute(x: int, y: int) -> int:\n    return int(x) + int(y)\n"
+
+
+def test_mirror_nested_mkdir_enospc_rolls_back_created_parent_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 P2: ENOSPC during nested mkdir rolls back already-created shallow parent dirs."""
+    import errno
+
+    from olympus.harness.worktree import SandboxHandle, snapshot_sandbox_state
+    from olympus.stages import arena as arena_mod
+
+    base_dir = tmp_path / "base_ws"
+    src_dir = tmp_path / "src_ws"
+    dst_dir = tmp_path / "dst_ws"
+    for d in (base_dir, src_dir, dst_dir):
+        d.mkdir()
+        (d / "keep.py").write_text("v0\n", encoding="utf-8")
+    base_baseline = snapshot_sandbox_state(SandboxHandle(base_dir, base_dir, None, False))
+
+    (src_dir / "brand_new" / "deep_child").mkdir(parents=True)
+    (src_dir / "brand_new" / "deep_child" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    real_mkdir = Path.mkdir
+
+    def enospc_on_deep_child(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self.name == "deep_child" and self.parent.name == "brand_new":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", enospc_on_deep_child)
+    with pytest.raises(CraftPause, match="rolled back"):
+        arena_mod._mirror_sandbox_changes(
+            source_handle=SandboxHandle(base_dir, src_dir, None, False),
+            target_handle=SandboxHandle(base_dir, dst_dir, None, False),
+            base_baseline=base_baseline,
+            allowed_write_scope=["brand_new/deep_child/mod.py"],
+            forbidden_globs=[],
+            node_name="arena_race",
+        )
+
+    assert not (dst_dir / "brand_new").exists()
+    assert (dst_dir / "keep.py").read_text(encoding="utf-8") == "v0\n"
+
+

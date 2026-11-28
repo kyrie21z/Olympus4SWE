@@ -151,6 +151,20 @@ def test_builtin_workflows_keep_backward_compatible_manifests() -> None:
     assert legacy.anti_patterns == []
 
 
+def test_builtin_pstack_hillclimb_manifest_declares_pantheon_metadata() -> None:
+    definition = load_workflow("pstack_hillclimb")
+    summary = WorkflowSummary.model_validate(describe_workflow(definition))
+    assert summary.family == "pstack"
+    assert summary.autonomy == "autonomous_hard_stops"
+    assert summary.stop_after == "verify"
+    assert summary.applicable_scenarios
+    assert summary.anti_patterns
+    by_name = {node.name: node for node in summary.graph.nodes}
+    assert by_name["explore"].god == "prometheus"
+    assert by_name["hillclimb"].god == "hephaestus"
+    assert by_name["verify_surface"].god == "argus"
+
+
 def test_custom_workflow_manifest_and_node_metadata_round_trip() -> None:
     definition = _custom_pstack_definition()
     described = describe_workflow(definition)

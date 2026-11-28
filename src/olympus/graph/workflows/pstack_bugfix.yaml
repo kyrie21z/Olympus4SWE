@@ -1,0 +1,96 @@
+name: pstack_bugfix
+description: >-
+  Reproduce-first, failing-test-before-fix bugfix workflow distilled from t3-pstack:
+  deterministically proves failure on base_ref before planning, enforces a red-test-to-green-fix
+  receipt on the same surface inside an isolated worktree, runs diff hygiene and cold-start
+  adversarial interrogation (Momus), and verifies on the real surface (Argus).
+family: pstack
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - unknown-cause bugs and production regressions requiring deterministic reproduction before editing
+  - non-obvious defects needing failing-test-first proof and post-fix verification on the same surface
+  - bug fixes where speculative patching or defensive-guard masking must be prevented
+anti_patterns:
+  - known-cause trivial typo or config patch with an already-identified single-file edit
+  - read-only root-cause forensics where workspace files must not be modified
+  - greenfield feature design without an existing defect to reproduce
+stop_after: verify
+topology: evidence_first
+nodes:
+  - name: explore
+    type: explore_reproduce
+    god: prometheus
+    phase: align
+    role: explorer
+    skill_refs:
+      - pstack/explore
+      - pstack/bugfix
+    params:
+      require_repro: true
+  - name: architect
+    type: architect_sketch
+    god: athena
+    phase: design
+    role: architect
+    skill_refs:
+      - pstack/architect
+      - pstack/bugfix
+  - name: build
+    type: build_direct
+    god: hephaestus
+    phase: execute
+    role: builder
+    skill_refs:
+      - pstack/build
+      - pstack/bugfix
+    max_visits: 3
+    params:
+      failing_test_first: true
+  - name: hygiene
+    type: hygiene_pass
+    god: hephaestus
+    phase: execute
+    role: hygiene
+    skill_refs:
+      - pstack/hygiene
+    max_visits: 3
+  - name: interrogate
+    type: interrogate_review
+    god: momus
+    phase: review
+    role: interrogator
+    skill_refs:
+      - pstack/interrogate
+      - pstack/thermo-review
+    max_visits: 3
+    params:
+      enable_thermo: false
+      max_cycles: 3
+  - name: verify_surface
+    type: verify_surface
+    god: argus
+    phase: verify
+    role: verifier
+    skill_refs:
+      - pstack/verify
+edges:
+  - source: START
+    target: explore
+  - source: explore
+    target: architect
+  - source: architect
+    target: build
+  - source: build
+    target: hygiene
+  - source: hygiene
+    target: interrogate
+  - source: verify_surface
+    target: END
+routers:
+  - at: interrogate
+    key: route
+    default: verify_surface
+    rules:
+      findings: build
+      pass: verify_surface
+gates: {}

@@ -1,0 +1,34 @@
+name: investigate
+description: >-
+  Strictly read-only root-cause forensics workflow: inspects the repository with zero workspace
+  mutation (write_scope=[]) and emits a structured EvidenceBrief mechanism report grounded in
+  verified file:line facts.
+family: pstack
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - read-only root-cause forensics and "why does this happen?" codebase investigations
+  - runtime failure trace analysis and file:line mechanism diagnosis with zero workspace mutation
+anti_patterns:
+  - code changes, bug fixes, or refactors that require modifying workspace files
+  - greenfield product specification or multi-wave task planning
+stop_after: report
+topology: evidence_first
+nodes:
+  - name: explore
+    type: explore_reproduce
+    god: prometheus
+    phase: align
+    role: explorer
+    skill_refs:
+      - pstack/explore
+      - pstack/investigate
+    params:
+      require_repro: false
+      read_only_report: true
+edges:
+  - source: START
+    target: explore
+  - source: explore
+    target: END
+routers: []
+gates: {}

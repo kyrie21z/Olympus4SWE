@@ -34,7 +34,6 @@ from olympus.core.control import (
     is_design_bound_to_spec,
     is_plan_bound_to_upstream,
 )
-from olympus.core.fingerprint import content_hash
 from olympus.core.store import ConcurrencyConflictError, NotFoundError, RunStore
 from olympus.graph.engine import END, run_graph
 from olympus.graph.loader import (
@@ -377,7 +376,7 @@ class SessionRunner:
                 "constraints": clean_constraints,
                 "workflow": definition.name,
                 "workflow_path": str(workflow_path) if workflow_path is not None else None,
-                "workflow_hash": content_hash(definition.model_dump(mode="json")),
+                "workflow_hash": definition.execution_hash(),
                 "workspace_root": str(self.workspace_root),
                 "git_toplevel": str(toplevel) if toplevel is not None else None,
                 "step_mode": self.config.step_mode.value,
@@ -940,7 +939,7 @@ class SessionRunner:
         blocked = self._execution_blocked_tasks(run_id, snap)
         if blocked:
             return self._recover_blocked_in_place(run_id, definition, snap, clean, blocked)
-        if definition.family != "sdlc" and snap.get("plan") is None:
+        if not definition.uses_sdlc_artifacts() and snap.get("plan") is None:
             return self._recover_blocked_craft(run_id, definition, snap, clean)
         if self._has_bound_approved_plan(run_id, snap):
             plan: TaskPlan | None = snap["plan"]
@@ -1288,8 +1287,8 @@ class SessionRunner:
             )
         recorded_hash = self._recorded_workflow_hash(run_id)
         if recorded_hash is not None:
-            actual_hash = content_hash(definition.model_dump(mode="json"))
-            if actual_hash != recorded_hash:
+            valid_hashes = {definition.execution_hash(), definition.content_hash}
+            if recorded_hash not in valid_hashes:
                 raise ValueError(
                     f"Workflow definition for '{definition.name}' does not match the "
                     "workflow that started this run"

@@ -105,16 +105,22 @@ _LEGACY_SDLC_WORKFLOWS = ("full_sdlc_tdd", "product_blueprint", "repo_fast_patch
 
 
 def test_builtin_workflows_keep_backward_compatible_manifests() -> None:
+    expected_manifests = {
+        "full_sdlc_tdd": ("sdlc", "gated"),
+        "product_blueprint": ("sdlc", "gated"),
+        "repo_fast_patch": ("minimal", "autonomous_hard_stops"),
+    }
     for name in _LEGACY_SDLC_WORKFLOWS:
         definition = load_workflow(name)
-        assert definition.family == "sdlc"
-        assert definition.autonomy == "gated"
+        expected_family, expected_autonomy = expected_manifests[name]
+        assert definition.family == expected_family
+        assert definition.autonomy == expected_autonomy
         summary = WorkflowSummary.model_validate(describe_workflow(definition))
         assert summary.name == name
-        assert summary.family == "sdlc"
-        assert summary.autonomy == "gated"
-        assert summary.applicable_scenarios == []
-        assert summary.anti_patterns == []
+        assert summary.family == expected_family
+        assert summary.autonomy == expected_autonomy
+        assert summary.applicable_scenarios
+        assert summary.anti_patterns
         assert all(node.god is None and node.phase is None for node in summary.graph.nodes)
 
     arena_def = load_workflow("pstack_arena")
@@ -129,6 +135,20 @@ def test_builtin_workflows_keep_backward_compatible_manifests() -> None:
     assert arena_nodes["arena_race"].god == "athena"
     assert arena_nodes["hygiene"].god == "hephaestus"
     assert arena_nodes["verify_surface"].god == "argus"
+
+    # Historical minimal YAML without manifest fields still defaults to sdlc/gated.
+    legacy = WorkflowDefinition(
+        name="legacy_custom",
+        nodes=[WorkflowNodeDef(name="intake", type="intake_triage")],
+        edges=[
+            WorkflowEdgeDef(source=START, target="intake"),
+            WorkflowEdgeDef(source="intake", target=END),
+        ],
+    )
+    assert legacy.family == "sdlc"
+    assert legacy.autonomy == "gated"
+    assert legacy.applicable_scenarios == []
+    assert legacy.anti_patterns == []
 
 
 def test_custom_workflow_manifest_and_node_metadata_round_trip() -> None:
@@ -458,13 +478,45 @@ def test_headless_session_runner_propagates_workspace_context_and_role_drivers(
 
 def test_builtin_workflow_model_dump_preserves_legacy_workflow_hash() -> None:
     """New default manifest/node fields must not change legacy content_hash on upgrade."""
+    minimal_legacy = WorkflowDefinition(
+        name="legacy_upgrade",
+        nodes=[WorkflowNodeDef(name="intake", type="intake_triage")],
+        edges=[
+            WorkflowEdgeDef(source=START, target="intake"),
+            WorkflowEdgeDef(source="intake", target=END),
+        ],
+    )
+    minimal_dumped = minimal_legacy.model_dump(mode="json")
+    for new_wf_key in ("family", "autonomy", "applicable_scenarios", "anti_patterns"):
+        assert new_wf_key not in minimal_dumped
+    for node in minimal_dumped["nodes"]:
+        for new_node_key in ("god", "phase", "role", "skill_refs"):
+            assert new_node_key not in node
+
     for name in _LEGACY_SDLC_WORKFLOWS:
         dumped = load_workflow(name).model_dump(mode="json")
-        for new_wf_key in ("family", "autonomy", "applicable_scenarios", "anti_patterns"):
-            assert new_wf_key not in dumped
+        if name in ("full_sdlc_tdd", "product_blueprint"):
+            assert "family" not in dumped
+            assert "autonomy" not in dumped
         for node in dumped["nodes"]:
             for new_node_key in ("god", "phase", "role", "skill_refs"):
                 assert new_node_key not in node
+
+    # Descriptive manifest metadata must never alter the structural execution hash
+    # recorded in legacy session.started events on origin/main.
+    origin_main_hashes = {
+        "full_sdlc_tdd": (
+            "sha256:291faa5f5f3fb4d33efe1c28a579e04c4bc3ae0e085f0bce5c8110bf06a3cd7d"
+        ),
+        "product_blueprint": (
+            "sha256:26841aed6e876cf8b7773727cc96e867053412b50c6851710ee1598987b2fae7"
+        ),
+        "repo_fast_patch": (
+            "sha256:87aa62e27d58fb5fdea94754dace076bffbac8e458228d25b02f9f03d0b424a5"
+        ),
+    }
+    for name, expected_hash in origin_main_hashes.items():
+        assert load_workflow(name).execution_hash() == expected_hash
 
 
 def test_custom_human_gate_pauses_under_own_node_name_and_non_sdlc_gate_spec_resumes(

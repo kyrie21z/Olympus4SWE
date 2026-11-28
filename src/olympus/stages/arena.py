@@ -13,8 +13,13 @@ Primitive:
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import json
 import os
+import shutil
+import stat
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -45,12 +50,13 @@ from olympus.harness.driver import (
     default_driver_factories,
     resolve_driver_spec,
 )
-from olympus.harness.loop import AgentLoop
+from olympus.harness.loop import AgentLoop, TurnCancelledError
 from olympus.harness.native import NativeDriver
 from olympus.harness.structured import run_structured_turn
 from olympus.harness.worktree import (
     SandboxBaseline,
     SandboxHandle,
+    _safe_label,
     capture_sandbox_diff,
     clean_ephemeral_artifacts,
     collect_sandbox_changes,
@@ -73,7 +79,7 @@ from olympus.stages.craft import (
     _trim_output,
     _validate_substantive_command,
 )
-from olympus.tools.aci import WorkspaceToolkit
+from olympus.tools.aci import WorkspacePolicy, WorkspaceToolkit
 
 _MAX_CANDIDATE_DIFF_CHARS = 10_000
 _MAX_GRAFT_DIFF_CHARS = 8_000
@@ -167,17 +173,51 @@ def _filter_allowed_verification_plan(
     return valid if valid else [cmd.strip() for cmd in commands if cmd.strip()]
 
 
+def _is_cancelled_stop_reason(stop_reason: str) -> bool:
+    normalized = stop_reason.strip().lower()
+    return any(token in normalized for token in ("cancel", "interrupt", "abort"))
+
+
+def _planned_sandbox_handle(
+    repo_root: Path,
+    *,
+    label: str,
+    sandbox_root: Path | None,
+    is_git_worktree: bool,
+) -> SandboxHandle:
+    """Compute the deterministic SandboxHandle before creation so partial failures clean up."""
+    root = repo_root.resolve()
+    safe_label = _safe_label(label)
+    sandbox_dir = (
+        sandbox_root.resolve() / safe_label
+        if sandbox_root is not None
+        else root / ".olympus" / "sandboxes" / safe_label
+    )
+    return SandboxHandle(
+        repo_root=root,
+        workspace_path=sandbox_dir,
+        base_commit=None,
+        is_git_worktree=is_git_worktree,
+    )
+
+
 def _resolve_git_base_commit(repo_root: Path, base_ref: str | None) -> str | None:
-    """Resolve a non-HEAD ``base_ref`` to a verified commit SHA without shell execution."""
-    if not base_ref or not base_ref.strip():
-        return None
-    cleaned = base_ref.strip()
-    if cleaned == "HEAD":
-        return None
+    """Lock ``base_ref`` (including default ``HEAD``) to one immutable commit SHA up front.
+
+    Fail closed when an explicit ``base_ref`` is requested on a non-git directory or
+    when the target ref cannot be resolved to a commit.
+    """
+    explicit_ref = base_ref.strip() if base_ref is not None and base_ref.strip() else None
     if not is_git_repo(repo_root):
+        if explicit_ref is not None:
+            raise ValueError(
+                f"Explicit base_ref {explicit_ref!r} cannot be resolved because "
+                f"{repo_root} is not a git repository"
+            )
         return None
+    target_ref = explicit_ref or "HEAD"
     proc = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{cleaned}^{{commit}}"],
+        ["git", "rev-parse", "--verify", f"{target_ref}^{{commit}}"],
         cwd=str(repo_root),
         capture_output=True,
         text=True,
@@ -185,35 +225,175 @@ def _resolve_git_base_commit(repo_root: Path, base_ref: str | None) -> str | Non
         check=False,
     )
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip() or f"unknown ref {cleaned!r}"
-        raise ValueError(f"Invalid base_ref {cleaned!r}: {detail}")
+        if explicit_ref is None:
+            return None
+        detail = (proc.stderr or proc.stdout).strip() or f"unknown ref {target_ref!r}"
+        raise ValueError(f"Invalid base_ref {target_ref!r}: {detail}")
     return proc.stdout.strip()
 
 
-def _checkout_sandbox_ref(handle: SandboxHandle, commit_sha: str | None) -> SandboxHandle:
-    """Detach an isolated worktree at ``commit_sha`` before snapshotting its baseline."""
-    if not commit_sha or not handle.is_git_worktree or handle.base_commit == commit_sha:
-        return handle
-    proc = subprocess.run(
-        ["git", "checkout", "--detach", commit_sha],
-        cwd=str(handle.workspace_path),
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-        check=False,
+def _mirror_sandbox_changes(
+    *,
+    source_handle: SandboxHandle,
+    target_handle: SandboxHandle,
+    base_baseline: SandboxBaseline,
+    allowed_write_scope: Sequence[str],
+    forbidden_globs: Sequence[str],
+    node_name: str,
+) -> list[str]:
+    """Transactionally mirror ``source_handle`` changes onto ``target_handle`` with rollback.
+
+    Covers edits, additions, deletions, symlinks, and file mode bits across the union of
+    paths changed in either ``source_handle`` or ``target_handle`` relative to ``base_baseline``.
+    On any ``OSError``, restores every touched file/mode/symlink and removes created dirs.
+    """
+    source_changed = collect_sandbox_changes(source_handle, base_baseline)
+    target_changed = collect_sandbox_changes(target_handle, base_baseline)
+    union_paths = sorted(set(source_changed) | set(target_changed))
+    policy = WorkspacePolicy(
+        allowed_write_scope=list(allowed_write_scope),
+        forbidden_write_scope=list(forbidden_globs),
     )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
-        raise RuntimeError(
-            f"Failed to checkout base_ref {commit_sha!r} in sandbox "
-            f"{handle.workspace_path}: {detail}"
-        )
-    return SandboxHandle(
-        repo_root=handle.repo_root,
-        workspace_path=handle.workspace_path,
-        base_commit=commit_sha,
-        is_git_worktree=handle.is_git_worktree,
-    )
+    src_root = source_handle.workspace_path.resolve()
+    dst_root = target_handle.workspace_path.resolve()
+
+    copy_plan: list[tuple[Path, Path, str | None]] = []
+    delete_plan: list[Path] = []
+    for rel in union_paths:
+        if policy.forbidden_match(rel) is not None or not policy.allows_relative_path(rel):
+            raise CraftPause(
+                node_name,
+                f"Refusing to commit graft change outside write_scope: {rel}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise CraftPause(
+                node_name,
+                f"Refusing to commit unsafe relative graft path: {rel}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        src = src_root / rel_path
+        dst = dst_root / rel_path
+        parent_resolved = dst.parent.resolve(strict=False)
+        if parent_resolved != dst_root and not parent_resolved.is_relative_to(dst_root):
+            raise CraftPause(
+                node_name,
+                f"Refusing to commit graft path escaping sandbox root: {rel}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        if not src.exists() and not src.is_symlink():
+            if dst.exists() and not dst.is_symlink() and dst.is_dir():
+                raise CraftPause(
+                    node_name,
+                    f"Refusing to delete directory via graft commit: {rel}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            delete_plan.append(dst)
+            continue
+        link_target: str | None = None
+        if src.is_symlink():
+            link_target = os.readlink(src)
+            resolved_target = (dst.parent / link_target).resolve(strict=False)
+            if resolved_target != dst_root and not resolved_target.is_relative_to(dst_root):
+                raise CraftPause(
+                    node_name,
+                    f"Refusing to commit graft symlink escaping sandbox root: "
+                    f"{rel} -> {link_target}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+        elif src.is_dir() or not src.is_file():
+            raise CraftPause(
+                node_name,
+                f"Refusing to commit non-regular graft path: {rel}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        if dst.exists() and not dst.is_symlink() and dst.is_dir():
+            raise CraftPause(
+                node_name,
+                f"Refusing to overwrite directory via graft commit: {rel}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        copy_plan.append((src, dst, link_target))
+
+    backups: list[tuple[Path, str, tuple[bytes, int] | str | None]] = []
+    created_dirs: list[Path] = []
+    try:
+        for target in delete_plan:
+            if target.is_symlink():
+                backups.append((target, "symlink", os.readlink(target)))
+                target.unlink()
+            elif target.is_file():
+                mode = stat.S_IMODE(target.stat().st_mode)
+                backups.append((target, "file", (target.read_bytes(), mode)))
+                target.unlink()
+            parent = target.parent
+            while parent != dst_root and parent.is_relative_to(dst_root):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        for src, dst, link_target in copy_plan:
+            missing_parents: list[Path] = []
+            cur_parent = dst.parent
+            while cur_parent != dst_root and not cur_parent.exists():
+                missing_parents.append(cur_parent)
+                cur_parent = cur_parent.parent
+            if missing_parents:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                created_dirs.extend(missing_parents)
+            if dst.is_symlink():
+                backups.append((dst, "symlink", os.readlink(dst)))
+                dst.unlink()
+            elif dst.is_file():
+                mode = stat.S_IMODE(dst.stat().st_mode)
+                backups.append((dst, "file", (dst.read_bytes(), mode)))
+            else:
+                backups.append((dst, "missing", None))
+            if link_target is not None:
+                if dst.is_file() or dst.is_symlink():
+                    dst.unlink()
+                os.symlink(link_target, dst)
+            else:
+                shutil.copy2(src, dst)
+    except OSError as exc:
+        for path, kind, saved in reversed(backups):
+            try:
+                if kind == "missing":
+                    if path.is_symlink() or path.is_file():
+                        path.unlink(missing_ok=True)
+                elif kind == "symlink" and isinstance(saved, str):
+                    if path.is_symlink() or path.is_file():
+                        path.unlink(missing_ok=True)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(saved, path)
+                elif kind == "file" and isinstance(saved, tuple):
+                    data, saved_mode = saved
+                    if path.is_symlink():
+                        path.unlink(missing_ok=True)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    os.chmod(path, saved_mode)
+            except OSError:
+                pass
+        for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+        raise CraftPause(
+            node_name,
+            f"Transactional graft commit failed and winner sandbox was rolled back: {exc}",
+            route="blocked",
+            pause_kind="blocked",
+        ) from exc
+    return source_changed
 
 
 class ArenaStage:
@@ -638,7 +818,7 @@ class ArenaStage:
         )
         diff_text = ""
         try:
-            _outcome, driver_spec = self._run_worker_turn(
+            outcome, driver_spec = self._run_worker_turn(
                 run_id=run_id,
                 node_name=node_name,
                 role=candidate_role,
@@ -652,63 +832,122 @@ class ArenaStage:
                 max_steps=max_steps,
                 trace_name=f"candidate_{candidate_id}",
             )
-            clean_ephemeral_artifacts(handle, baseline, write_scope=rubric.write_scope)
-            gate_result = run_diff_gate(
-                handle,
-                baseline,
-                allowed_write_scope=rubric.write_scope,
-                forbidden_globs=rubric.forbidden_globs,
-                strict_scope=strict_scope,
-            )
-            diff_text = capture_sandbox_diff(handle, baseline)
-            changed_paths = list(gate_result.changed_paths)
-            if gate_result.rejected:
+            if _is_cancelled_stop_reason(outcome.stop_reason):
                 result = ArenaCandidateResult(
                     candidate_id=candidate_id,
                     role=candidate_role,
                     driver_spec=driver_spec,
                     strategy_hint=strategy_hint,
-                    changed_paths=changed_paths,
-                    diff_summary=_summarize_diff(changed_paths, diff_text),
-                    diff_bytes=len(diff_text.encode("utf-8")),
+                    changed_paths=[],
+                    diff_summary="Candidate execution cancelled.",
+                    diff_bytes=0,
                     diff_gate_passed=False,
-                    diff_gate_error=gate_result.rejection_message(),
+                    diff_gate_error="",
                     verification_passed=False,
                     verification_exit_code=None,
                     verification_excerpt="",
-                    status="rejected",
+                    status="cancelled",
                     worktree_status="active",
-                    error=gate_result.rejection_message(),
+                    error=f"Candidate turn cancelled (stop_reason={outcome.stop_reason!r})",
                 )
-            else:
-                verified, exit_code, excerpt = self._verify_candidate_sandbox(
-                    handle=handle,
-                    commands=rubric.verification_plan,
-                    timeout_s=verify_timeout_s,
-                    node_name=node_name,
-                )
-                clean_ephemeral_artifacts(handle, baseline, write_scope=rubric.write_scope)
-                diff_text = capture_sandbox_diff(handle, baseline)
-                changed_paths = collect_sandbox_changes(handle, baseline)
+            elif not outcome.completed:
                 result = ArenaCandidateResult(
                     candidate_id=candidate_id,
                     role=candidate_role,
                     driver_spec=driver_spec,
                     strategy_hint=strategy_hint,
-                    changed_paths=changed_paths,
-                    diff_summary=_summarize_diff(changed_paths, diff_text),
-                    diff_bytes=len(diff_text.encode("utf-8")),
-                    diff_gate_passed=True,
+                    changed_paths=[],
+                    diff_summary="Candidate execution did not complete.",
+                    diff_bytes=0,
+                    diff_gate_passed=False,
                     diff_gate_error="",
-                    verification_passed=verified,
-                    verification_exit_code=exit_code,
-                    verification_excerpt=excerpt,
-                    status="completed",
+                    verification_passed=False,
+                    verification_exit_code=None,
+                    verification_excerpt="",
+                    status="failed",
                     worktree_status="active",
-                    error="",
+                    error=f"Candidate turn incomplete (stop_reason={outcome.stop_reason!r})",
                 )
+            else:
+                clean_ephemeral_artifacts(handle, baseline, write_scope=rubric.write_scope)
+                gate_result = run_diff_gate(
+                    handle,
+                    baseline,
+                    allowed_write_scope=rubric.write_scope,
+                    forbidden_globs=rubric.forbidden_globs,
+                    strict_scope=strict_scope,
+                )
+                diff_text = capture_sandbox_diff(handle, baseline)
+                changed_paths = list(gate_result.changed_paths)
+                if gate_result.rejected:
+                    result = ArenaCandidateResult(
+                        candidate_id=candidate_id,
+                        role=candidate_role,
+                        driver_spec=driver_spec,
+                        strategy_hint=strategy_hint,
+                        changed_paths=changed_paths,
+                        diff_summary=_summarize_diff(changed_paths, diff_text),
+                        diff_bytes=len(diff_text.encode("utf-8")),
+                        diff_gate_passed=False,
+                        diff_gate_error=gate_result.rejection_message(),
+                        verification_passed=False,
+                        verification_exit_code=None,
+                        verification_excerpt="",
+                        status="rejected",
+                        worktree_status="active",
+                        error=gate_result.rejection_message(),
+                    )
+                else:
+                    verified, exit_code, excerpt = self._verify_candidate_sandbox(
+                        handle=handle,
+                        commands=rubric.verification_plan,
+                        timeout_s=verify_timeout_s,
+                        node_name=node_name,
+                    )
+                    clean_ephemeral_artifacts(handle, baseline, write_scope=rubric.write_scope)
+                    diff_text = capture_sandbox_diff(handle, baseline)
+                    changed_paths = collect_sandbox_changes(handle, baseline)
+                    result = ArenaCandidateResult(
+                        candidate_id=candidate_id,
+                        role=candidate_role,
+                        driver_spec=driver_spec,
+                        strategy_hint=strategy_hint,
+                        changed_paths=changed_paths,
+                        diff_summary=_summarize_diff(changed_paths, diff_text),
+                        diff_bytes=len(diff_text.encode("utf-8")),
+                        diff_gate_passed=True,
+                        diff_gate_error="",
+                        verification_passed=verified,
+                        verification_exit_code=exit_code,
+                        verification_excerpt=excerpt,
+                        status="completed",
+                        worktree_status="active",
+                        error="",
+                    )
         except CraftPause:
             raise
+        except (
+            TurnCancelledError,
+            concurrent.futures.CancelledError,
+            asyncio.CancelledError,
+        ) as exc:
+            result = ArenaCandidateResult(
+                candidate_id=candidate_id,
+                role=candidate_role,
+                driver_spec=driver_spec,
+                strategy_hint=strategy_hint,
+                changed_paths=[],
+                diff_summary="Candidate execution cancelled.",
+                diff_bytes=0,
+                diff_gate_passed=False,
+                diff_gate_error="",
+                verification_passed=False,
+                verification_exit_code=None,
+                verification_excerpt="",
+                status="cancelled",
+                worktree_status="active",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001 - isolate one candidate failure from peers
             result = ArenaCandidateResult(
                 candidate_id=candidate_id,
@@ -804,7 +1043,8 @@ class ArenaStage:
             f"ArenaRubric:\n{rubric_json}\n\n"
             f"Required candidate IDs in `scores`: {json.dumps(candidate_ids)}\n"
             f"Required criterion IDs per candidate: {json.dumps(criteria_ids)}\n"
-            f"Eligible winner_id choices (DiffGate passed): {json.dumps(list(eligible_ids))}\n\n"
+            f"Eligible winner_id choices (completed, DiffGate passed, verification passed): "
+            f"{json.dumps(list(eligible_ids))}\n\n"
             + "\n\n".join(dossier_parts)
             + "\n\nReturn JSON matching schema:\n"
             + json.dumps(ArenaVerdict.model_json_schema(), ensure_ascii=False)
@@ -829,6 +1069,7 @@ class ArenaStage:
                 rubric,
                 candidate_ids,
                 eligible_winner_ids=eligible_ids,
+                max_graft_items=max_graft_items,
             )
         except ValueError as exc:
             raise CraftPause(
@@ -868,16 +1109,30 @@ class ArenaStage:
         node_name: str,
         raw_input: str,
         rubric: ArenaRubric,
+        sketch: ArchitectSketch,
         verdict: ArenaVerdict,
+        winner_handle: SandboxHandle,
+        winner_baseline: SandboxBaseline,
         craft_handle: SandboxHandle,
         craft_baseline: SandboxBaseline,
         candidate_diffs: Mapping[str, str],
+        created_handles: list[tuple[str, SandboxHandle]],
+        resolved_base_sha: str | None,
         skill_refs: Sequence[str],
         strict_scope: bool,
         max_steps: int,
+        verify_timeout_s: int,
         max_graft_items: int,
     ) -> tuple[str, list[str], list[ArenaGraftItem]]:
-        active_grafts = list(verdict.graft_items[:max_graft_items])
+        if len(verdict.graft_items) > max_graft_items:
+            raise CraftPause(
+                node_name,
+                f"ArenaVerdict proposed {len(verdict.graft_items)} graft_items, exceeding "
+                f"max_graft_items={max_graft_items}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        active_grafts = list(verdict.graft_items)
         if not active_grafts:
             diff = capture_sandbox_diff(craft_handle, craft_baseline)
             changed = collect_sandbox_changes(craft_handle, craft_baseline)
@@ -895,7 +1150,49 @@ class ArenaStage:
             )
             return diff, changed, []
 
-        winner_diff = capture_sandbox_diff(craft_handle, craft_baseline)
+        # Run graft in an isolated staging worktree initialized from the winner so any error,
+        # cancellation, DiffGate violation, or verification regression leaves craft_handle intact.
+        graft_label = f"{run_id}-arena-graft"
+        planned_graft = _planned_sandbox_handle(
+            self.workspace_root,
+            label=graft_label,
+            sandbox_root=self.sandbox_root,
+            is_git_worktree=is_git_repo(self.workspace_root),
+        )
+        created_handles.append(("graft", planned_graft))
+        graft_idx = len(created_handles) - 1
+        graft_handle = create_sandbox(
+            self.workspace_root,
+            label=graft_label,
+            reuse=False,
+            sandbox_root=self.sandbox_root,
+            base_ref=resolved_base_sha,
+        )
+        created_handles[graft_idx] = ("graft", graft_handle)
+        graft_baseline = snapshot_sandbox_state(graft_handle)
+        save_sandbox_baseline(graft_handle, graft_baseline)
+
+        graft_promoter = CraftStage(
+            store=self.store,
+            workspace_root=graft_handle.workspace_path,
+            provider=self.provider,
+            artifacts_root=self.artifacts_root,
+            sandbox_root=self.sandbox_root,
+            execution_drivers=self.execution_drivers,
+            driver_registry=self.driver_registry,
+            model_provider=self.model_provider,
+            on_driver_handle=self.on_driver_handle,
+            command_runner=self._run_command,
+            allow_unsandboxed_repro=self._allow_unsandboxed_repro,
+        )
+        graft_promoter._promote_sandbox_to_workspace(
+            winner_handle,
+            winner_baseline,
+            sketch,
+            node_name=node_name,
+        )
+
+        winner_diff = capture_sandbox_diff(graft_handle, graft_baseline)
         source_blocks: list[str] = []
         seen_sources: set[str] = set()
         for item in active_grafts:
@@ -925,7 +1222,7 @@ class ArenaStage:
         user_prompt = (
             f"Goal:\n{raw_input}\n\n"
             f"Sandbox Root (use this directory for all file paths): "
-            f"{craft_handle.workspace_path}\n"
+            f"{graft_handle.workspace_path}\n"
             f"Winning candidate: {verdict.winner_id}\n"
             f"Authorized write_scope: {json.dumps(rubric.write_scope)}\n"
             f"Forbidden globs: {json.dumps(rubric.forbidden_globs)}\n\n"
@@ -934,24 +1231,56 @@ class ArenaStage:
             f"{_trim_output(winner_diff, _MAX_GRAFT_DIFF_CHARS)}\n```\n\n"
             + "\n\n".join(source_blocks)
         )
-        self._run_worker_turn(
-            run_id=run_id,
-            node_name=node_name,
-            role="builder",
-            actor="hephaestus:arena_graft",
-            workspace_path=craft_handle.workspace_path,
-            write_scope=rubric.write_scope,
-            forbidden_globs=rubric.forbidden_globs,
-            strict_scope=strict_scope,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_steps=max_steps,
-            trace_name="graft",
-        )
-        clean_ephemeral_artifacts(craft_handle, craft_baseline, write_scope=rubric.write_scope)
+        try:
+            graft_outcome, _ = self._run_worker_turn(
+                run_id=run_id,
+                node_name=node_name,
+                role="builder",
+                actor="hephaestus:arena_graft",
+                workspace_path=graft_handle.workspace_path,
+                write_scope=rubric.write_scope,
+                forbidden_globs=rubric.forbidden_globs,
+                strict_scope=strict_scope,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_steps=max_steps,
+                trace_name="graft",
+            )
+        except (
+            TurnCancelledError,
+            concurrent.futures.CancelledError,
+            asyncio.CancelledError,
+        ) as exc:
+            raise CraftPause(
+                node_name,
+                f"Arena graft turn cancelled; winner craft sandbox preserved untouched: {exc}",
+                route="blocked",
+                pause_kind="blocked",
+            ) from exc
+        except CraftPause:
+            raise
+        except Exception as exc:  # noqa: BLE001 - preserve winner sandbox on graft failure
+            raise CraftPause(
+                node_name,
+                f"Arena graft turn failed ({type(exc).__name__}: {exc}); "
+                "winner craft sandbox preserved untouched.",
+                route="blocked",
+                pause_kind="blocked",
+            ) from exc
+
+        if _is_cancelled_stop_reason(graft_outcome.stop_reason) or not graft_outcome.completed:
+            raise CraftPause(
+                node_name,
+                f"Arena graft turn did not complete (stop_reason={graft_outcome.stop_reason!r}); "
+                "winner craft sandbox preserved untouched.",
+                route="blocked",
+                pause_kind="blocked",
+            )
+
+        clean_ephemeral_artifacts(graft_handle, graft_baseline, write_scope=rubric.write_scope)
         gate_result = run_diff_gate(
-            craft_handle,
-            craft_baseline,
+            graft_handle,
+            graft_baseline,
             allowed_write_scope=rubric.write_scope,
             forbidden_globs=rubric.forbidden_globs,
             strict_scope=strict_scope,
@@ -963,8 +1292,32 @@ class ArenaStage:
                 route="blocked",
                 pause_kind="blocked",
             )
+        verified, exit_code, excerpt = self._verify_candidate_sandbox(
+            handle=graft_handle,
+            commands=rubric.verification_plan,
+            timeout_s=verify_timeout_s,
+            node_name=node_name,
+        )
+        if not verified or exit_code != 0:
+            raise CraftPause(
+                node_name,
+                f"Arena graft failed verification (exit={exit_code}); "
+                f"winner craft sandbox preserved untouched.\n{excerpt}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        clean_ephemeral_artifacts(graft_handle, graft_baseline, write_scope=rubric.write_scope)
+
+        # Graft passed DiffGate + verification: transactionally commit onto craft_handle.
+        changed = _mirror_sandbox_changes(
+            source_handle=graft_handle,
+            target_handle=craft_handle,
+            base_baseline=craft_baseline,
+            allowed_write_scope=rubric.write_scope,
+            forbidden_globs=rubric.forbidden_globs,
+            node_name=node_name,
+        )
         grafted_diff = capture_sandbox_diff(craft_handle, craft_baseline)
-        changed = list(gate_result.changed_paths)
         (self._arena_dir(run_id) / "grafted.patch").write_text(grafted_diff, encoding="utf-8")
         self._append_event(
             run_id=run_id,
@@ -1065,23 +1418,34 @@ class ArenaStage:
         candidate_slots: list[tuple[str, str, str, SandboxHandle, SandboxBaseline]] = []
         created_handles: list[tuple[str, SandboxHandle]] = []
         cleanup_statuses: dict[str, Literal["active", "cleaned", "cleanup_failed"]] = {}
+        cleanup_errors: list[str] = []
         candidate_results: dict[str, ArenaCandidateResult] = {}
         candidate_diffs: dict[str, str] = {}
+        git_repo = is_git_repo(self.workspace_root)
 
         try:
             for idx in range(1, num_candidates + 1):
                 cid = f"cand_{idx}"
                 role = resolved_roles[idx - 1]
                 hint = _strategy_hint_for_index(idx)
+                label = f"{run_id}-arena-{cid}"
+                # Register the target path BEFORE creation so mid-creation failures still clean up.
+                planned = _planned_sandbox_handle(
+                    self.workspace_root,
+                    label=label,
+                    sandbox_root=self.sandbox_root,
+                    is_git_worktree=git_repo,
+                )
+                created_handles.append((cid, planned))
+                handle_idx = len(created_handles) - 1
                 handle = create_sandbox(
                     self.workspace_root,
-                    label=f"{run_id}-arena-{cid}",
+                    label=label,
                     reuse=False,
                     sandbox_root=self.sandbox_root,
+                    base_ref=resolved_base_sha,
                 )
-                created_handles.append((cid, handle))
-                handle = _checkout_sandbox_ref(handle, resolved_base_sha)
-                created_handles[-1] = (cid, handle)
+                created_handles[handle_idx] = (cid, handle)
                 baseline = snapshot_sandbox_state(handle)
                 save_sandbox_baseline(handle, baseline)
                 candidate_slots.append((cid, role, hint, handle, baseline))
@@ -1118,17 +1482,23 @@ class ArenaStage:
             eligible_ids = [
                 cand.candidate_id
                 for cand in ordered_results
-                if cand.diff_gate_passed and cand.status == "completed"
+                if cand.status == "completed"
+                and cand.diff_gate_passed
+                and cand.verification_passed
+                and cand.verification_exit_code == 0
             ]
             if not eligible_ids:
                 details = "; ".join(
-                    f"{cand.candidate_id}={cand.status} ({cand.error or 'no details'})"
+                    f"{cand.candidate_id}={cand.status} "
+                    f"(diff_gate={cand.diff_gate_passed}, "
+                    f"verified={cand.verification_passed}, "
+                    f"exit={cand.verification_exit_code}, "
+                    f"{cand.error or 'no details'})"
                     for cand in ordered_results
                 )
                 raise CraftPause(
                     node_name,
-                    f"All {num_candidates} arena candidates failed DiffGate or execution: "
-                    f"{details}",
+                    f"No eligible arena candidates passed DiffGate and verification: {details}",
                     route="blocked",
                     pause_kind="blocked",
                 )
@@ -1170,14 +1540,14 @@ class ArenaStage:
                 verification_plan=list(rubric.verification_plan),
             )
 
-            # Create a clean craft sandbox and atomically promote the winning candidate into it.
+            # Create a clean craft sandbox locked at the exact same resolved_base_sha.
             craft_handle = create_sandbox(
                 self.workspace_root,
                 label=f"{run_id}-craft",
                 reuse=False,
                 sandbox_root=self.sandbox_root,
+                base_ref=resolved_base_sha,
             )
-            craft_handle = _checkout_sandbox_ref(craft_handle, resolved_base_sha)
             craft_baseline = snapshot_sandbox_state(craft_handle)
             save_sandbox_baseline(craft_handle, craft_baseline)
 
@@ -1207,27 +1577,44 @@ class ArenaStage:
                 node_name=node_name,
                 raw_input=raw_input,
                 rubric=rubric,
+                sketch=sketch,
                 verdict=verdict,
+                winner_handle=winner_handle,
+                winner_baseline=winner_baseline,
                 craft_handle=craft_handle,
                 craft_baseline=craft_baseline,
                 candidate_diffs=candidate_diffs,
+                created_handles=created_handles,
+                resolved_base_sha=resolved_base_sha,
                 skill_refs=skill_refs,
                 strict_scope=strict_scope,
                 max_steps=max_steps,
+                verify_timeout_s=verify_timeout_s,
                 max_graft_items=max_graft_items,
             )
         finally:
-            # Guaranteed sequential cleanup of every temporary candidate worktree.
+            # Guaranteed strict sequential cleanup of every temporary candidate & graft worktree.
             for cid, handle in created_handles:
                 try:
-                    remove_sandbox(handle)
+                    remove_sandbox(handle, strict=True)
                     cleanup_statuses[cid] = "cleaned"
-                except Exception:  # noqa: BLE001 - best-effort cleanup of remaining worktrees
+                except Exception as exc:  # noqa: BLE001 - continue cleaning remaining worktrees
                     cleanup_statuses[cid] = "cleanup_failed"
+                    cleanup_errors.append(f"{cid} ({handle.workspace_path}): {exc}")
+                    self._append_event(
+                        run_id=run_id,
+                        event_type="arena.cleanup_failed",
+                        actor=f"arena:{cid}",
+                        payload={
+                            "candidate_id": cid,
+                            "workspace_path": str(handle.workspace_path),
+                            "error": str(exc),
+                        },
+                    )
 
         finalized_candidates = [
             candidate_results[cid].model_copy(
-                update={"worktree_status": cleanup_statuses.get(cid, "cleaned")}
+                update={"worktree_status": cleanup_statuses.get(cid, "cleanup_failed")}
             )
             for cid, *_ in candidate_slots
         ]
@@ -1240,6 +1627,14 @@ class ArenaStage:
             json.dumps(dumped_candidates, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if cleanup_errors:
+            raise CraftPause(
+                node_name,
+                "Failed to clean up temporary arena worktree(s): " + "; ".join(cleanup_errors),
+                route="blocked",
+                pause_kind="blocked",
+                state_updates={"arena_candidates": dumped_candidates},
+            )
         (arena_dir / "summary.json").write_text(
             json.dumps(
                 {

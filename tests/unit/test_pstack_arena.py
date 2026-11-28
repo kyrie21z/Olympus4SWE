@@ -10,6 +10,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -886,5 +887,717 @@ def test_arena_verification_plan_sanitizer_preserves_fail_closed(tmp_path: Path)
         _filter_allowed_verification_plan(all_disallowed, workspace_root=tmp_path)
         == all_disallowed
     )
+
+
+# ---------------------------------------------------------------------- 7. Codex review hardening
+
+
+def test_arena_verification_failure_and_cancellation_cannot_win(tmp_path: Path) -> None:
+    """Finding 1: failed verification and cancelled turns are never eligible winners."""
+    from olympus.harness.loop import TurnCancelledError
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    sandbox_root = tmp_path / "sandboxes"
+
+    # Case A: cand_1 passes verification, cand_2 passes DiffGate but fails unittest (exit=1).
+    # Judge attempting to pick cand_2 must be deterministically rejected.
+    run_a = store.create_run(
+        title="Arena verify fail winner rejected",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    def worker_a(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:cand_1":
+            (req.workspace_path / "calc.py").write_text(
+                "def compute(x: int, y: int) -> int:\n    return x + y\n",
+                encoding="utf-8",
+            )
+        else:
+            (req.workspace_path / "calc.py").write_text(
+                "def compute(x: int, y: int) -> int:\n    return x * y\n",
+                encoding="utf-8",
+            )
+        return "done"
+
+    def judge_picks_failing_cand_2(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_2",
+            scores={
+                "cand_1": {"correctness": 9.0, "simplicity": 8.0, "clarity": 8.0},
+                "cand_2": {"correctness": 9.5, "simplicity": 9.0, "clarity": 9.0},
+            },
+            rationale="Improperly picking failing cand_2.",
+        ).model_dump_json()
+
+    stage_a = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker_a),
+                "judge": _ScriptedDriver("judge", judge_picks_failing_cand_2),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="failed deterministic validation"):
+        stage_a.arena_race(
+            run_id=run_a,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+    # Case B: both candidates fail verification -> pauses without invoking judge.
+    run_b = store.create_run(
+        title="Arena all fail verification",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    judge_called = False
+
+    def should_not_run_judge(req: DriverTurnRequest) -> str:
+        nonlocal judge_called
+        judge_called = True
+        del req
+        raise AssertionError("Judge must not be invoked when zero candidates pass verification")
+
+    def worker_all_fail(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x * y\n",
+            encoding="utf-8",
+        )
+        return "broken"
+
+    stage_b = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker_all_fail),
+                "judge": _ScriptedDriver("judge", should_not_run_judge),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="No eligible arena candidates passed DiffGate and verif"):
+        stage_b.arena_race(
+            run_id=run_b,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert judge_called is False
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+    # Case C: cancelled candidate (via TurnOutcome stop_reason='cancelled' OR TurnCancelledError)
+    # is marked status='cancelled', never 'completed', and cannot win.
+    run_c = store.create_run(
+        title="Arena cancelled candidate",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    class _CancellingDriver:
+        name = "cancelling"
+
+        def run_turn(
+            self,
+            request: DriverTurnRequest,
+            *,
+            on_event: DriverEvent | None = None,
+            on_handle: Callable[[ActiveTurnHandle], None] | None = None,
+        ) -> TurnOutcome:
+            del on_event, on_handle
+            if request.actor == "hephaestus:cand_1":
+                (request.workspace_path / "calc.py").write_text(
+                    "def compute(x: int, y: int) -> int:\n    return x + y\n",
+                    encoding="utf-8",
+                )
+                return TurnOutcome(
+                    completed=True,
+                    stop_reason="completed",
+                    final_content="ok",
+                    steps_taken=1,
+                    driver_name=self.name,
+                )
+            if request.actor == "hephaestus:cand_2":
+                # Even if a partial edit happened before cancel, status MUST be cancelled.
+                (request.workspace_path / "calc.py").write_text(
+                    "def compute(x: int, y: int) -> int:\n    return x + y\n",
+                    encoding="utf-8",
+                )
+                return TurnOutcome(
+                    completed=False,
+                    stop_reason="cancelled",
+                    final_content="",
+                    steps_taken=1,
+                    driver_name=self.name,
+                )
+            raise TurnCancelledError("cancelled")
+
+    def judge_picks_cand_1(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 0.0, "simplicity": 0.0, "clarity": 0.0},
+                "cand_3": {"correctness": 0.0, "simplicity": 0.0, "clarity": 0.0},
+            },
+            rationale="Only cand_1 completed and verified cleanly.",
+        ).model_dump_json()
+
+    stage_c = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="cancelling",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "cancelling": _CancellingDriver(),
+                "judge": _ScriptedDriver("judge", judge_picks_cand_1),
+            }
+        ),
+    )
+    out_c = stage_c.arena_race(
+        run_id=run_c,
+        raw_input="Fix calc.compute.",
+        state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        num_candidates=3,
+    )
+    by_id = {c["candidate_id"]: c for c in out_c["arena_candidates"]}
+    assert by_id["cand_1"]["status"] == "completed"
+    assert by_id["cand_2"]["status"] == "cancelled"
+    assert by_id["cand_2"]["verification_passed"] is False
+    assert by_id["cand_3"]["status"] == "cancelled"
+    assert by_id["cand_3"]["verification_passed"] is False
+
+
+def test_arena_graft_failure_preserves_winner_craft_sandbox(tmp_path: Path) -> None:
+    """Finding 2: graft exception, DiffGate violation, or verification failure never corrupts
+    the winning candidate's craft sandbox.
+    """
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    sandbox_root = tmp_path / "sandboxes"
+    winner_code = "def compute(x: int, y: int) -> int:\n    return x + y\n"
+
+    def judge_with_graft(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 9.5, "simplicity": 9.5, "clarity": 9.0},
+                "cand_2": {"correctness": 9.0, "simplicity": 8.0, "clarity": 8.5},
+            },
+            graft_items=[
+                ArenaGraftItem(
+                    source_candidate_id="cand_2",
+                    idea="Add helper check from cand_2.",
+                    target_files=["calc.py"],
+                )
+            ],
+            convergence_mode="winner_plus_graft",
+            rationale="cand_1 wins; attempt graft from cand_2.",
+        ).model_dump_json()
+
+    # Sub-case 1: graft breaks calc.py and fails verification -> craft sandbox stays pristine.
+    run_verif_fail = store.create_run(
+        title="Arena graft verification rollback",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    def worker_graft_breaks_tests(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:arena_graft":
+            (req.workspace_path / "calc.py").write_text(
+                "def compute(x: int, y: int) -> int:\n    return x - y - 999\n",
+                encoding="utf-8",
+            )
+            return "regressed graft"
+        (req.workspace_path / "calc.py").write_text(winner_code, encoding="utf-8")
+        return "ok"
+
+    stage_1 = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker_graft_breaks_tests),
+                "judge": _ScriptedDriver("judge", judge_with_graft),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="Arena graft failed verification"):
+        stage_1.arena_race(
+            run_id=run_verif_fail,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert (sandbox_root / f"{run_verif_fail}-craft" / "calc.py").read_text(
+        encoding="utf-8"
+    ) == winner_code
+    assert not (sandbox_root / f"{run_verif_fail}-arena-graft").exists()
+
+    # Sub-case 2: graft raises mid-edit -> craft sandbox stays pristine.
+    run_exc = store.create_run(
+        title="Arena graft exception rollback",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    def worker_graft_explodes(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:arena_graft":
+            (req.workspace_path / "calc.py").write_text("CORRUPT HALF-WRITE\n", encoding="utf-8")
+            raise RuntimeError("graft crashed mid-edit")
+        (req.workspace_path / "calc.py").write_text(winner_code, encoding="utf-8")
+        return "ok"
+
+    stage_2 = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker_graft_explodes),
+                "judge": _ScriptedDriver("judge", judge_with_graft),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="graft crashed mid-edit"):
+        stage_2.arena_race(
+            run_id=run_exc,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert (sandbox_root / f"{run_exc}-craft" / "calc.py").read_text(
+        encoding="utf-8"
+    ) == winner_code
+    assert not (sandbox_root / f"{run_exc}-arena-graft").exists()
+
+
+def test_arena_strict_cleanup_on_partial_create_and_removal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 3: partial create cleans up immediately; failed removal is never reported cleaned."""
+    from olympus.harness import worktree as wt_mod
+    from olympus.stages import arena as arena_mod
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    sandbox_root = tmp_path / "sandboxes"
+
+    # Sub-case A: cand_2 creation leaves a partial directory and raises -> both cleaned up.
+    run_partial = store.create_run(
+        title="Arena partial create failure",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    real_create = arena_mod.create_sandbox
+    call_count = 0
+
+    def flaky_create(repo_root: Path | str, **kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            partial_dir = Path(kwargs["sandbox_root"]) / kwargs["label"]
+            partial_dir.mkdir(parents=True, exist_ok=True)
+            (partial_dir / "partial.tmp").write_text("leaked", encoding="utf-8")
+            raise RuntimeError("injected create_sandbox crash on cand_2")
+        return real_create(repo_root, **kwargs)
+
+    monkeypatch.setattr(arena_mod, "create_sandbox", flaky_create)
+    stage_a = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+    )
+    with pytest.raises(RuntimeError, match="injected create_sandbox crash on cand_2"):
+        stage_a.arena_race(
+            run_id=run_partial,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    assert not (sandbox_root / f"{run_partial}-arena-cand_1").exists()
+    assert not (sandbox_root / f"{run_partial}-arena-cand_2").exists()
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+    monkeypatch.setattr(arena_mod, "create_sandbox", real_create)
+
+    # Sub-case B: strict remove_sandbox fails on cand_2 -> NOT reported cleaned & raises CraftPause.
+    run_fail_rm = store.create_run(
+        title="Arena cleanup failure reported honestly",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    real_remove = arena_mod.remove_sandbox
+
+    def failing_remove(handle: Any, *, strict: bool = False) -> None:
+        if handle.workspace_path.name.endswith("cand_2"):
+            raise RuntimeError(f"locked directory: {handle.workspace_path}")
+        real_remove(handle, strict=strict)
+
+    def ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def ok_judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 8.0},
+            },
+            rationale="cand_1 wins.",
+        ).model_dump_json()
+
+    monkeypatch.setattr(arena_mod, "remove_sandbox", failing_remove)
+    stage_b = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=sandbox_root,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", ok_worker),
+                "judge": _ScriptedDriver("judge", ok_judge),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="Failed to clean up temporary arena worktree"):
+        stage_b.arena_race(
+            run_id=run_fail_rm,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+        )
+    monkeypatch.setattr(arena_mod, "remove_sandbox", real_remove)
+    # Verify honest worktree_status persisted and cleanup_failed event recorded.
+    persisted = json.loads(
+        (tmp_path / "artifacts" / run_fail_rm / "arena" / "candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    by_id = {item["candidate_id"]: item for item in persisted}
+    assert by_id["cand_1"]["worktree_status"] == "cleaned"
+    assert by_id["cand_2"]["worktree_status"] == "cleanup_failed"
+    assert any(ev.event_type == "arena.cleanup_failed" for ev in store.list_events(run_fail_rm))
+    # Clean up the simulated locked cand_2 directory now.
+    real_remove(
+        wt_mod.SandboxHandle(repo, sandbox_root / f"{run_fail_rm}-arena-cand_2", None, True),
+        strict=True,
+    )
+
+    # Sub-case C: worktree.remove_sandbox(strict=True) itself raises if directory persists.
+    stuck_dir = tmp_path / "stuck_sandbox"
+    stuck_dir.mkdir()
+    monkeypatch.setattr(wt_mod.shutil, "rmtree", lambda *_a, **_kw: None)
+    with pytest.raises(RuntimeError, match="directory still exists"):
+        wt_mod.remove_sandbox(wt_mod.SandboxHandle(repo, stuck_dir, None, False), strict=True)
+
+
+def test_pooled_provider_concurrent_429_does_not_skip_healthy_endpoint() -> None:
+    """Finding 4: concurrent 429 on endpoint A advances once to B and never skips to C."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from olympus.providers.auth import CredentialPool, EndpointTarget, PooledProvider
+    from olympus.providers.types import ChatMessage, HttpStatusError
+
+    endpoints = [
+        EndpointTarget(base_url="https://ep-a.test", api_key="key-a"),
+        EndpointTarget(base_url="https://ep-b.test", api_key="key-b"),
+        EndpointTarget(base_url="https://ep-c.test", api_key="key-c"),
+    ]
+    pool = CredentialPool(endpoints)
+    barrier = threading.Barrier(2, timeout=5.0)
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    class _Concurrent429Dialect:
+        wire_api = "openai-completions"
+
+        def send(self, endpoint: EndpointTarget, **_kwargs: Any) -> LLMResponse:
+            with calls_lock:
+                calls.append(endpoint.base_url)
+            if endpoint.base_url == "https://ep-a.test":
+                barrier.wait()
+                raise HttpStatusError(
+                    status_code=429,
+                    url=endpoint.base_url,
+                    body_preview="rate limited",
+                )
+            if endpoint.base_url == "https://ep-b.test":
+                return LLMResponse(content="served-by-b")
+            raise AssertionError(f"Endpoint C must never be hit; got {endpoint.base_url}")
+
+    provider = PooledProvider(
+        model_name="test-model",
+        dialect=_Concurrent429Dialect(),  # type: ignore[arg-type]
+        pool=pool,
+    )
+    msg = [ChatMessage(role="user", content="hello")]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(provider.complete, messages=msg) for _ in range(2)]
+        results = [f.result() for f in futures]
+
+    assert [r.content for r in results] == ["served-by-b", "served-by-b"]
+    assert pool.active_index == 1
+    assert "https://ep-c.test" not in calls
+    assert calls.count("https://ep-b.test") == 2
+
+
+def test_arena_locks_base_ref_uniformly_and_rejects_explicit_ref_in_non_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 5: base_ref (including HEAD) locks to one SHA across all sandboxes; non-git
+    explicit base_ref fails closed.
+    """
+    from olympus.stages import arena as arena_mod
+
+    # Sub-case A: non-git directory with explicit base_ref must fail closed.
+    nongit = tmp_path / "nongit"
+    nongit.mkdir()
+    (nongit / "calc.py").write_text("def compute(x, y): return x - y\n", encoding="utf-8")
+    store = RunStore(tmp_path / "olympus.db")
+    run_ng = store.create_run(
+        title="Arena non-git explicit base_ref",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+    stage_ng = ArenaStage(
+        store=store,
+        workspace_root=nongit,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    with pytest.raises(CraftPause, match="not a git repository"):
+        stage_ng.arena_race(
+            run_id=run_ng,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+            base_ref="main",
+        )
+
+    # Sub-case B: HEAD advances mid-creation -> cand_1, cand_2, and craft all stay pinned
+    # to the single initial locked SHA.
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    initial_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    real_create = arena_mod.create_sandbox
+    recorded_base_commits: list[str | None] = []
+    moved_head = False
+
+    def moving_head_create(repo_root: Path | str, **kwargs: Any) -> Any:
+        nonlocal moved_head
+        handle = real_create(repo_root, **kwargs)
+        recorded_base_commits.append(handle.base_commit)
+        if not moved_head:
+            moved_head = True
+            (repo / "README.md").write_text("# Moved HEAD\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "advance HEAD mid-race"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+        return handle
+
+    monkeypatch.setattr(arena_mod, "create_sandbox", moving_head_create)
+    run_locked = store.create_run(
+        title="Arena locked base_ref SHA",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    def ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def ok_judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 8.0},
+            },
+            rationale="cand_1 wins.",
+        ).model_dump_json()
+
+    stage_locked = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", ok_worker),
+                "judge": _ScriptedDriver("judge", ok_judge),
+            }
+        ),
+    )
+    stage_locked.arena_race(
+        run_id=run_locked,
+        raw_input="Fix calc.compute.",
+        state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+    )
+    assert len(recorded_base_commits) == 3  # cand_1, cand_2, craft
+    assert all(sha == initial_sha for sha in recorded_base_commits)
+
+
+def test_arena_verdict_rejects_duplicate_stripped_criteria_and_excess_grafts(
+    tmp_path: Path,
+) -> None:
+    """Finding 6: duplicate normalized criterion keys raise ValidationError; excess graft_items
+    are rejected deterministically before persisting verdict.
+    """
+    # Duplicate criterion key after .strip() must raise ValidationError (never overwrite).
+    with pytest.raises(ValidationError, match="duplicate criterion_id"):
+        ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {
+                    "correctness": 9.0,
+                    "correctness ": 2.0,
+                    "simplicity": 8.0,
+                    "clarity": 8.0,
+                },
+                "cand_2": {"correctness": 8.0, "simplicity": 8.0, "clarity": 8.0},
+            },
+            rationale="duplicate criterion key after stripping",
+        )
+
+    # Excess graft_items (> max_graft_items) rejected in judge validation before persistence.
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena excess graft_items rejected",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    def ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def judge_too_many_grafts(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.0, "clarity": 9.0},
+                "cand_2": {"correctness": 9.0, "simplicity": 8.0, "clarity": 8.5},
+            },
+            graft_items=[
+                ArenaGraftItem(source_candidate_id="cand_2", idea="graft 1"),
+                ArenaGraftItem(source_candidate_id="cand_2", idea="graft 2"),
+                ArenaGraftItem(source_candidate_id="cand_2", idea="graft 3"),
+            ],
+            convergence_mode="winner_plus_graft",
+            rationale="Too many grafts.",
+        ).model_dump_json()
+
+    artifacts_root = tmp_path / "artifacts"
+    stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=artifacts_root,
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", ok_worker),
+                "judge": _ScriptedDriver("judge", judge_too_many_grafts),
+            }
+        ),
+    )
+    with pytest.raises(CraftPause, match="exceeding max_graft_items=2"):
+        stage.arena_race(
+            run_id=run_id,
+            raw_input="Fix calc.compute.",
+            state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+            max_graft_items=2,
+        )
+    assert not (artifacts_root / run_id / "arena" / "verdict.json").exists()
+    assert not any(ev.event_type == "arena.judged" for ev in store.list_events(run_id))
+    assert _git_worktree_paths(repo) == [repo.resolve()]
 
 

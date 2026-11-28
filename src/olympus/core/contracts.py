@@ -1020,7 +1020,7 @@ class ArenaCandidateResult(FingerprintedModel):
     verification_passed: bool = False
     verification_exit_code: int | None = None
     verification_excerpt: str = ""
-    status: Literal["completed", "rejected", "failed"] = "completed"
+    status: Literal["completed", "rejected", "failed", "cancelled"] = "completed"
     worktree_status: Literal["active", "cleaned", "cleanup_failed"] = "cleaned"
     error: str = ""
 
@@ -1101,6 +1101,11 @@ class ArenaVerdict(FingerprintedModel):
                     raise ValueError(
                         f"ArenaVerdict.scores[{cid!r}] contains an empty criterion_id"
                     )
+                if crit in crit_map:
+                    raise ValueError(
+                        f"ArenaVerdict.scores[{cid!r}] has duplicate criterion_id {crit!r} "
+                        "after normalization"
+                    )
                 if not math.isfinite(score) or not (0.0 <= score <= 10.0):
                     raise ValueError(
                         f"ArenaVerdict score for {cid!r}.{crit!r} must be within [0, 10], "
@@ -1155,6 +1160,7 @@ class ArenaVerdict(FingerprintedModel):
         candidate_ids: Sequence[str],
         *,
         eligible_winner_ids: Sequence[str] | None = None,
+        max_graft_items: int | None = None,
     ) -> None:
         """Deterministically verify verdict alignment with rubric criteria and candidates."""
         expected_candidates = {cid.strip() for cid in candidate_ids if cid.strip()}
@@ -1178,6 +1184,11 @@ class ArenaVerdict(FingerprintedModel):
                     f"ArenaVerdict.winner_id {self.winner_id!r} is not an eligible passing "
                     f"candidate {sorted(eligible)}"
                 )
+        if max_graft_items is not None and len(self.graft_items) > max_graft_items:
+            raise ValueError(
+                f"ArenaVerdict proposed {len(self.graft_items)} graft_items, exceeding "
+                f"max_graft_items={max_graft_items}"
+            )
 
     def weighted_totals(self, rubric: ArenaRubric) -> dict[str, float]:
         """Compute deterministic weighted totals for each scored candidate."""

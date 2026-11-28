@@ -52,6 +52,8 @@ from olympus.stages.hillclimb import (
     _parse_safe_argv,
     _probe_bwrap,
     _probe_bwrap_unshare_net,
+    _probe_bwrap_unshare_pid,
+    _run_argv_command,
     hillclimb_loop,
     parse_metric_value,
     snapshot_frozen_harness,
@@ -816,6 +818,7 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
         assert captured_cmds
         bwrap_cmd = captured_cmds[-1]
         assert "--unshare-net" in bwrap_cmd
+        assert "--unshare-pid" in bwrap_cmd
         assert "--tmpfs" in bwrap_cmd
         bench_resolved = str((repo / "bench.py").resolve())
         ro_pairs = [
@@ -843,6 +846,64 @@ def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
                 timeout_s=30,
                 node_name="hillclimb",
             )
+
+        # Fail closed when --unshare-pid is unavailable under require_fs_isolation=True.
+        monkeypatch.setattr(hillclimb_mod, "_probe_bwrap_unshare_net", lambda: True)
+        monkeypatch.setattr(hillclimb_mod, "_probe_bwrap_unshare_pid", lambda: False)
+        with pytest.raises(HillclimbPause, match="unshare-pid"):
+            strict_stage._measure_metric(
+                sandbox_path=repo,
+                config=cfg,
+                timeout_s=30,
+                node_name="hillclimb",
+            )
+
+
+def test_bwrap_mounts_multi_hop_symlinked_interpreter_prefixes_and_hides_host_pids(
+    tmp_path: Path,
+) -> None:
+    if _probe_bwrap() is None or not _probe_bwrap_unshare_net() or not _probe_bwrap_unshare_pid():
+        pytest.skip("bwrap with --unshare-net and --unshare-pid unavailable")
+
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    host_secret = tmp_path / "unrelated_secret.txt"
+    host_secret.write_text("SECRET", encoding="utf-8")
+    (repo / "bench.py").write_text(
+        "import os, pathlib, solver\n"
+        f"print('HOST_SECRET=' + str(pathlib.Path({str(host_secret)!r}).exists()))\n"
+        "pids = [p for p in os.listdir('/proc') if p.isdigit()]\n"
+        "print(f'PROC_COUNT={len(pids)}')\n"
+        "print(f'SCORE={solver.score_value()}')\n",
+        encoding="utf-8",
+    )
+
+    # Simulate a venv python symlink traversing a symlinked directory into another prefix
+    # (mirroring GitHub Actions uv/toolcache layouts).
+    real_py_prefix = tmp_path / "ext_real_py"
+    (real_py_prefix / "bin").mkdir(parents=True)
+    os.symlink(sys.executable, real_py_prefix / "bin" / "python3")
+    alias_py_prefix = tmp_path / "ext_alias_py"
+    os.symlink(real_py_prefix, alias_py_prefix)
+    venv_prefix = tmp_path / "ext_venv"
+    (venv_prefix / "bin").mkdir(parents=True)
+    venv_python = venv_prefix / "bin" / "python"
+    os.symlink(alias_py_prefix / "bin" / "python3", venv_python)
+
+    code, output = _run_argv_command(
+        [str(venv_python), "bench.py"],
+        cwd=repo,
+        timeout_s=30,
+        host_root=repo,
+        require_fs_isolation=True,
+        read_only_files=[repo / "bench.py"],
+    )
+    assert code == 0, output
+    assert "SCORE=100" in output
+    assert "HOST_SECRET=False" in output
+    # Under --unshare-pid, /proc only exposes the tiny sandbox PID namespace (<= 5 PIDs).
+    proc_line = next(line for line in output.splitlines() if line.startswith("PROC_COUNT="))
+    assert int(proc_line.split("=", 1)[1]) <= 5
 
 
 def test_pre_execution_tamper_short_circuits_without_running_metric_and_unsandboxed_runtime_tamper(
@@ -1605,3 +1666,155 @@ def test_session_runner_starts_and_resumes_pstack_hillclimb_from_verify_surface(
     assert "return 14" in (repo / "solver.py").read_text(encoding="utf-8")
     # Worker was NOT re-invoked on resume; loader routed straight to HillclimbStage.verify_surface!
     assert len(scripted.calls) == 1
+
+
+def test_latest_argus_gate_host_mode_drift_and_session_start_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "olympus.sqlite")
+
+    # 1. Promotion gate MUST honor ONLY the LATEST actor=='argus' verify_recorded event.
+    repo_gate = tmp_path / "repo_gate"
+    _init_opt_repo(repo_gate)
+    run_gate = store.create_run(
+        title="Latest argus gate",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_gate,
+    )
+
+    def _ok_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 22\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Improve to 22"
+
+    stage_gate = HillclimbStage(
+        store=store,
+        workspace_root=repo_gate,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_gate",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_ok_worker)}),
+    )
+    cfg_gate = _base_config(direction="minimize", max_iterations=1)
+    res_gate = stage_gate.hillclimb_loop(run_id=run_gate, raw_input="Opt", config=cfg_gate)
+    win_sha = res_gate["hillclimb_winning_commit_sha"]
+
+    # Record a passing Argus verification, then a LATER failing Argus verification, then a
+    # non-argus fake pass — promote_winner MUST reject!
+    stage_gate.verify_surface(run_id=run_gate, state=res_gate, apply_to_workspace=False)
+    store.append_event(
+        run_id=run_gate,
+        stage="hillclimb",
+        event_type="craft.verify_recorded",
+        actor="argus",
+        payload={
+            "passed": False,
+            "winning_commit_sha": win_sha,
+            "config_hash": cfg_gate.content_hash,
+            "summary": "Later argus verification failed",
+        },
+    )
+    store.append_event(
+        run_id=run_gate,
+        stage="hillclimb",
+        event_type="craft.verify_recorded",
+        actor="hephaestus",
+        payload={
+            "passed": True,
+            "winning_commit_sha": win_sha,
+            "config_hash": cfg_gate.content_hash,
+            "summary": "Spoofed non-argus pass",
+        },
+    )
+    with pytest.raises(HillclimbPause, match="missing passing Argus verify_surface"):
+        stage_gate.promote_winner(run_id=run_gate, state=res_gate)
+    assert "return 100" in (repo_gate / "solver.py").read_text(encoding="utf-8")
+
+    # 2. Host permission mode drift (chmod 0o600 on host solver.py) MUST block promotion!
+    os.chmod(repo_gate / "solver.py", 0o600)
+    with pytest.raises(HillclimbPause, match="host workspace drifted"):
+        stage_gate.verify_surface(run_id=run_gate, state=res_gate, apply_to_workspace=True)
+    assert stat.S_IMODE((repo_gate / "solver.py").stat().st_mode) == 0o600
+    assert "return 100" in (repo_gate / "solver.py").read_text(encoding="utf-8")
+
+    # 3. SessionRunner.start(..., hillclimb_config=explicit_cfg) overrides SessionConfig default
+    # consistently for both the initial run and a resumed SessionRunner!
+    repo_sess = tmp_path / "repo_sess"
+    _init_opt_repo(repo_sess)
+    gate_file = tmp_path / "override_gate.flag"
+    (repo_sess / "check_gate.py").write_text(
+        "import pathlib, sys\n"
+        f"sys.exit(0 if pathlib.Path({str(gate_file)!r}).exists() else 1)\n",
+        encoding="utf-8",
+    )
+    _git(repo_sess, "add", "check_gate.py")
+    _git(repo_sess, "commit", "-m", "add override gate")
+
+    monkeypatch.setenv("OLYMPUS_ALLOW_UNSANDBOXED_REPRO", "1")
+    monkeypatch.setattr(hillclimb_mod, "_probe_bwrap", lambda: None)
+
+    scripted_sess = _ScriptedDriver(_ok_worker)
+    orig_factories = hillclimb_mod.default_driver_factories
+
+    def _factories_override(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        factories = dict(orig_factories(*args, **kwargs))
+        factories["scripted"] = lambda: scripted_sess
+        return factories
+
+    monkeypatch.setattr(hillclimb_mod, "default_driver_factories", _factories_override)
+
+    default_cfg = _base_config(direction="minimize", target_value=None, max_iterations=5)
+    override_cfg = _base_config(direction="minimize", target_value=25.0, max_iterations=2)
+    assert default_cfg.content_hash != override_cfg.content_hash
+
+    sess_dir = tmp_path / "sess_override_state"
+    runner = SessionRunner(
+        SessionConfig(
+            workspace_root=repo_sess,
+            state_dir=sess_dir,
+            workflow="pstack_hillclimb",
+            step_mode=StepMode.EXECUTE,
+            stage_driver="native",
+            worker_driver="scripted",
+            reviewer_driver="native",
+            hillclimb_config=default_cfg.model_dump(mode="json"),
+            metadata={"verification_commands": [f"{sys.executable} check_gate.py"]},
+            provider_builder=lambda **_kw: _mock_provider([_sample_evidence()]),
+        )
+    )
+    env1 = runner.start(
+        goal="Optimize with explicit override config",
+        hillclimb_config=override_cfg.model_dump(mode="json"),
+    )
+    assert env1.status == "needs_input"
+    base_evs = [
+        ev
+        for ev in runner.store.list_events(env1.run_id)
+        if ev.event_type == "hillclimb.baseline_recorded"
+    ]
+    assert base_evs and base_evs[0].payload["config_hash"] == override_cfg.content_hash
+
+    # Resume with a brand-new SessionRunner that STILL carries default_cfg in SessionConfig!
+    gate_file.write_text("go", encoding="utf-8")
+    resumed = SessionRunner(
+        SessionConfig(
+            workspace_root=repo_sess,
+            state_dir=sess_dir,
+            workflow="pstack_hillclimb",
+            step_mode=StepMode.EXECUTE,
+            stage_driver="native",
+            worker_driver="scripted",
+            reviewer_driver="native",
+            hillclimb_config=default_cfg.model_dump(mode="json"),
+            provider_builder=lambda **_kw: _mock_provider([]),
+        )
+    )
+    env2 = resumed.reply(run_id=env1.run_id, message="retry")
+    assert env2.status == "completed", env2
+    assert "return 22" in (repo_sess / "solver.py").read_text(encoding="utf-8")

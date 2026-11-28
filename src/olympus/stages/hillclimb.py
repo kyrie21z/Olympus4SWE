@@ -201,48 +201,140 @@ _MINIMAL_SYSTEM_RO_MOUNTS: tuple[str, ...] = (
     "/etc/ssl",
     "/etc/ca-certificates",
 )
+_FORBIDDEN_RO_PREFIXES: frozenset[Path] = frozenset(
+    {
+        Path("/"),
+        Path("/home"),
+        Path("/Users"),
+        Path("/root"),
+        Path("/tmp"),
+        Path("/var"),
+        Path("/var/tmp"),
+        Path("/opt"),
+        Path("/etc"),
+    }
+)
 
 
-def _minimal_bwrap_ro_mounts(
+def _is_safe_ro_prefix(path: Path, *, cwd_resolved: Path, metric_tmp: Path) -> bool:
+    """Return True when ``path`` is a narrow install/runtime prefix safe to mount read-only."""
+    norm = Path(os.path.abspath(str(path)))
+    home = Path(os.path.abspath(str(Path.home())))
+    home_res = Path.home().resolve(strict=False)
+    if norm in _FORBIDDEN_RO_PREFIXES or norm in {home, home_res}:
+        return False
+    # Never mount /home/<user> or /Users/<user> directly.
+    if len(norm.parts) == 3 and norm.parts[1] in {"home", "Users"}:
+        return False
+    if norm == cwd_resolved or norm.is_relative_to(cwd_resolved):
+        return False
+    if norm == metric_tmp or norm.is_relative_to(metric_tmp):
+        return False
+    return not (cwd_resolved.is_relative_to(norm) or metric_tmp.is_relative_to(norm))
+
+
+def _system_ro_mount_args() -> list[str]:
+    """Build read-only system mounts, preserving usrmerge root symlinks (/bin -> usr/bin)."""
+    args: list[str] = []
+    for raw in _MINIMAL_SYSTEM_RO_MOUNTS:
+        p = Path(raw)
+        if p.is_symlink():
+            args.extend(["--symlink", os.readlink(p), raw])
+        elif p.exists():
+            args.extend(["--ro-bind", raw, raw])
+    return args
+
+
+def _collect_ancestor_symlinks(path: Path) -> list[tuple[Path, str]]:
+    """Return any symlinked directory components along ``path`` (shallowest first)."""
+    found: list[tuple[Path, str]] = []
+    cur = Path("/")
+    for part in Path(os.path.abspath(str(path))).parts[1:]:
+        cur = cur / part
+        if cur.is_symlink():
+            found.append((cur, os.readlink(cur)))
+    return found
+
+
+def _minimal_bwrap_mount_args(
     argv: Sequence[str],
     *,
     cwd_resolved: Path,
     metric_tmp: Path,
-) -> list[Path]:
-    """Build minimal read-only system + Python/toolchain mounts (never ``/``)."""
-    raw_candidates: list[Path] = [Path(item) for item in _MINIMAL_SYSTEM_RO_MOUNTS]
+) -> list[str]:
+    """Build minimal read-only system + symlink-resolved Python/toolchain bwrap mount args.
+
+    Walks every hop of symlink chains for ``argv[0]`` and ``sys.executable`` as well as
+    ``sys.prefix`` / ``sys.base_prefix`` (including both unresolved and resolved install
+    prefixes such as ``<prefix>/bin`` + ``<prefix>/lib``) without exposing ``/`` or host home.
+    """
+    symlinks: dict[Path, str] = {}
+    ro_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+
+    def _add_ro_dir(candidate: Path) -> None:
+        if not (candidate.exists() or candidate.is_symlink()):
+            return
+        norm = Path(os.path.abspath(str(candidate)))
+        for anc_link, anc_target in _collect_ancestor_symlinks(norm):
+            symlinks.setdefault(anc_link, anc_target)
+        resolved = norm.resolve(strict=False)
+        if not resolved.exists():
+            return
+        if not _is_safe_ro_prefix(resolved, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp):
+            return
+        if resolved not in seen_dirs:
+            seen_dirs.add(resolved)
+            ro_dirs.append(resolved)
+
+    def _walk_executable_chain(exe: Path) -> None:
+        cur = Path(os.path.abspath(str(exe)))
+        visited: set[Path] = set()
+        for _ in range(16):
+            if cur in visited or not (cur.exists() or cur.is_symlink()):
+                break
+            visited.add(cur)
+            _add_ro_dir(cur.parent)
+            if cur.parent.name in {"bin", "Scripts"}:
+                _add_ro_dir(cur.parent.parent)
+            if not cur.is_symlink():
+                break
+            raw_target = os.readlink(cur)
+            nxt = Path(raw_target) if os.path.isabs(raw_target) else (cur.parent / raw_target)
+            cur = Path(os.path.abspath(str(nxt)))
+
     for prefix in (sys.prefix, sys.base_prefix):
         if prefix:
-            raw_candidates.append(Path(prefix))
-    exe_path = Path(sys.executable)
-    raw_candidates.append(exe_path.parent)
-    raw_candidates.append(exe_path.resolve(strict=False).parent)
+            _add_ro_dir(Path(prefix))
+
+    _walk_executable_chain(Path(sys.executable))
     if argv:
         bin_path = Path(argv[0])
         if bin_path.is_absolute():
-            raw_candidates.append(bin_path.parent)
-            raw_candidates.append(bin_path.resolve(strict=False).parent)
+            _walk_executable_chain(bin_path)
 
-    mounts: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in raw_candidates:
-        if not candidate.exists():
+    args: list[str] = _system_ro_mount_args()
+    # Emit real directory ro-binds first (skipping already-covered subdirs), then symlinks.
+    system_dirs = {
+        Path(raw).resolve(strict=False)
+        for raw in _MINIMAL_SYSTEM_RO_MOUNTS
+        if Path(raw).exists()
+    }
+    mounted_dirs: list[Path] = list(system_dirs)
+    for ro_dir in sorted(ro_dirs, key=lambda item: len(item.parts)):
+        if any(ro_dir == existing or ro_dir.is_relative_to(existing) for existing in mounted_dirs):
             continue
-        # Preserve symlinked prefix locations (e.g. /bin -> /usr/bin) when resolving dedup.
-        norm = Path(os.path.abspath(str(candidate)))
-        if norm == Path("/"):
+        args.extend(["--ro-bind", str(ro_dir), str(ro_dir)])
+        mounted_dirs.append(ro_dir)
+    system_links = {Path(raw) for raw in _MINIMAL_SYSTEM_RO_MOUNTS}
+    for link_path, target in sorted(symlinks.items(), key=lambda item: len(item[0].parts)):
+        if link_path in system_links or any(
+            link_path == existing or link_path.is_relative_to(existing)
+            for existing in mounted_dirs
+        ):
             continue
-        if norm == cwd_resolved or norm.is_relative_to(cwd_resolved):
-            continue
-        if norm == metric_tmp or norm.is_relative_to(metric_tmp):
-            continue
-        # Never mount an ancestor directory that would expose cwd or host /home root.
-        if cwd_resolved.is_relative_to(norm) or metric_tmp.is_relative_to(norm):
-            continue
-        if norm not in seen:
-            seen.add(norm)
-            mounts.append(norm)
-    return mounts
+        args.extend(["--symlink", target, str(link_path)])
+    return args
 
 
 @functools.lru_cache(maxsize=1)
@@ -251,11 +343,18 @@ def _probe_bwrap() -> str | None:
     bwrap_bin = shutil.which("bwrap", path="/usr/bin:/bin:/usr/local/bin")
     if bwrap_bin is None:
         return None
-    cmd: list[str] = [bwrap_bin, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
-    for item in _MINIMAL_SYSTEM_RO_MOUNTS:
-        if Path(item).exists():
-            cmd.extend(["--ro-bind", item, item])
-    cmd.extend(["--", "/bin/true"])
+    cmd: list[str] = [
+        bwrap_bin,
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        *_system_ro_mount_args(),
+        "--",
+        "/bin/true",
+    ]
     try:
         probe = subprocess.run(
             cmd,
@@ -285,11 +384,43 @@ def _probe_bwrap_unshare_net() -> bool:
         "/dev",
         "--tmpfs",
         "/tmp",
+        *_system_ro_mount_args(),
+        "--",
+        "/bin/true",
     ]
-    for item in _MINIMAL_SYSTEM_RO_MOUNTS:
-        if Path(item).exists():
-            cmd.extend(["--ro-bind", item, item])
-    cmd.extend(["--", "/bin/true"])
+    try:
+        probe = subprocess.run(
+            cmd,
+            shell=False,
+            capture_output=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_bwrap_unshare_pid() -> bool:
+    """Return True when ``bwrap --unshare-pid`` works alongside ``--proc /proc``."""
+    bwrap_bin = _probe_bwrap()
+    if bwrap_bin is None:
+        return False
+    cmd: list[str] = [
+        bwrap_bin,
+        "--unshare-pid",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        *_system_ro_mount_args(),
+        "--",
+        "/bin/true",
+    ]
     try:
         probe = subprocess.run(
             cmd,
@@ -512,21 +643,31 @@ def _run_argv_command(
     cmd: list[str] = list(argv)
     if bwrap_bin is not None:
         unshare_net_ok = _probe_bwrap_unshare_net()
-        if not unshare_net_ok and require_fs_isolation:
+        unshare_pid_ok = _probe_bwrap_unshare_pid()
+        if (not unshare_net_ok or not unshare_pid_ok) and require_fs_isolation:
             shutil.rmtree(metric_tmp, ignore_errors=True)
+            missing = [
+                flag
+                for flag, ok in (
+                    ("--unshare-net", unshare_net_ok),
+                    ("--unshare-pid", unshare_pid_ok),
+                )
+                if not ok
+            ]
             raise _SandboxIsolationUnavailableError(
-                "bwrap --unshare-net is unavailable; refusing network-enabled metric "
+                f"bwrap {' '.join(missing)} is unavailable; refusing weakly isolated metric "
                 "execution (set allow_unsandboxed_metric=True or "
                 "OLYMPUS_ALLOW_UNSANDBOXED_REPRO=1 to opt in explicitly)"
             )
         bwrap_cmd: list[str] = [bwrap_bin]
         if unshare_net_ok:
             bwrap_cmd.append("--unshare-net")
+        if unshare_pid_ok:
+            bwrap_cmd.append("--unshare-pid")
         bwrap_cmd.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
-        for ro_mount in _minimal_bwrap_ro_mounts(
-            argv, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp
-        ):
-            bwrap_cmd.extend(["--ro-bind", str(ro_mount), str(ro_mount)])
+        bwrap_cmd.extend(
+            _minimal_bwrap_mount_args(argv, cwd_resolved=cwd_resolved, metric_tmp=metric_tmp)
+        )
         bwrap_cmd.extend(["--bind", str(cwd_resolved), str(cwd_resolved)])
         # Overlay frozen harness files read-only inside the sandbox mount namespace.
         for ro_file in read_only_files:
@@ -651,16 +792,46 @@ def _git_blob_fingerprint(repo_root: Path, base_commit: str, rel: str) -> str | 
     return f"git:{'x' if is_exec else 'f'}:{digest}"
 
 
+_HOST_WALK_SKIP = frozenset({".git", ".venv", ".olympus", "__pycache__", "node_modules"})
+
+
+def snapshot_host_write_scope(
+    ws_root: Path,
+    write_scope: Sequence[str],
+    forbidden_paths: Sequence[str] = (),
+) -> dict[str, str | None]:
+    """Snapshot exact host ``mode:sha256`` fingerprints for all files under ``write_scope``."""
+    policy = WorkspacePolicy(
+        allowed_write_scope=list(write_scope),
+        forbidden_write_scope=list(forbidden_paths),
+    )
+    root = ws_root.resolve()
+    fingerprints: dict[str, str | None] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in _HOST_WALK_SKIP)
+        for name in sorted(filenames):
+            candidate = Path(dirpath) / name
+            rel = candidate.relative_to(root).as_posix()
+            if policy.forbidden_match(rel) is not None or not policy.allows_relative_path(rel):
+                continue
+            fingerprints[rel] = _host_path_fingerprint(candidate)
+    return fingerprints
+
+
 def _host_matches_baseline(
     *,
     ws_root: Path,
     rel: str,
     baseline: SandboxBaseline,
+    host_baseline_fingerprints: Mapping[str, str | None] | None = None,
 ) -> bool:
-    """Return True iff host ``ws_root / rel`` has not drifted since ``baseline``."""
+    """Return True iff host ``ws_root / rel`` has not drifted (content, type, or exact mode)."""
     dst = ws_root / rel
-    before_map = baseline.mapping()
     current = _host_path_fingerprint(dst)
+    if host_baseline_fingerprints is not None:
+        expected_fp = host_baseline_fingerprints.get(rel)
+        return current == expected_fp
+    before_map = baseline.mapping()
     if rel in before_map:
         return current == before_map[rel]
     if baseline.is_git and baseline.base_commit is not None:
@@ -1161,20 +1332,23 @@ class HillclimbStage:
         expected_commit_sha: str,
         expected_config_hash: str,
     ) -> bool:
-        """Return True iff SQLite holds a passing Argus verify_surface bound to commit+config."""
-        for event in reversed(self.store.list_events(run_id)):
-            if event.event_type != "craft.verify_recorded":
-                continue
-            payload = event.payload
-            if not isinstance(payload, Mapping):
-                continue
-            if (
-                payload.get("passed") is True
-                and payload.get("winning_commit_sha") == expected_commit_sha
-                and payload.get("config_hash") == expected_config_hash
-            ):
-                return True
-        return False
+        """Return True iff the LATEST Argus verify_surface event passed for commit+config."""
+        argus_events = [
+            event
+            for event in self.store.list_events(run_id)
+            if event.event_type == "craft.verify_recorded" and event.actor == "argus"
+        ]
+        if not argus_events:
+            return False
+        latest = max(argus_events, key=lambda event: event.event_seq)
+        payload = latest.payload
+        if not isinstance(payload, Mapping):
+            return False
+        return (
+            payload.get("passed") is True
+            and payload.get("winning_commit_sha") == expected_commit_sha
+            and payload.get("config_hash") == expected_config_hash
+        )
 
     def _promote_sandbox_to_workspace(
         self,
@@ -1186,6 +1360,7 @@ class HillclimbStage:
         expected_commit_sha: str | None = None,
         run_id: str | None = None,
         require_verified: bool = False,
+        host_baseline_fingerprints: Mapping[str, str | None] | None = None,
         node_name: str = "hillclimb",
     ) -> list[str]:
         if require_verified:
@@ -1364,11 +1539,16 @@ class HillclimbStage:
                     )
                 ancestor = ancestor.parent
 
-        # Phase 1b: verify host workspace has NOT drifted since baseline on any mutated path.
+        # Phase 1b: verify host workspace has NOT drifted (content, type, or mode) since baseline.
         drifted_paths = [
             rel
             for rel in changed
-            if not _host_matches_baseline(ws_root=ws_root, rel=rel, baseline=baseline)
+            if not _host_matches_baseline(
+                ws_root=ws_root,
+                rel=rel,
+                baseline=baseline,
+                host_baseline_fingerprints=host_baseline_fingerprints,
+            )
         ]
         if drifted_paths:
             raise HillclimbPause(
@@ -1543,6 +1723,7 @@ class HillclimbStage:
             expected_commit_sha=auth["expected_commit_sha"],
             run_id=run_id,
             require_verified=True,
+            host_baseline_fingerprints=auth.get("host_baseline_fingerprints"),
             node_name=node_name,
         )
         remove_sandbox(handle)
@@ -1701,6 +1882,12 @@ class HillclimbStage:
                 consecutive_non_improving = 0
             else:
                 consecutive_non_improving += 1
+        raw_host_fps = baseline_payload.get("host_baseline_fingerprints")
+        host_baseline_fingerprints: dict[str, str | None] | None = (
+            {str(k): (None if v is None else str(v)) for k, v in raw_host_fps.items()}
+            if isinstance(raw_host_fps, Mapping)
+            else None
+        )
         return {
             "baseline_payload": baseline_payload,
             "rows": sqlite_rows,
@@ -1709,6 +1896,7 @@ class HillclimbStage:
             "best_metric": best_metric,
             "expected_commit_sha": expected_commit_sha,
             "consecutive_non_improving": consecutive_non_improving,
+            "host_baseline_fingerprints": host_baseline_fingerprints,
         }
 
     # ------------------------------------------------------------------ composite primitive
@@ -1812,6 +2000,9 @@ class HillclimbStage:
                 )
             baseline_metric = measured_base
 
+            host_baseline_fingerprints = snapshot_host_write_scope(
+                self.workspace_root, cfg.write_scope, cfg.frozen_harness_paths
+            )
             self.store.append_event(
                 run_id=run_id,
                 stage="hillclimb",
@@ -1830,6 +2021,7 @@ class HillclimbStage:
                     "base_commit": last_kept_sha,
                     "frozen_hashes": dict(frozen_hashes),
                     "frozen_harness_hashes": dict(frozen_hashes),
+                    "host_baseline_fingerprints": host_baseline_fingerprints,
                 },
             )
             best_metric = baseline_metric

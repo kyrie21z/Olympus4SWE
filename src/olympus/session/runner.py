@@ -354,20 +354,25 @@ class SessionRunner:
             )
         workflow_path = _yaml_workflow_path(self.config.workflow)
         clean_constraints = [str(item).strip() for item in (constraints or []) if str(item).strip()]
+        explicit_meta = dict(metadata or {})
         merged_metadata: dict[str, Any] = {
             **dict(self.config.metadata),
-            **dict(metadata or {}),
+            **explicit_meta,
         }
         effective_hillclimb_cfg = (
             dict(hillclimb_config)
             if hillclimb_config is not None
             else (
-                dict(self.config.hillclimb_config)
-                if self.config.hillclimb_config is not None
+                dict(explicit_meta["hillclimb_config"])
+                if isinstance(explicit_meta.get("hillclimb_config"), dict)
                 else (
-                    dict(merged_metadata["hillclimb_config"])
-                    if isinstance(merged_metadata.get("hillclimb_config"), dict)
-                    else None
+                    dict(self.config.hillclimb_config)
+                    if self.config.hillclimb_config is not None
+                    else (
+                        dict(self.config.metadata["hillclimb_config"])
+                        if isinstance(self.config.metadata.get("hillclimb_config"), dict)
+                        else None
+                    )
                 )
             )
         )
@@ -749,23 +754,37 @@ class SessionRunner:
         except Exception as exc:  # noqa: BLE001 -- surface graph/runtime setup failure as SessionEnvelope
             return self._fail(run_id, exc)
         snap = self.store.get_run(run_id)
-        session_metadata: dict[str, Any] = dict(self.config.metadata)
-        hillclimb_cfg: dict[str, Any] | None = (
-            dict(self.config.hillclimb_config)
-            if self.config.hillclimb_config is not None
-            else None
-        )
+        # Prefer the authoritative configuration persisted in session.started for this run_id
+        # over self.config defaults so explicit start() overrides stay consistent across resume.
+        started_meta: dict[str, Any] = {}
+        started_hc: dict[str, Any] | None = None
         for event in self.store.list_events(run_id):
             if event.event_type != "session.started":
                 continue
             ev_meta = event.payload.get("metadata")
             if isinstance(ev_meta, dict):
-                session_metadata = {**ev_meta, **session_metadata}
+                started_meta.update(ev_meta)
             ev_hc = event.payload.get("hillclimb_config")
-            if hillclimb_cfg is None and isinstance(ev_hc, dict):
-                hillclimb_cfg = dict(ev_hc)
-        if hillclimb_cfg is None and isinstance(session_metadata.get("hillclimb_config"), dict):
-            hillclimb_cfg = dict(session_metadata["hillclimb_config"])
+            if isinstance(ev_hc, dict):
+                started_hc = dict(ev_hc)
+        session_metadata: dict[str, Any] = {**dict(self.config.metadata), **started_meta}
+        hillclimb_cfg: dict[str, Any] | None = (
+            started_hc
+            if started_hc is not None
+            else (
+                dict(started_meta["hillclimb_config"])
+                if isinstance(started_meta.get("hillclimb_config"), dict)
+                else (
+                    dict(self.config.hillclimb_config)
+                    if self.config.hillclimb_config is not None
+                    else (
+                        dict(session_metadata["hillclimb_config"])
+                        if isinstance(session_metadata.get("hillclimb_config"), dict)
+                        else None
+                    )
+                )
+            )
+        )
         state: dict[str, Any] = {
             "run_id": run_id,
             "raw_input": raw_input,

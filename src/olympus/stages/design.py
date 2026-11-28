@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +40,78 @@ from olympus.tools.aci import WorkspaceToolkit
 
 # Free-form prose below this length can never carry a frozen contract.
 _MIN_STRUCTURED_CHARS = 400
+
+
+class DesignVariant(StrEnum):
+    """Independent lenses a candidate DesignSpec is drafted from.
+
+    Each variant runs its own cold-start AgentLoop and never sees the other drafts; the merge
+    happens afterwards in a separate synthesis turn so the trade-off stays auditable.
+    """
+
+    PRODUCT = "product_led"
+    ENGINEERING = "engineering_led"
+    RISK = "risk_led"
+
+
+DEFAULT_DESIGN_VARIANTS: tuple[DesignVariant, ...] = (
+    DesignVariant.PRODUCT,
+    DesignVariant.ENGINEERING,
+    DesignVariant.RISK,
+)
+
+# Per-variant mandates appended to the shared architect prompt. They deliberately pull in
+# different directions so the panel produces genuinely different seams instead of three
+# paraphrases of one design.
+_VARIANT_BRIEFS: dict[DesignVariant, str] = {
+    DesignVariant.PRODUCT: (
+        "MANDATE (product-led): optimise for the observable surfaces in the GoalSpec. Keep the "
+        "smallest module set that still delivers every acceptance criterion, make behaviour at "
+        "the seam explicit, and prefer deferring anything out_of_scope over speculative "
+        "generality. State which requirement each module exists for."
+    ),
+    DesignVariant.ENGINEERING: (
+        "MANDATE (engineering-led): optimise for deep modules with narrow interfaces. Put "
+        "shared invariants and error envelopes in one place, make each interface hard to misuse, "
+        "and justify every module boundary by information hiding rather than by file layout. "
+        "Call out seams that would force callers to change when internals change."
+    ),
+    DesignVariant.RISK: (
+        "MANDATE (risk-led): optimise for failure containment. Identify the concurrency, "
+        "ordering, and partial-write hazards implied by the GoalSpec, give each a module or "
+        "invariant that owns it, and refuse any design whose failure mode is a silent wrong "
+        "write. Prefer an extra explicit module over an implicit assumption."
+    ),
+}
+
+_ARBITER_SYSTEM_PROMPT = """You are the Stage 1.5 Design Arbiter (Momus-of-design) of
+Olympus4SWE. You receive several independently drafted DesignSpec candidates for the SAME
+frozen GoalSpec, each with the verdict of the zero-token structural gate. Produce the single
+DesignSpec that will be frozen.
+
+Rules:
+1. Never invent a module, interface, or data model that no candidate proposed unless two
+   candidates disagree and the GoalSpec forces a choice.
+2. Prefer the candidate whose seams survive the gate with zero violations; when several do,
+   keep the module set that is smallest while still covering every requirement.
+3. When candidates conflict, resolve the conflict and record why in `strategy_rationale`.
+4. Preserve every shared invariant that any candidate declared; dropping one is a regression.
+5. Set spec_id and spec_hash to the values given in the prompt, and return one DesignSpec JSON
+   object matching the schema."""
+
+
+@dataclass(frozen=True)
+class DesignCandidate:
+    """One variant's draft plus the gate verdict that decided whether it can be used."""
+
+    variant: str
+    design: DesignSpec | None = None
+    violations: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.design is not None and not self.violations
 
 # Vocabulary that signals the author already reasoned about architecture seams.
 _SEAM_MARKERS: tuple[str, ...] = (
@@ -513,6 +589,246 @@ class DesignStage:
             )
         return design
 
+    def propose_design_panel(
+        self,
+        run_id: str,
+        *,
+        variants: Sequence[DesignVariant | str] | None = None,
+        synthesize: bool = True,
+        auto_approve: bool = False,
+        approver: str = "zeus",
+        max_steps: int = 16,
+    ) -> DesignSpec:
+        """Draft one DesignSpec per variant in parallel, archive every draft, then freeze one.
+
+        Unlike :meth:`propose_design`, each variant runs its own cold-start ``AgentLoop`` with
+        its own trace and never observes its peers. Every draft (usable or not) is written to
+        ``design_candidates/`` and recorded as an event, then a separate synthesis turn picks or
+        merges the winner. The deliberation stays auditable while the control plane still
+        freezes exactly one DesignSpec.
+        """
+        spec = self._require_confirmed_spec(run_id)
+        chosen = _normalize_variants(variants)
+        self.store.set_run_status(
+            run_id,
+            RunStatus.DESIGNING,
+            actor="design",
+            stage="design",
+            detail={"panel_variants": [variant.value for variant in chosen]},
+        )
+        toolkit = WorkspaceToolkit(self.workspace_root, read_only=True)
+        inventory = format_workspace_inventory(toolkit)
+        schema_json = json.dumps(DesignSpec.model_json_schema(), ensure_ascii=False)
+        run_dir = self._run_dir(run_id)
+
+        def stamp_binding(candidate: DesignSpec) -> DesignSpec:
+            return candidate.model_copy(
+                update={
+                    "spec_id": spec.spec_id,
+                    "spec_hash": spec.content_hash,
+                    "status": SpecStatus.AWAITING_HUMAN,
+                }
+            )
+
+        def design_gate(candidate: DesignSpec) -> list[str]:
+            return validate_design_spec(candidate, spec, strict_v2=True)
+
+        def draft(variant: DesignVariant) -> DesignCandidate:
+            driver, driver_model = resolve_stage_driver(
+                settings=self.execution_drivers,
+                registry=self.driver_registry,
+                provider=self.provider,
+                store=self.store,
+                run_id=run_id,
+            )
+            brief = _VARIANT_BRIEFS[variant]
+            trace_path = run_dir / "traces" / f"designer-{variant.value}.jsonl"
+            actor = f"design:{variant.value}"
+            loop = AgentLoop(
+                provider=self.provider,
+                toolkit=toolkit,
+                store=self.store,
+                run_id=run_id,
+                actor=actor,
+                max_steps=max_steps,
+                trace_path=trace_path,
+            )
+            prompt = (
+                f"Workspace root: {self.workspace_root}\n"
+                f"{inventory}\n"
+                f"Frozen GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
+                f"GoalSpec markdown:\n{spec.to_markdown()}\n"
+                f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'.\n"
+                f"Return DesignSpec JSON matching schema:\n{schema_json}\n\n{brief}"
+            )
+            try:
+                design = run_structured_turn(
+                    loop=loop,
+                    driver=driver,
+                    driver_model=driver_model,
+                    store=self.store,
+                    run_id=run_id,
+                    workspace_root=self.workspace_root,
+                    actor=actor,
+                    system_prompt=f"{_DESIGN_SYSTEM_PROMPT}\n\n{brief}",
+                    user_prompt=prompt,
+                    model_cls=DesignSpec,
+                    trace_path=trace_path,
+                    max_steps=max_steps,
+                    max_validation_retries=2,
+                    validation_header="[DESIGN VALIDATION FAILED]",
+                    validation_instruction=(
+                        "Fix every violation and return a valid DesignSpec JSON object."
+                    ),
+                    transform=stamp_binding,
+                    validator=design_gate,
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad draft must not kill the panel
+                return DesignCandidate(variant=variant.value, error=str(exc))
+            return DesignCandidate(
+                variant=variant.value,
+                design=design,
+                violations=design_gate(design),
+            )
+
+        with ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+            candidates = list(pool.map(draft, chosen))
+
+        archived = _archive_candidates(run_dir, candidates)
+        self.store.append_event(
+            run_id=run_id,
+            stage="design",
+            event_type="design.candidates_produced",
+            actor="design:panel",
+            payload={
+                "variants": [candidate.variant for candidate in candidates],
+                "usable": [candidate.variant for candidate in candidates if candidate.usable],
+                "violations": {
+                    candidate.variant: candidate.violations
+                    for candidate in candidates
+                    if candidate.violations
+                },
+                "errors": {
+                    candidate.variant: candidate.error
+                    for candidate in candidates
+                    if candidate.error
+                },
+                "archived": archived,
+            },
+        )
+
+        usable = [candidate for candidate in candidates if candidate.usable]
+        if not usable:
+            raise DesignValidationError(
+                ["no usable design candidate from the panel", *_panel_failure_summary(candidates)]
+            )
+
+        if synthesize and len(usable) > 1:
+            design = self._synthesize_design(
+                run_id=run_id,
+                spec=spec,
+                candidates=usable,
+                inventory=inventory,
+                schema_json=schema_json,
+                run_dir=run_dir,
+                max_steps=max_steps,
+                transform=stamp_binding,
+                validator=design_gate,
+            )
+        else:
+            only = usable[0].design
+            if only is None:  # pragma: no cover - `usable` already guarantees a design
+                raise DesignValidationError(["design panel produced no design"])
+            design = only
+
+        self.store.save_design(run_id, design, actor="design:panel")
+        self.store.set_run_status(
+            run_id,
+            RunStatus.AWAITING_HUMAN,
+            actor="design",
+            stage="design",
+            detail={
+                "design_id": design.design_id,
+                "design_hash": design.content_hash,
+                "module_count": len(design.modules),
+                "panel_variants": [candidate.variant for candidate in candidates],
+                "panel_synthesized": bool(synthesize and len(usable) > 1),
+            },
+        )
+        if auto_approve:
+            self.approve_design(run_id=run_id, approver=approver, reason="auto_approve flag")
+        return design
+
+    def _synthesize_design(
+        self,
+        *,
+        run_id: str,
+        spec: GoalSpec,
+        candidates: Sequence[DesignCandidate],
+        inventory: str,
+        schema_json: str,
+        run_dir: Path,
+        max_steps: int,
+        transform: Callable[[DesignSpec], DesignSpec],
+        validator: Callable[[DesignSpec], list[str]],
+    ) -> DesignSpec:
+        """Fold the usable drafts into one DesignSpec with a cold-start arbiter turn."""
+        driver, driver_model = resolve_stage_driver(
+            settings=self.execution_drivers,
+            registry=self.driver_registry,
+            provider=self.provider,
+            store=self.store,
+            run_id=run_id,
+        )
+        trace_path = run_dir / "traces" / "design-arbiter.jsonl"
+        loop = AgentLoop(
+            provider=self.provider,
+            toolkit=WorkspaceToolkit(self.workspace_root, read_only=True),
+            store=self.store,
+            run_id=run_id,
+            actor="design:arbiter",
+            max_steps=max_steps,
+            trace_path=trace_path,
+        )
+        blocks: list[str] = []
+        for candidate in candidates:
+            payload = candidate.design.model_dump_json(indent=2) if candidate.design else "{}"
+            blocks.append(f"### Candidate {candidate.variant}\ngate: clean\n{payload}")
+        prompt = (
+            f"Workspace root: {self.workspace_root}\n"
+            f"{inventory}\n"
+            f"Frozen GoalSpec:\n{spec.model_dump_json(indent=2)}\n\n"
+            f"GoalSpec markdown:\n{spec.to_markdown()}\n"
+            f"Set spec_id='{spec.spec_id}' and spec_hash='{spec.content_hash}'.\n"
+            f"Return DesignSpec JSON matching schema:\n{schema_json}\n\n"
+            f"{len(candidates)} independent candidates follow. Produce the single design to "
+            f"freeze.\n\n" + "\n\n".join(blocks)
+        )
+        return run_structured_turn(
+            loop=loop,
+            driver=driver,
+            driver_model=driver_model,
+            store=self.store,
+            run_id=run_id,
+            workspace_root=self.workspace_root,
+            actor="design:arbiter",
+            system_prompt=_ARBITER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            model_cls=DesignSpec,
+            trace_path=trace_path,
+            max_steps=max_steps,
+            max_validation_retries=2,
+            validation_header="[DESIGN VALIDATION FAILED]",
+            validation_instruction=(
+                "Fix every violation and return a valid DesignSpec JSON object."
+            ),
+            transform=transform,
+            validator=validator,
+            on_validation_exhausted=lambda candidate, violations: _raise_panel_exhausted(
+                violations
+            ),
+        )
+
     def approve_design(
         self,
         run_id: str,
@@ -532,9 +848,64 @@ class DesignStage:
         )
 
 
+def _normalize_variants(
+    variants: Sequence[DesignVariant | str] | None,
+) -> tuple[DesignVariant, ...]:
+    """Coerce workflow params into a de-duplicated, ordered variant tuple."""
+    if variants is None:
+        return DEFAULT_DESIGN_VARIANTS
+    normalized: list[DesignVariant] = []
+    for raw in variants:
+        if isinstance(raw, DesignVariant):
+            normalized.append(raw)
+            continue
+        try:
+            normalized.append(DesignVariant(str(raw).strip().lower()))
+        except ValueError as exc:
+            allowed = ", ".join(variant.value for variant in DesignVariant)
+            raise ValueError(f"unknown design variant {raw!r}; allowed: {allowed}") from exc
+    unique = tuple(dict.fromkeys(normalized))
+    if not unique:
+        raise ValueError("design panel requires at least one variant")
+    return unique
+
+
+def _archive_candidates(run_dir: Path, candidates: Iterable[DesignCandidate]) -> list[str]:
+    """Persist every draft verbatim so the rejected ones stay inspectable after the fact."""
+    target = run_dir / "design_candidates"
+    target.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for candidate in candidates:
+        payload = {
+            "variant": candidate.variant,
+            "violations": candidate.violations,
+            "error": candidate.error,
+            "design": candidate.design.model_dump(mode="json") if candidate.design else None,
+        }
+        path = target / f"{candidate.variant}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        written.append(str(path))
+    return written
+
+
+def _panel_failure_summary(candidates: Sequence[DesignCandidate]) -> list[str]:
+    return [
+        f"{candidate.variant}: "
+        f"{candidate.error or '; '.join(candidate.violations) or 'no design'}"
+        for candidate in candidates
+    ]
+
+
+def _raise_panel_exhausted(violations: list[str]) -> DesignSpec:
+    raise DesignValidationError(violations)
+
+
 __all__ = [
+    "DEFAULT_DESIGN_VARIANTS",
+    "DesignCandidate",
     "DesignStage",
     "DesignValidationError",
+    "DesignVariant",
     "ExtractionProbe",
     "triage_input",
 ]

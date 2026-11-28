@@ -1,0 +1,103 @@
+name: panel_deliberation
+description: >-
+  Full SDLC with a multi-agent design panel: three independent cold-start architects draft
+  DesignSpec candidates under different mandates (product-led, engineering-led, risk-led),
+  every draft is archived with its zero-token gate verdict, and a fourth cold-start arbiter
+  folds them into the single DesignSpec that gets frozen. All three human gates stay enabled;
+  only the design step differs from full_sdlc_tdd.
+stop_after: execute
+topology: tdd_first
+nodes:
+  - name: intake
+    type: intake_triage
+  - name: align
+    type: align_goal
+    params:
+      strict_canonical: true
+  - name: critic
+    type: critic_parallel
+  - name: gate_spec
+    type: human_gate
+    params:
+      gate: spec
+  - name: design
+    type: design_panel
+    params:
+      variants:
+        - product_led
+        - engineering_led
+        - risk_led
+      synthesize: true
+  - name: validate_design
+    type: validate_design
+  - name: gate_design
+    type: human_gate
+    params:
+      gate: design
+  - name: plan
+    type: pm_decompose
+    params:
+      use_design: true
+  - name: validate_plan
+    type: validate_plan
+  - name: gate_plan
+    type: human_gate
+    params:
+      gate: plan
+  - name: execute
+    type: execute_task_dag
+edges:
+  - source: START
+    target: intake
+  - source: align
+    target: critic
+  - source: critic
+    target: gate_spec
+  - source: gate_spec
+    target: design
+  - source: design
+    target: validate_design
+  - source: gate_design
+    target: plan
+  - source: plan
+    target: validate_plan
+  - source: gate_plan
+    target: execute
+  - source: execute
+    target: END
+routers:
+  - at: intake
+    key: route
+    default: align
+    rules:
+      design_ready: validate_design
+      goal_ready: gate_spec
+      raw: align
+  - at: align
+    key: route
+    default: critic
+    rules:
+      blocked: gate_spec
+      ready: critic
+  - at: critic
+    key: route
+    default: gate_spec
+    rules:
+      blocked: gate_spec
+      ready: gate_spec
+  - at: validate_design
+    key: route
+    default: gate_design
+    rules:
+      ok: gate_design
+      fail: END
+  - at: validate_plan
+    key: route
+    default: gate_plan
+    rules:
+      ok: gate_plan
+      fail: END
+gates:
+  approve_spec: true
+  approve_design: true
+  approve_plan: true

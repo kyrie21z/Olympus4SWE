@@ -41,6 +41,7 @@ _NODE_TYPES: tuple[str, ...] = (
     "align_goal",
     "critic_parallel",
     "design_spec",
+    "design_panel",
     "validate_design",
     "pm_decompose",
     "validate_plan",
@@ -314,6 +315,34 @@ def _node_design(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, 
     except Exception as exc:  # noqa: BLE001 - surfaced as a clean graph pause
         raise GraphPaused(
             "design_spec",
+            str(exc),
+            {"route": "blocked", "pause_kind": "blocked"},
+        ) from exc
+    return {"design": design.model_dump(mode="json"), "route": "ready"}
+
+
+def _node_design_panel(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    """Draft several independent DesignSpec candidates, then freeze the synthesized winner."""
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    raw_variants = params.get("variants")
+    variants: list[str] | None = None
+    if isinstance(raw_variants, list):
+        variants = [str(item) for item in raw_variants]
+    raw_synthesize = params.get("synthesize")
+    synthesize = True if raw_synthesize is None else bool(raw_synthesize)
+    try:
+        design = _design_stage(runtime).propose_design_panel(
+            run_id,
+            variants=variants,
+            synthesize=synthesize,
+            auto_approve=False,
+            approver=runtime.approver,
+            max_steps=runtime.max_steps,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a clean graph pause
+        raise GraphPaused(
+            "design_panel",
             str(exc),
             {"route": "blocked", "pause_kind": "blocked"},
         ) from exc
@@ -667,6 +696,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any
     "align_goal": _node_align,
     "critic_parallel": _node_critique,
     "design_spec": _node_design,
+    "design_panel": _node_design_panel,
     "validate_design": _node_validate_design,
     "pm_decompose": _node_pm_decompose,
     "validate_plan": _node_validate_plan,

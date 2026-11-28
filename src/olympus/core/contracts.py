@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal, Self
@@ -946,3 +947,243 @@ class SurfaceVerificationReport(FingerprintedModel):
                     + ", ".join(non_passing)
                 )
         return self
+
+
+class ArenaRubricCriterion(FingerprintedModel):
+    criterion_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    weight: float = Field(default=1.0, gt=0.0, le=10.0)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash"})
+
+    @model_validator(mode="after")
+    def _validate_criterion(self) -> ArenaRubricCriterion:
+        cid = self.criterion_id.strip()
+        desc = self.description.strip()
+        if not cid:
+            raise ValueError("ArenaRubricCriterion.criterion_id must be non-empty")
+        if not desc:
+            raise ValueError("ArenaRubricCriterion.description must be non-empty")
+        if not math.isfinite(self.weight):
+            raise ValueError("ArenaRubricCriterion.weight must be finite")
+        self.criterion_id = cid
+        self.description = desc
+        return self._refresh_hash()
+
+
+class ArenaRubric(FingerprintedModel):
+    rubric_id: str = Field(default_factory=lambda: new_id("rubr"))
+    criteria: list[ArenaRubricCriterion] = Field(min_length=3, max_length=6)
+    write_scope: list[str] = Field(min_length=1)
+    forbidden_globs: list[str] = Field(default_factory=list)
+    verification_plan: list[str] = Field(min_length=1)
+    summary: str = ""
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "rubric_id"})
+
+    @model_validator(mode="after")
+    def _validate_rubric(self) -> ArenaRubric:
+        if not (3 <= len(self.criteria) <= 6):
+            raise ValueError("ArenaRubric must define between 3 and 6 criteria")
+        seen: set[str] = set()
+        for item in self.criteria:
+            if item.criterion_id in seen:
+                raise ValueError(
+                    f"ArenaRubric contains duplicate criterion_id {item.criterion_id!r}"
+                )
+            seen.add(item.criterion_id)
+        cleaned_scope = [item.strip() for item in self.write_scope if item.strip()]
+        if not cleaned_scope:
+            raise ValueError("ArenaRubric.write_scope must contain at least one path")
+        self.write_scope = cleaned_scope
+        cleaned_plan = [item.strip() for item in self.verification_plan if item.strip()]
+        if not cleaned_plan:
+            raise ValueError(
+                "ArenaRubric.verification_plan must contain at least one executable check"
+            )
+        self.verification_plan = cleaned_plan
+        return self._refresh_hash()
+
+
+class ArenaCandidateResult(FingerprintedModel):
+    candidate_id: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+    driver_spec: str = Field(min_length=1)
+    strategy_hint: str = ""
+    changed_paths: list[str] = Field(default_factory=list)
+    diff_summary: str = ""
+    diff_bytes: int = Field(default=0, ge=0)
+    diff_gate_passed: bool = False
+    diff_gate_error: str = ""
+    verification_passed: bool = False
+    verification_exit_code: int | None = None
+    verification_excerpt: str = ""
+    status: Literal["completed", "rejected", "failed"] = "completed"
+    worktree_status: Literal["active", "cleaned", "cleanup_failed"] = "cleaned"
+    error: str = ""
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash"})
+
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> ArenaCandidateResult:
+        cid = self.candidate_id.strip()
+        role = self.role.strip()
+        spec = self.driver_spec.strip()
+        if not cid:
+            raise ValueError("ArenaCandidateResult.candidate_id must be non-empty")
+        if not role:
+            raise ValueError("ArenaCandidateResult.role must be non-empty")
+        if not spec:
+            raise ValueError("ArenaCandidateResult.driver_spec must be non-empty")
+        self.candidate_id = cid
+        self.role = role
+        self.driver_spec = spec
+        return self._refresh_hash()
+
+
+class ArenaGraftItem(StrictModel):
+    source_candidate_id: str = Field(min_length=1)
+    idea: str = Field(min_length=1)
+    target_files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_graft_item(self) -> ArenaGraftItem:
+        src = self.source_candidate_id.strip()
+        idea = self.idea.strip()
+        if not src:
+            raise ValueError("ArenaGraftItem.source_candidate_id must be non-empty")
+        if not idea:
+            raise ValueError("ArenaGraftItem.idea must be non-empty")
+        self.source_candidate_id = src
+        self.idea = idea
+        self.target_files = [path.strip() for path in self.target_files if path.strip()]
+        return self
+
+
+class ArenaVerdict(FingerprintedModel):
+    verdict_id: str = Field(default_factory=lambda: new_id("verd"))
+    winner_id: str = Field(min_length=1)
+    scores: dict[str, dict[str, float]] = Field(min_length=2)
+    graft_items: list[ArenaGraftItem] = Field(default_factory=list)
+    convergence_mode: Literal["single_winner", "winner_plus_graft", "tie_broken"] = (
+        "single_winner"
+    )
+    rationale: str = Field(min_length=1)
+    judge_driver: str = ""
+    cold_start: bool = True
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "verdict_id"})
+
+    @model_validator(mode="after")
+    def _validate_verdict(self) -> ArenaVerdict:
+        winner = self.winner_id.strip()
+        rationale = self.rationale.strip()
+        if not winner:
+            raise ValueError("ArenaVerdict.winner_id must be non-empty")
+        if not rationale:
+            raise ValueError("ArenaVerdict.rationale must be non-empty")
+        normalized_scores: dict[str, dict[str, float]] = {}
+        expected_criteria: set[str] | None = None
+        for raw_cid, raw_map in self.scores.items():
+            cid = raw_cid.strip()
+            if not cid:
+                raise ValueError("ArenaVerdict.scores keys must be non-empty candidate IDs")
+            if cid in normalized_scores:
+                raise ValueError(f"ArenaVerdict.scores has duplicate candidate ID {cid!r}")
+            crit_map: dict[str, float] = {}
+            for raw_crit, score in raw_map.items():
+                crit = raw_crit.strip()
+                if not crit:
+                    raise ValueError(
+                        f"ArenaVerdict.scores[{cid!r}] contains an empty criterion_id"
+                    )
+                if not math.isfinite(score) or not (0.0 <= score <= 10.0):
+                    raise ValueError(
+                        f"ArenaVerdict score for {cid!r}.{crit!r} must be within [0, 10], "
+                        f"got {score!r}"
+                    )
+                crit_map[crit] = float(score)
+            if not (3 <= len(crit_map) <= 6):
+                raise ValueError(
+                    f"ArenaVerdict.scores[{cid!r}] must score 3 to 6 criteria, "
+                    f"got {len(crit_map)}"
+                )
+            crit_keys = set(crit_map)
+            if expected_criteria is None:
+                expected_criteria = crit_keys
+            elif crit_keys != expected_criteria:
+                raise ValueError(
+                    f"ArenaVerdict.scores[{cid!r}] criteria {sorted(crit_keys)} do not match "
+                    f"expected criteria {sorted(expected_criteria)}"
+                )
+            normalized_scores[cid] = crit_map
+        if winner not in normalized_scores:
+            raise ValueError(
+                f"ArenaVerdict.winner_id {winner!r} must match one of scored candidates "
+                f"{sorted(normalized_scores)}"
+            )
+        for item in self.graft_items:
+            if item.source_candidate_id not in normalized_scores:
+                raise ValueError(
+                    f"ArenaGraftItem.source_candidate_id {item.source_candidate_id!r} "
+                    f"is not in scored candidates {sorted(normalized_scores)}"
+                )
+            if item.source_candidate_id == winner:
+                raise ValueError(
+                    f"ArenaGraftItem.source_candidate_id {item.source_candidate_id!r} "
+                    "cannot reference the winner itself"
+                )
+        if self.convergence_mode == "winner_plus_graft" and not self.graft_items:
+            raise ValueError(
+                "ArenaVerdict with convergence_mode='winner_plus_graft' requires at least one "
+                "graft_item"
+            )
+        if self.graft_items and self.convergence_mode == "single_winner":
+            self.convergence_mode = "winner_plus_graft"
+        self.winner_id = winner
+        self.rationale = rationale
+        self.scores = normalized_scores
+        return self._refresh_hash()
+
+    def validate_against(
+        self,
+        rubric: ArenaRubric,
+        candidate_ids: Sequence[str],
+        *,
+        eligible_winner_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Deterministically verify verdict alignment with rubric criteria and candidates."""
+        expected_candidates = {cid.strip() for cid in candidate_ids if cid.strip()}
+        scored_candidates = set(self.scores)
+        if scored_candidates != expected_candidates:
+            raise ValueError(
+                f"ArenaVerdict scored candidates {sorted(scored_candidates)} do not match "
+                f"race candidates {sorted(expected_candidates)}"
+            )
+        expected_criteria = {item.criterion_id for item in rubric.criteria}
+        for cid, crit_map in self.scores.items():
+            if set(crit_map) != expected_criteria:
+                raise ValueError(
+                    f"ArenaVerdict criteria for {cid!r} {sorted(crit_map)} do not match "
+                    f"rubric criteria {sorted(expected_criteria)}"
+                )
+        if eligible_winner_ids is not None:
+            eligible = {cid.strip() for cid in eligible_winner_ids if cid.strip()}
+            if self.winner_id not in eligible:
+                raise ValueError(
+                    f"ArenaVerdict.winner_id {self.winner_id!r} is not an eligible passing "
+                    f"candidate {sorted(eligible)}"
+                )
+
+    def weighted_totals(self, rubric: ArenaRubric) -> dict[str, float]:
+        """Compute deterministic weighted totals for each scored candidate."""
+        weights = {item.criterion_id: item.weight for item in rubric.criteria}
+        totals: dict[str, float] = {}
+        for cid, crit_map in self.scores.items():
+            total = sum(crit_map.get(k, 0.0) * w for k, w in weights.items())
+            totals[cid] = round(total, 4)
+        return totals

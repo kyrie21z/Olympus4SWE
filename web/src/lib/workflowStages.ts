@@ -320,55 +320,58 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
     }
   }
 
-  // DFS reverse-postorder from graph.start yields a true topological ordering on any DAG
-  // (preventing convergence shortcuts like align -> gate_spec or custom review -> execute
+  // When graph.start is declared, DFS reverse-postorder yields a true topological ordering on
+  // any DAG (preventing convergence shortcuts like align -> gate_spec or custom review -> execute
   // from being mislabeled as back-edges) while still detecting genuine cycle-closing edges.
-  // Sorting outgoing edges by (non-conditional first, declared node index) ensures primary
-  // spine paths are traversed before conditional shortcuts even when cycles exist.
-  const declaredIndex = new Map<string, number>();
-  for (let i = 0; i < uniqueNodes.length; i += 1) {
-    declaredIndex.set(uniqueNodes[i].name, i);
-  }
-  const adjacency = new Map<string, { target: string; conditional: boolean }[]>();
-  for (const edge of rawEdges) {
-    if (!seenNodes.has(edge.source) || !seenNodes.has(edge.target)) continue;
-    const entry = { target: edge.target, conditional: Boolean(edge.conditional) };
-    const targets = adjacency.get(edge.source);
-    if (targets) targets.push(entry);
-    else adjacency.set(edge.source, [entry]);
-  }
-  for (const targets of adjacency.values()) {
-    targets.sort((a, b) => {
-      if (a.conditional !== b.conditional) return a.conditional ? 1 : -1;
-      return (declaredIndex.get(a.target) ?? 0) - (declaredIndex.get(b.target) ?? 0);
-    });
-  }
-  const visitState = new Map<string, number>(); // 1 = visiting (on stack), 2 = finished
-  const postOrder: string[] = [];
-  const visit = (nodeName: string): void => {
-    visitState.set(nodeName, 1);
-    for (const edge of adjacency.get(nodeName) || []) {
-      if (visitState.get(edge.target) === undefined) {
-        visit(edge.target);
+  // When graph.start is omitted (partial/synthetic graph payloads), fall back to displayOrder.
+  const startNodes = (workflow.graph?.start || []).filter((name) => seenNodes.has(name));
+  let orderMap: Map<string, number> = displayOrder;
+  if (startNodes.length > 0) {
+    const declaredIndex = new Map<string, number>();
+    for (let i = 0; i < uniqueNodes.length; i += 1) {
+      declaredIndex.set(uniqueNodes[i].name, i);
+    }
+    const adjacency = new Map<string, { target: string; conditional: boolean }[]>();
+    for (const edge of rawEdges) {
+      if (!seenNodes.has(edge.source) || !seenNodes.has(edge.target)) continue;
+      const entry = { target: edge.target, conditional: Boolean(edge.conditional) };
+      const targets = adjacency.get(edge.source);
+      if (targets) targets.push(entry);
+      else adjacency.set(edge.source, [entry]);
+    }
+    for (const targets of adjacency.values()) {
+      targets.sort((a, b) => {
+        if (a.conditional !== b.conditional) return a.conditional ? 1 : -1;
+        return (declaredIndex.get(a.target) ?? 0) - (declaredIndex.get(b.target) ?? 0);
+      });
+    }
+    const visitState = new Map<string, number>(); // 1 = visiting (on stack), 2 = finished
+    const postOrder: string[] = [];
+    const visit = (nodeName: string): void => {
+      visitState.set(nodeName, 1);
+      for (const edge of adjacency.get(nodeName) || []) {
+        if (visitState.get(edge.target) === undefined) {
+          visit(edge.target);
+        }
+      }
+      visitState.set(nodeName, 2);
+      postOrder.push(nodeName);
+    };
+    for (const startNode of startNodes) {
+      if (visitState.get(startNode) === undefined) {
+        visit(startNode);
       }
     }
-    visitState.set(nodeName, 2);
-    postOrder.push(nodeName);
-  };
-  for (const startNode of workflow.graph?.start || []) {
-    if (seenNodes.has(startNode) && visitState.get(startNode) === undefined) {
-      visit(startNode);
+    for (const [nodeName] of displayOrder) {
+      if (visitState.get(nodeName) === undefined) {
+        visit(nodeName);
+      }
     }
-  }
-  for (const [nodeName] of displayOrder) {
-    if (visitState.get(nodeName) === undefined) {
-      visit(nodeName);
+    postOrder.reverse();
+    orderMap = new Map<string, number>();
+    for (const nodeName of postOrder) {
+      orderMap.set(nodeName, orderMap.size);
     }
-  }
-  postOrder.reverse();
-  const graphOrder = new Map<string, number>();
-  for (const nodeName of postOrder) {
-    graphOrder.set(nodeName, graphOrder.size);
   }
 
   const columns: WorkflowStageColumn[] = [];
@@ -387,7 +390,7 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
         node.name,
         status,
         def.id,
-        graphOrder,
+        orderMap,
         nodePhaseMap,
         kindMap,
         rawEdges,

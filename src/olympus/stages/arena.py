@@ -325,7 +325,9 @@ def _mirror_sandbox_changes(
 
     backups: list[tuple[Path, str, tuple[bytes, int] | str | None]] = []
     created_dirs: list[Path] = []
+    created_dir_set: set[Path] = set()
     removed_dirs: list[tuple[Path, int]] = []
+    removed_dir_set: set[Path] = set()
     try:
         for target in delete_plan:
             if target.is_symlink():
@@ -342,7 +344,9 @@ def _mirror_sandbox_changes(
                     parent.rmdir()
                 except OSError:
                     break
-                removed_dirs.append((parent, parent_mode))
+                if parent not in removed_dir_set:
+                    removed_dirs.append((parent, parent_mode))
+                    removed_dir_set.add(parent)
                 parent = parent.parent
         for src, dst, link_target in copy_plan:
             missing_parents: list[Path] = []
@@ -352,7 +356,10 @@ def _mirror_sandbox_changes(
                 cur_parent = cur_parent.parent
             if missing_parents:
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                created_dirs.extend(missing_parents)
+                for created in missing_parents:
+                    if created not in removed_dir_set and created not in created_dir_set:
+                        created_dirs.append(created)
+                        created_dir_set.add(created)
             if dst.is_symlink():
                 backups.append((dst, "symlink", os.readlink(dst)))
                 dst.unlink()
@@ -393,7 +400,10 @@ def _mirror_sandbox_changes(
                     os.chmod(path, saved_mode)
             except OSError:
                 pass
+        # Only remove directories that genuinely did not exist before mirroring started.
         for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
+            if directory in removed_dir_set:
+                continue
             with contextlib.suppress(OSError):
                 directory.rmdir()
         # Restore original modes on removed directories deep-to-shallow (after file writes).
@@ -1394,6 +1404,7 @@ class ArenaStage:
             reuse=False,
             sandbox_root=effective_sandbox_root,
             base_ref=None,
+            force_copy=True,
         )
         return SandboxHandle(
             repo_root=self.workspace_root,

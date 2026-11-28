@@ -1963,3 +1963,295 @@ def test_arena_unborn_head_git_repo_locks_single_frozen_baseline(
     ) == initial_readme
 
 
+# ---------------------------------------------------------------------- 9. Round-3 counterexamples
+
+
+def test_mirror_rollback_preserves_preexisting_empty_and_replaced_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 #1: rollback removes only newly created dirs and never deletes preexisting
+    empty directories or directories emptied and reused during mirroring.
+    """
+    import os
+    import stat
+
+    from olympus.harness.worktree import SandboxHandle, snapshot_sandbox_state
+    from olympus.stages import arena as arena_mod
+
+    base_dir = tmp_path / "base_ws"
+    src_dir = tmp_path / "src_ws"
+    dst_dir = tmp_path / "dst_ws"
+    for d in (base_dir, src_dir, dst_dir):
+        d.mkdir()
+        (d / "fail.py").write_text("v0\n", encoding="utf-8")
+    base_baseline = snapshot_sandbox_state(SandboxHandle(base_dir, base_dir, None, False))
+
+    # Preexisting empty 0o700 directory in dst_dir that graft writes a new file into.
+    preexisting_empty = dst_dir / "preexisting_empty"
+    preexisting_empty.mkdir(mode=0o700)
+    os.chmod(preexisting_empty, 0o700)
+
+    # Preexisting 0o700 dir with old.py that graft replaces with new.py.
+    replaced_dir = dst_dir / "replaced_dir"
+    replaced_dir.mkdir(mode=0o700)
+    os.chmod(replaced_dir, 0o700)
+    (replaced_dir / "old.py").write_text("old\n", encoding="utf-8")
+
+    # Source writes into preexisting_empty, brand_new_dir, replaces replaced_dir/old.py -> new.py,
+    # and modifies fail.py (which triggers OSError).
+    (src_dir / "preexisting_empty").mkdir()
+    (src_dir / "preexisting_empty" / "added.py").write_text("added\n", encoding="utf-8")
+    (src_dir / "brand_new_dir").mkdir()
+    (src_dir / "brand_new_dir" / "fresh.py").write_text("fresh\n", encoding="utf-8")
+    (src_dir / "replaced_dir").mkdir()
+    (src_dir / "replaced_dir" / "new.py").write_text("new\n", encoding="utf-8")
+    (src_dir / "fail.py").write_text("v1\n", encoding="utf-8")
+
+    real_copy2 = arena_mod.shutil.copy2
+
+    def fail_on_fail_py(src: Path, dst: Path) -> Any:
+        if Path(src).name == "fail.py":
+            raise OSError("injected failure on fail.py")
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(arena_mod.shutil, "copy2", fail_on_fail_py)
+    with pytest.raises(CraftPause, match="rolled back"):
+        arena_mod._mirror_sandbox_changes(
+            source_handle=SandboxHandle(base_dir, src_dir, None, False),
+            target_handle=SandboxHandle(base_dir, dst_dir, None, False),
+            base_baseline=base_baseline,
+            allowed_write_scope=[
+                "preexisting_empty/added.py",
+                "brand_new_dir/fresh.py",
+                "replaced_dir/old.py",
+                "replaced_dir/new.py",
+                "fail.py",
+            ],
+            forbidden_globs=[],
+            node_name="arena_race",
+        )
+
+    # Preexisting empty 0o700 dir MUST still exist with mode 0o700 and added.py removed.
+    assert preexisting_empty.is_dir()
+    assert stat.S_IMODE(preexisting_empty.stat().st_mode) == 0o700
+    assert not (preexisting_empty / "added.py").exists()
+
+    # Preexisting replaced_dir MUST still exist with mode 0o700 and old.py restored (new.py gone).
+    assert replaced_dir.is_dir()
+    assert stat.S_IMODE(replaced_dir.stat().st_mode) == 0o700
+    assert (replaced_dir / "old.py").read_text(encoding="utf-8") == "old\n"
+    assert not (replaced_dir / "new.py").exists()
+
+    # Truly newly created brand_new_dir MUST be cleaned up.
+    assert not (dst_dir / "brand_new_dir").exists()
+    assert (dst_dir / "fail.py").read_text(encoding="utf-8") == "v0\n"
+
+
+def test_strict_remove_sandbox_fails_when_git_repo_probe_exits_128(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 #2: if git rev-parse probe returns 128 on a git worktree handle,
+    remove_sandbox(strict=True) must raise RuntimeError instead of skipping cleanup.
+    """
+    from olympus.harness import worktree as wt_mod
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    handle = wt_mod.create_sandbox(
+        repo,
+        label="probe-128-test",
+        reuse=False,
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    real_run_git = wt_mod._run_git
+
+    def probe_exits_128(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("rev-parse", "--is-inside-work-tree"):
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                returncode=128,
+                stdout="",
+                stderr="fatal: dubious ownership in repository",
+            )
+        return real_run_git(cwd, *args)
+
+    monkeypatch.setattr(wt_mod, "_run_git", probe_exits_128)
+    with pytest.raises(
+        RuntimeError, match="git rev-parse --is-inside-work-tree failed \\(exit=128\\)"
+    ):
+        wt_mod.remove_sandbox(handle, strict=True)
+
+    # Restore git and clean up the worktree properly afterwards.
+    monkeypatch.setattr(wt_mod, "_run_git", real_run_git)
+    wt_mod.remove_sandbox(handle, strict=True)
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+
+def test_create_sandbox_cleans_up_on_base_exception_after_git_worktree_add(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 #3: BaseException (e.g. KeyboardInterrupt) after git worktree add before
+    return must immediately clean up the directory and git worktree registration.
+    """
+    from olympus.harness import worktree as wt_mod
+
+    repo = tmp_path / "repo"
+    _init_demo_repo(repo)
+    sandbox_root = tmp_path / "sandboxes"
+    real_handle_cls = wt_mod.SandboxHandle
+
+    def interrupted_handle(*args: Any, **kwargs: Any) -> Any:
+        # Simulate KeyboardInterrupt right after git worktree add succeeded.
+        if kwargs.get("is_git_worktree") is True:
+            raise KeyboardInterrupt("simulated interrupt after git worktree add")
+        return real_handle_cls(*args, **kwargs)
+
+    monkeypatch.setattr(wt_mod, "SandboxHandle", interrupted_handle)
+    with pytest.raises(KeyboardInterrupt, match="simulated interrupt"):
+        wt_mod.create_sandbox(
+            repo,
+            label="interrupt-after-add",
+            reuse=False,
+            sandbox_root=sandbox_root,
+        )
+
+    assert not (sandbox_root / "interrupt-after-add").exists()
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+
+def test_arena_unborn_head_default_sandbox_root_none_locks_baseline_across_candidates_and_graft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 #4: with default sandbox_root=None inside an unborn-HEAD git repo, a mid-race
+    first commit must NOT leak into cand_2, graft, or -craft sandboxes.
+    """
+    from olympus.stages import arena as arena_mod
+
+    repo = tmp_path / "unborn_default_repo"
+    repo.mkdir()
+    initial_readme = "# Frozen Default-Sandbox Unborn Baseline\n"
+    (repo / "calc.py").write_text(
+        "def compute(x: int, y: int) -> int:\n    return x - y\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text(initial_readme, encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import unittest\n"
+        "import calc\n\n"
+        "class TestCalc(unittest.TestCase):\n"
+        "    def test_add(self) -> None:\n"
+        "        self.assertEqual(calc.compute(2, 3), 5)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+
+    store = RunStore(tmp_path / "olympus.db")
+    run_id = store.create_run(
+        title="Arena unborn HEAD sandbox_root=None",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_arena",
+    )
+
+    real_create = arena_mod.create_sandbox
+    seen_readmes: list[tuple[str, str]] = []
+    committed_first = False
+
+    def intercept_create(repo_root: Path | str, **kwargs: Any) -> Any:
+        nonlocal committed_first
+        handle = real_create(repo_root, **kwargs)
+        seen_readmes.append(
+            (kwargs["label"], (handle.workspace_path / "README.md").read_text(encoding="utf-8"))
+        )
+        if not committed_first:
+            committed_first = True
+            # Mutate host repo and create its very first commit right after cand_1 is created!
+            (repo / "README.md").write_text("# Host First Commit Mid-Race\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "calc.py", "README.md", "test_calc.py"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "initial commit mid-race"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+        return handle
+
+    monkeypatch.setattr(arena_mod, "create_sandbox", intercept_create)
+
+    def worker(req: DriverTurnRequest) -> str:
+        if req.actor == "hephaestus:arena_graft":
+            (req.workspace_path / "calc.py").write_text(
+                "def compute(x: int, y: int) -> int:\n    return int(x) + int(y)\n",
+                encoding="utf-8",
+            )
+            return "grafted"
+        (req.workspace_path / "calc.py").write_text(
+            "def compute(x: int, y: int) -> int:\n    return x + y\n",
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def judge(req: DriverTurnRequest) -> str:
+        del req
+        return ArenaVerdict(
+            winner_id="cand_1",
+            scores={
+                "cand_1": {"correctness": 10.0, "simplicity": 9.5, "clarity": 9.0},
+                "cand_2": {"correctness": 10.0, "simplicity": 8.0, "clarity": 9.5},
+            },
+            graft_items=[
+                ArenaGraftItem(
+                    source_candidate_id="cand_2",
+                    idea="Coerce with int().",
+                    target_files=["calc.py"],
+                )
+            ],
+            convergence_mode="winner_plus_graft",
+            rationale="cand_1 wins with int() graft.",
+        ).model_dump_json()
+
+    # sandbox_root is intentionally omitted (None -> repo/.olympus/sandboxes).
+    stage = ArenaStage(
+        store=store,
+        workspace_root=repo,
+        provider=MockLLMProvider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=None,
+        execution_drivers=ExecutionDriversConfig.resolve(
+            stage_driver="native",
+            worker_driver="worker",
+            reviewer_driver="judge",
+        ),
+        driver_registry=DriverRegistry(
+            {
+                "worker": _ScriptedDriver("worker", worker),
+                "judge": _ScriptedDriver("judge", judge),
+            }
+        ),
+    )
+    out = stage.arena_race(
+        run_id=run_id,
+        raw_input="Fix calc.compute.",
+        state={"arena_rubric": _sample_rubric().model_dump(mode="json")},
+    )
+    assert out["route"] == "pass"
+    # cand_1, cand_2, -craft, and -arena-graft ALL saw the exact frozen initial unborn README!
+    assert len(seen_readmes) == 4
+    assert all(text == initial_readme for _label, text in seen_readmes), seen_readmes
+
+    default_sandboxes = repo / ".olympus" / "sandboxes"
+    assert not (default_sandboxes / f"{run_id}-arena-base").exists()
+    assert not (default_sandboxes / f"{run_id}-arena-cand_1").exists()
+    assert not (default_sandboxes / f"{run_id}-arena-cand_2").exists()
+    assert not (default_sandboxes / f"{run_id}-arena-graft").exists()
+    assert (default_sandboxes / f"{run_id}-craft" / "README.md").read_text(
+        encoding="utf-8"
+    ) == initial_readme
+    assert _git_worktree_paths(repo) == [repo.resolve()]
+
+

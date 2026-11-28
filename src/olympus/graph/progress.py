@@ -8,7 +8,7 @@ resumed entry point can never disagree.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -28,6 +28,7 @@ from olympus.core.control import (
 )
 from olympus.core.dag import validate_plan_topology
 from olympus.core.store import RunStore
+from olympus.graph.engine import START
 
 if TYPE_CHECKING:
     from olympus.graph.loader import WorkflowDefinition
@@ -87,21 +88,120 @@ def is_artifact_approved(
     )
 
 
+def extract_paused_cursor(
+    events: Sequence[RunEvent],
+    *,
+    valid_names: Collection[str] | None = None,
+) -> str | None:
+    """Return the latest active paused node recorded in ``events``, if any."""
+    cursor: str | None = None
+    for event in events:
+        payload = event.payload
+        if event.event_type in ("graph.paused", "graph.node_paused", "session.paused"):
+            node = payload.get("node")
+            if isinstance(node, str):
+                candidate = node.strip()
+                if candidate and (valid_names is None or candidate in valid_names):
+                    cursor = candidate
+        elif (
+            event.event_type == "run.status_changed"
+            and payload.get("to") == RunStatus.AWAITING_HUMAN.value
+        ):
+            # RunStore.set_run_status unpacks ``detail`` into top-level payload keys.
+            node = payload.get("paused_node")
+            if node is None:
+                detail = payload.get("detail")
+                if isinstance(detail, Mapping):
+                    node = detail.get("paused_node")
+            if isinstance(node, str):
+                candidate = node.strip()
+                if candidate and (valid_names is None or candidate in valid_names):
+                    cursor = candidate
+        elif event.event_type == "graph.node_finished":
+            if payload.get("node") == cursor:
+                cursor = None
+        elif event.event_type == "graph.finished" or (
+            event.event_type == "run.status_changed"
+            and payload.get("to") == RunStatus.COMPLETED.value
+        ):
+            cursor = None
+    return cursor
+
+
+def _is_superseded_legacy_cursor(
+    cursor: str,
+    *,
+    store: RunStore,
+    run_id: str,
+    snap: Mapping[str, Any],
+) -> bool:
+    """Return whether a paused cursor refers to a legacy SDLC node already superseded."""
+    spec = snap.get("spec")
+    design = snap.get("design")
+    plan = snap.get("plan")
+    spec_approved = is_artifact_approved(store, run_id, "spec", snap)
+
+    if cursor == "align":
+        return spec is not None
+    if cursor in ("validate_design", "validate_plan"):
+        # Legacy SDLC validators always delegate resume choice to artifact progression
+        # (rebuilding stale/invalid artifacts at design/plan or advancing once valid).
+        return True
+    if cursor == "gate_spec":
+        return spec_approved
+    if cursor == "gate_design":
+        if spec is not None and not spec_approved:
+            return True
+        if design is None:
+            return False
+        if is_design_bound_to_spec(store, run_id, snap):
+            return True
+        return bool(
+            spec is not None
+            and spec_approved
+            and design.spec_hash is not None
+            and design.spec_hash != spec.content_hash
+        )
+    if cursor == "gate_plan":
+        if spec is not None and not spec_approved:
+            return True
+        if plan is None:
+            return False
+        return bool(
+            is_artifact_approved(store, run_id, "plan", snap)
+            and is_plan_bound_to_upstream(store, run_id, snap)
+        )
+    return False
+
+
 def resolve_resume_node(
     definition: WorkflowDefinition,
     snap: Mapping[str, Any],
     *,
     store: RunStore,
 ) -> str | None:
-    """Pick the graph entry point implied by the run's confirmed artifacts."""
+    """Pick the graph entry point from persisted pause cursor first, then SDLC artifacts."""
     names = {node.name for node in definition.nodes}
     run_id = str(snap["run_id"])
+    events = store.list_events(run_id)
 
     align_node = next(
         (node.name for node in definition.nodes if node.type == "align_goal"), None
     )
-    if align_node is not None and has_unfulfilled_revision(store.list_events(run_id)):
+    if align_node is not None and has_unfulfilled_revision(events):
         return align_node
+
+    paused_cursor = extract_paused_cursor(events, valid_names=names)
+    if paused_cursor is not None:
+        if definition.family != "sdlc":
+            return paused_cursor
+        if not _is_superseded_legacy_cursor(
+            paused_cursor,
+            store=store,
+            run_id=run_id,
+            snap=snap,
+        ):
+            return paused_cursor
 
     spec = snap.get("spec")
     if spec is not None and not is_artifact_approved(store, run_id, "spec", snap):
@@ -161,7 +261,14 @@ def resolve_resume_node(
             return "gate_spec"
         return "align" if "align" in names else None
 
-    return "intake" if "intake" in names else ("align" if "align" in names else None)
+    if "intake" in names:
+        return "intake"
+    if "align" in names:
+        return "align"
+    return next(
+        (edge.target for edge in definition.edges if edge.source == START and edge.target in names),
+        None,
+    )
 
 
 _VISITED_STATUSES = frozenset({"running", "completed", "paused", "error", "failed"})
@@ -568,6 +675,38 @@ def _reconcile_domain_workflow_state(
     return current_node, paused, failed_node, last_error, finished
 
 
+def _recorded_workflow_path(events: Sequence[RunEvent]) -> Path | None:
+    for event in reversed(events):
+        if event.event_type not in ("session.started", "graph.started"):
+            continue
+        raw = event.payload.get("workflow_path")
+        if isinstance(raw, str) and raw.strip():
+            candidate = Path(raw.strip())
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _load_workflow_for_view(
+    workflow_name: str,
+    events: Sequence[RunEvent],
+    definition: WorkflowDefinition | None,
+) -> WorkflowDefinition:
+    from olympus.graph.loader import load_workflow
+
+    if definition is not None:
+        return definition
+    recorded_path = _recorded_workflow_path(events)
+    if recorded_path is not None:
+        try:
+            loaded = load_workflow(recorded_path)
+            if loaded.name == workflow_name:
+                return loaded
+        except Exception:  # noqa: BLE001 - fall back to built-in workflow name lookup
+            pass
+    return load_workflow(workflow_name)
+
+
 def build_workflow_view(
     workflow_name: str,
     events: Sequence[RunEvent],
@@ -576,19 +715,24 @@ def build_workflow_view(
     spec_approved: bool = False,
     design_approved: bool = False,
     plan_approved: bool = False,
+    definition: WorkflowDefinition | None = None,
 ) -> dict[str, Any]:
     """Describe the run's workflow topology plus live per-node statuses from graph.* events."""
-    from olympus.graph.loader import build_graph, load_workflow
+    from olympus.graph.loader import build_graph
 
     topology: str | None = None
     stop_after: str | None = None
+    family = "sdlc"
+    autonomy = "gated"
     description: dict[str, Any] | None = None
     node_names: list[str] = []
     try:
-        definition = load_workflow(workflow_name)
-        description = build_graph(definition).describe()
-        topology = definition.topology
-        stop_after = definition.stop_after
+        resolved_def = _load_workflow_for_view(workflow_name, events, definition)
+        description = build_graph(resolved_def).describe()
+        topology = resolved_def.topology
+        stop_after = resolved_def.stop_after
+        family = resolved_def.family
+        autonomy = resolved_def.autonomy
         node_names = [str(n["name"]) for n in description.get("nodes", [])]
     except Exception:  # noqa: BLE001 - a legacy/unknown workflow must not break the console
         description = None
@@ -698,6 +842,8 @@ def build_workflow_view(
 
     return {
         "name": workflow_name,
+        "family": family,
+        "autonomy": autonomy,
         "topology": topology,
         "stop_after": stop_after,
         "graph": description,
@@ -728,7 +874,7 @@ def is_blueprint_completed(
         plan is not None
         and plan_approved
         and run_status == RunStatus.COMPLETED
-        and (stop_after or "execute") != "execute"
+        and (stop_after or "execute") not in ("execute", "verify")
         and not all_terminal
     )
 
@@ -880,12 +1026,41 @@ def _execution_god(tasks: Sequence[TaskNode], events: Sequence[RunEvent]) -> Pan
     return "hephaestus"
 
 
+_VALID_GODS: frozenset[str] = frozenset(
+    {"prometheus", "athena", "hephaestus", "momus", "argus"}
+)
+
+
+def _declared_node_god(
+    node_name: str, workflow_view: Mapping[str, Any]
+) -> PantheonGod | None:
+    graph = workflow_view.get("graph")
+    if not isinstance(graph, Mapping):
+        return None
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, Sequence):
+        return None
+    for item in nodes:
+        if not isinstance(item, Mapping) or item.get("name") != node_name:
+            continue
+        raw_god = item.get("god")
+        if isinstance(raw_god, str):
+            normalized = raw_god.strip().lower()
+            if normalized in _VALID_GODS:
+                return normalized  # type: ignore[return-value]
+    return None
+
+
 def _stage_god(
     tasks: Sequence[TaskNode],
     events: Sequence[RunEvent],
     workflow_view: Mapping[str, Any],
 ) -> PantheonGod:
     node = _trailing_node(events, workflow_view)
+    if node is not None:
+        declared = _declared_node_god(node, workflow_view)
+        if declared is not None:
+            return declared
     if node == "execute":
         return _execution_god(tasks, events)
     if node is not None:
@@ -901,6 +1076,10 @@ def _phase_god(
     workflow_view: Mapping[str, Any],
 ) -> PantheonGod:
     node = _trailing_node(events, workflow_view)
+    if node is not None:
+        declared = _declared_node_god(node, workflow_view)
+        if declared is not None:
+            return declared
     if node == "execute":
         return _execution_god(tasks, events)
     if node is not None:
@@ -982,7 +1161,10 @@ def classify_run_board(
         )
 
     if status == RunStatus.COMPLETED:
-        blueprint = (stop_after or "execute") != "execute" or is_blueprint_completed(
+        blueprint = (stop_after or "execute") not in (
+            "execute",
+            "verify",
+        ) or is_blueprint_completed(
             plan=plan,
             plan_approved=plan_approved,
             run_status=status,

@@ -553,6 +553,10 @@ class WorkflowGraphNode(StrictModel):
     max_visits: int
     on_error: str | None = None
     routed: bool
+    god: str | None = None
+    phase: str | None = None
+    role: str | None = None
+    skill_refs: list[str] = Field(default_factory=list)
 
 
 class WorkflowGraphEdge(StrictModel):
@@ -586,6 +590,8 @@ class WorkflowPause(StrictModel):
 
 class WorkflowView(StrictModel):
     name: str
+    family: str = "sdlc"
+    autonomy: str = "gated"
     topology: str | None = None
     stop_after: str | None = None
     graph: WorkflowGraph | None = None
@@ -953,6 +959,10 @@ class ProvidersResponse(StrictModel):
 class WorkflowSummary(StrictModel):
     name: str
     description: str
+    family: str = "sdlc"
+    autonomy: str = "gated"
+    applicable_scenarios: list[str] = Field(default_factory=list)
+    anti_patterns: list[str] = Field(default_factory=list)
     stop_after: str
     topology: str
     gates: dict[str, bool]

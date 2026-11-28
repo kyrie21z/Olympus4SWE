@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -95,14 +96,61 @@ class AgentDriver(Protocol):
     ) -> TurnOutcome: ...
 
 
+_STAGE_ROLES: frozenset[str] = frozenset(
+    {"stage", "explorer", "architect", "planner", "aligner", "designer"}
+)
+_REVIEWER_ROLES: frozenset[str] = frozenset(
+    {
+        "reviewer",
+        "interrogator",
+        "thermo_reviewer",
+        "verifier",
+        "judge",
+        "arena_judge",
+        "critic",
+    }
+)
+_WORKER_ROLES: frozenset[str] = frozenset(
+    {"worker", "builder", "hygiene", "arena_runner", "hillclimber"}
+)
+
+
+def _omit_empty_mapping(value: object) -> bool:
+    return not value
+
+
 class ExecutionDriversConfig(StrictModel):
     stage_driver: NonEmptySetting = "auto"
     worker_driver: NonEmptySetting = "auto"
     reviewer_driver: NonEmptySetting = "auto"
+    role_drivers: dict[NonEmptySetting, NonEmptySetting] = Field(
+        default_factory=dict,
+        exclude_if=_omit_empty_mapping,
+    )
     monitor_model: NonEmptySetting | None = None
     pi_provider: NonEmptySetting | None = None
     thinking_level: NonEmptySetting | None = None
     context_window: int | None = Field(default=None, ge=1024)
+
+    @field_validator("role_drivers", mode="before")
+    @classmethod
+    def _normalize_role_drivers(cls, value: object) -> object:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                f"role_drivers must be a mapping, got {type(value).__name__}"
+            )
+        normalized: dict[str, str] = {}
+        for raw_role, raw_spec in value.items():
+            if not isinstance(raw_role, str) or not raw_role.strip():
+                raise ValueError(f"role_drivers keys must be non-empty strings, got {raw_role!r}")
+            if not isinstance(raw_spec, str) or not raw_spec.strip():
+                raise ValueError(
+                    f"role_drivers[{raw_role!r}] must be a non-empty string, got {raw_spec!r}"
+                )
+            normalized[raw_role.strip().lower()] = raw_spec.strip()
+        return normalized
 
     @field_validator("thinking_level", mode="before")
     @classmethod
@@ -121,6 +169,22 @@ class ExecutionDriversConfig(StrictModel):
             )
         return normalized
 
+    def resolve_driver_for_role(self, role: str | None) -> str:
+        """Return the driver spec for ``role``, falling back cleanly to coarse slots."""
+        if role is not None:
+            normalized = role.strip().lower()
+            if normalized:
+                explicit = self.role_drivers.get(normalized)
+                if explicit is not None:
+                    return explicit
+                if normalized in _REVIEWER_ROLES:
+                    return self.reviewer_driver
+                if normalized in _STAGE_ROLES:
+                    return self.stage_driver
+                if normalized in _WORKER_ROLES:
+                    return self.worker_driver
+        return self.worker_driver
+
     @classmethod
     def resolve(
         cls,
@@ -128,6 +192,7 @@ class ExecutionDriversConfig(StrictModel):
         stage_driver: str | None = None,
         worker_driver: str | None = None,
         reviewer_driver: str | None = None,
+        role_drivers: Mapping[str, str] | None = None,
         monitor_model: str | None = None,
         pi_provider: str | None = None,
         thinking_level: str | None = None,
@@ -147,6 +212,26 @@ class ExecutionDriversConfig(StrictModel):
                 values[field_name] = value
             elif setting := os.getenv(f"OLYMPUS_{field_name.upper()}", "").strip():
                 values[field_name] = setting
+        merged_roles: dict[str, str] = {}
+        raw_roles_env = os.getenv("OLYMPUS_ROLE_DRIVERS", "").strip()
+        if raw_roles_env:
+            try:
+                parsed_roles = json.loads(raw_roles_env)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid OLYMPUS_ROLE_DRIVERS JSON: {exc.msg}"
+                ) from exc
+            if not isinstance(parsed_roles, Mapping):
+                raise ValueError("Invalid OLYMPUS_ROLE_DRIVERS: expected a JSON object")
+            for raw_role, raw_spec in parsed_roles.items():
+                key = raw_role.strip().lower() if isinstance(raw_role, str) else raw_role
+                merged_roles[key] = raw_spec
+        if role_drivers is not None:
+            for raw_role, raw_spec in role_drivers.items():
+                key = raw_role.strip().lower() if isinstance(raw_role, str) else raw_role
+                merged_roles[key] = raw_spec
+        if merged_roles:
+            values["role_drivers"] = merged_roles
         raw_window = os.getenv("OLYMPUS_CONTEXT_WINDOW", "").strip()
         if context_window is not None:
             values["context_window"] = context_window

@@ -2523,6 +2523,8 @@ export interface components {
         };
         /** WorkflowGraphNode */
         WorkflowGraphNode: {
+            /** God */
+            god?: string | null;
             /** Kind */
             kind: string;
             /** Max Visits */
@@ -2531,8 +2533,14 @@ export interface components {
             name: string;
             /** On Error */
             on_error?: string | null;
+            /** Phase */
+            phase?: string | null;
+            /** Role */
+            role?: string | null;
             /** Routed */
             routed: boolean;
+            /** Skill Refs */
+            skill_refs?: string[];
         };
         /** WorkflowNodeStatus */
         WorkflowNodeStatus: {
@@ -2574,8 +2582,22 @@ export interface components {
         };
         /** WorkflowSummary */
         WorkflowSummary: {
+            /** Anti Patterns */
+            anti_patterns?: string[];
+            /** Applicable Scenarios */
+            applicable_scenarios?: string[];
+            /**
+             * Autonomy
+             * @default gated
+             */
+            autonomy: string;
             /** Description */
             description: string;
+            /**
+             * Family
+             * @default sdlc
+             */
+            family: string;
             /** Gates */
             gates: {
                 [key: string]: boolean;
@@ -2590,10 +2612,20 @@ export interface components {
         };
         /** WorkflowView */
         WorkflowView: {
+            /**
+             * Autonomy
+             * @default gated
+             */
+            autonomy: string;
             /** Current Node */
             current_node?: string | null;
             /** Failed Node */
             failed_node?: string | null;
+            /**
+             * Family
+             * @default sdlc
+             */
+            family: string;
             /** Finished */
             finished: boolean;
             graph?: components["schemas"]["WorkflowGraph"] | null;

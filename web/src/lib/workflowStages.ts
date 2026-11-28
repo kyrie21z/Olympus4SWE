@@ -61,8 +61,26 @@ const PHASE_DEFINITIONS: readonly PhaseDefinition[] = [
   { id: "design", indexLabel: "STAGE 02", title: "白盒架构", god: "Athena" },
   { id: "plan", indexLabel: "STAGE 03", title: "任务编排", god: "Athena" },
   { id: "execute", indexLabel: "STAGE 04", title: "执行验收", god: "Hephaestus" },
-  { id: "other", indexLabel: "STAGE 05", title: "扩展步骤", god: "Olympus" },
+  { id: "review", indexLabel: "STAGE 05", title: "对抗审查", god: "Momus" },
+  { id: "verify", indexLabel: "STAGE 06", title: "真实验收", god: "Argus" },
+  { id: "other", indexLabel: "STAGE 07", title: "扩展步骤", god: "Olympus" },
 ];
+
+const PHASE_ALIASES: Record<string, string> = {
+  align: "align",
+  explore: "align",
+  reproduce: "align",
+  design: "design",
+  architect: "design",
+  plan: "plan",
+  execute: "execute",
+  build: "execute",
+  hygiene: "execute",
+  review: "review",
+  interrogate: "review",
+  verify: "verify",
+  other: "other",
+};
 
 const NODE_PHASE_BY_ID = new Map<string, string>([
   ["intake", "align"],
@@ -131,12 +149,19 @@ export function workflowStepTone(status: string): WorkflowStepTone {
 }
 
 function resolvePhaseId(node: WorkflowGraphNode): string {
+  const declaredPhase = typeof node.phase === "string" ? node.phase.trim().toLowerCase() : "";
+  if (declaredPhase) {
+    return ownValue(PHASE_ALIASES, declaredPhase) ?? "other";
+  }
   const direct = NODE_PHASE_BY_ID.get(node.name);
   if (direct) return direct;
   const id = node.name.toLowerCase();
   const kind = String(node.kind || "").toLowerCase();
   if (id.includes("design") || kind.includes("design")) return "design";
   if (id.includes("plan") || kind.includes("plan") || kind.includes("decompose")) return "plan";
+  if (id.includes("review") || id.includes("interrogate") || kind.includes("interrogate")) {
+    return "review";
+  }
   if (id.includes("exec") || id.includes("verify") || kind.includes("exec") || kind.includes("verify")) {
     return "execute";
   }
@@ -295,6 +320,57 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
     }
   }
 
+  // DFS reverse-postorder from graph.start yields a true topological ordering on any DAG
+  // (preventing convergence shortcuts like align -> gate_spec or custom review -> execute
+  // from being mislabeled as back-edges) while still detecting genuine cycle-closing edges.
+  // Sorting outgoing edges by (non-conditional first, declared node index) ensures primary
+  // spine paths are traversed before conditional shortcuts even when cycles exist.
+  const declaredIndex = new Map<string, number>();
+  for (let i = 0; i < uniqueNodes.length; i += 1) {
+    declaredIndex.set(uniqueNodes[i].name, i);
+  }
+  const adjacency = new Map<string, { target: string; conditional: boolean }[]>();
+  for (const edge of rawEdges) {
+    if (!seenNodes.has(edge.source) || !seenNodes.has(edge.target)) continue;
+    const entry = { target: edge.target, conditional: Boolean(edge.conditional) };
+    const targets = adjacency.get(edge.source);
+    if (targets) targets.push(entry);
+    else adjacency.set(edge.source, [entry]);
+  }
+  for (const targets of adjacency.values()) {
+    targets.sort((a, b) => {
+      if (a.conditional !== b.conditional) return a.conditional ? 1 : -1;
+      return (declaredIndex.get(a.target) ?? 0) - (declaredIndex.get(b.target) ?? 0);
+    });
+  }
+  const visitState = new Map<string, number>(); // 1 = visiting (on stack), 2 = finished
+  const postOrder: string[] = [];
+  const visit = (nodeName: string): void => {
+    visitState.set(nodeName, 1);
+    for (const edge of adjacency.get(nodeName) || []) {
+      if (visitState.get(edge.target) === undefined) {
+        visit(edge.target);
+      }
+    }
+    visitState.set(nodeName, 2);
+    postOrder.push(nodeName);
+  };
+  for (const startNode of workflow.graph?.start || []) {
+    if (seenNodes.has(startNode) && visitState.get(startNode) === undefined) {
+      visit(startNode);
+    }
+  }
+  for (const [nodeName] of displayOrder) {
+    if (visitState.get(nodeName) === undefined) {
+      visit(nodeName);
+    }
+  }
+  postOrder.reverse();
+  const graphOrder = new Map<string, number>();
+  for (const nodeName of postOrder) {
+    graphOrder.set(nodeName, graphOrder.size);
+  }
+
   const columns: WorkflowStageColumn[] = [];
   for (const def of PHASE_DEFINITIONS) {
     const nodesInPhase = grouped.get(def.id);
@@ -311,7 +387,7 @@ export function buildWorkflowStages(projection: RunProjection): WorkflowStagesMo
         node.name,
         status,
         def.id,
-        displayOrder,
+        graphOrder,
         nodePhaseMap,
         kindMap,
         rawEdges,

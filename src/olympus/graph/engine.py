@@ -56,6 +56,10 @@ class Node:
     kind: str = "fn"
     max_visits: int = 1
     on_error: str | None = None
+    god: str | None = None
+    phase: str | None = None
+    role: str | None = None
+    skill_refs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -76,6 +80,10 @@ class Graph:
         kind: str = "fn",
         max_visits: int = 1,
         on_error: str | None = None,
+        god: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        skill_refs: Sequence[str] = (),
     ) -> Node:
         resolved = node if isinstance(node, Node) else Node(
             name=node,
@@ -83,6 +91,10 @@ class Graph:
             kind=kind,
             max_visits=max_visits,
             on_error=on_error,
+            god=god,
+            phase=phase,
+            role=role,
+            skill_refs=tuple(skill_refs),
         )
         self.nodes[resolved.name] = resolved
         self.edges.setdefault(resolved.name, [])
@@ -161,6 +173,10 @@ class Graph:
                     "max_visits": node.max_visits,
                     "on_error": node.on_error,
                     "routed": node.name in self.routers,
+                    "god": node.god,
+                    "phase": node.phase,
+                    "role": node.role,
+                    "skill_refs": list(node.skill_refs),
                 }
                 for node in self.nodes.values()
             ],

@@ -111,6 +111,8 @@ export const EN: Record<string, string> = {
   // workflow stage model (lib/workflowStages.ts)
   "任务编排": "Task orchestration",
   "执行验收": "Execution & verification",
+  "对抗审查": "Adversarial review",
+  "真实验收": "Surface verification",
   "扩展步骤": "Extended steps",
   "关口": "Gate",
   "校验": "Check",

@@ -48,12 +48,37 @@ _NODE_TYPES: tuple[str, ...] = (
 )
 
 
+WorkflowAutonomy = Literal["gated", "autonomous_hard_stops", "read_only"]
+WorkflowStopAfter = Literal["goal", "design", "plan", "execute", "verify", "report"]
+WorkflowGod = Literal["prometheus", "athena", "hephaestus", "momus", "argus"]
+
+
+def _is_none(value: object) -> bool:
+    return value is None
+
+
+def _is_empty_seq(value: object) -> bool:
+    return not value
+
+
+def _is_default_family(value: object) -> bool:
+    return value == "sdlc"
+
+
+def _is_default_autonomy(value: object) -> bool:
+    return value == "gated"
+
+
 class WorkflowNodeDef(StrictModel):
     name: str = Field(min_length=1)
     type: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     max_visits: int = Field(default=1, ge=1)
     on_error: str | None = None
+    god: WorkflowGod | None = Field(default=None, exclude_if=_is_none)
+    phase: str | None = Field(default=None, exclude_if=_is_none)
+    role: str | None = Field(default=None, exclude_if=_is_none)
+    skill_refs: list[str] = Field(default_factory=list, exclude_if=_is_empty_seq)
 
 
 class WorkflowEdgeDef(StrictModel):
@@ -71,7 +96,11 @@ class WorkflowRouterDef(StrictModel):
 class WorkflowDefinition(StrictModel):
     name: str = Field(min_length=1)
     description: str = ""
-    stop_after: Literal["goal", "design", "plan", "execute"] = "plan"
+    family: str = Field(default="sdlc", exclude_if=_is_default_family)
+    autonomy: WorkflowAutonomy = Field(default="gated", exclude_if=_is_default_autonomy)
+    applicable_scenarios: list[str] = Field(default_factory=list, exclude_if=_is_empty_seq)
+    anti_patterns: list[str] = Field(default_factory=list, exclude_if=_is_empty_seq)
+    stop_after: WorkflowStopAfter = "plan"
     topology: str = "modular_product"
     nodes: list[WorkflowNodeDef] = Field(min_length=1)
     edges: list[WorkflowEdgeDef] = Field(default_factory=list)
@@ -407,11 +436,13 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
 
     gate_spec = GATE_SPECS.get(gate)
     if gate_spec is None:
-        raise GraphPaused(f"gate_{gate}", f"Unknown human gate '{gate}'")
+        pause_node = str(params.get("_node_name") or f"gate_{gate}")
+        raise GraphPaused(pause_node, f"Unknown human gate '{gate}'")
 
+    pause_node = str(params.get("_node_name") or gate_spec["node"])
     artifact = snap[gate_spec["snapshot_key"]]
     if artifact is None:
-        raise GraphPaused(gate_spec["node"], f"Run has no {gate_spec['label']} to approve")
+        raise GraphPaused(pause_node, f"Run has no {gate_spec['label']} to approve")
 
     approved = is_artifact_approved(runtime.store, run_id, gate, snap)
     policy = runtime.gate_policy
@@ -437,21 +468,21 @@ def _node_human_gate(state: dict[str, Any], params: Mapping[str, Any]) -> dict[s
             approved = True
         elif decision == "block":
             raise GraphPaused(
-                gate_spec["node"],
+                pause_node,
                 f"{gate_spec['label']} failed deterministic validation",
                 {"route": "blocked", "pause_kind": "blocked"},
             )
         else:
             pause_kind = "clarify" if gate == "spec" and _has_blockers(artifact) else "approval"
             raise GraphPaused(
-                gate_spec["node"],
+                pause_node,
                 f"{gate_spec['label']} is awaiting human approval",
                 {"route": "awaiting", "pause_kind": pause_kind},
             )
     if not approved:
         target_id = getattr(artifact, gate_spec["id_attr"])
         raise GraphPaused(
-            gate_spec["node"],
+            pause_node,
             f"{gate_spec['label']} {target_id} is awaiting human approval",
             {"route": "awaiting"},
         )
@@ -539,6 +570,7 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
         if node_def.type == "human_gate":
             gate_name = str(params.get("gate", "spec"))
             params.setdefault("enabled", gate_flags.get(f"approve_{gate_name}", True))
+            params.setdefault("_node_name", node_def.name)
         graph.add_node(
             Node(
                 name=node_def.name,
@@ -546,6 +578,10 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
                 kind=node_def.type,
                 max_visits=node_def.max_visits,
                 on_error=node_def.on_error,
+                god=node_def.god,
+                phase=node_def.phase,
+                role=node_def.role,
+                skill_refs=tuple(node_def.skill_refs),
             )
         )
     for edge in definition.edges:
@@ -600,6 +636,10 @@ def describe_workflow(definition: WorkflowDefinition) -> dict[str, Any]:
     return {
         "name": definition.name,
         "description": definition.description,
+        "family": definition.family,
+        "autonomy": definition.autonomy,
+        "applicable_scenarios": list(definition.applicable_scenarios),
+        "anti_patterns": list(definition.anti_patterns),
         "stop_after": definition.stop_after,
         "topology": definition.topology,
         "gates": dict(definition.gates),

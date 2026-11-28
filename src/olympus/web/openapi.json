@@ -6171,6 +6171,17 @@
       "WorkflowGraphNode": {
         "additionalProperties": false,
         "properties": {
+          "god": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "God"
+          },
           "kind": {
             "title": "Kind",
             "type": "string"
@@ -6194,9 +6205,38 @@
             ],
             "title": "On Error"
           },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "routed": {
             "title": "Routed",
             "type": "boolean"
+          },
+          "skill_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Skill Refs",
+            "type": "array"
           }
         },
         "required": [
@@ -6386,8 +6426,32 @@
       "WorkflowSummary": {
         "additionalProperties": false,
         "properties": {
+          "anti_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Anti Patterns",
+            "type": "array"
+          },
+          "applicable_scenarios": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Applicable Scenarios",
+            "type": "array"
+          },
+          "autonomy": {
+            "default": "gated",
+            "title": "Autonomy",
+            "type": "string"
+          },
           "description": {
             "title": "Description",
+            "type": "string"
+          },
+          "family": {
+            "default": "sdlc",
+            "title": "Family",
             "type": "string"
           },
           "gates": {
@@ -6427,6 +6491,11 @@
       "WorkflowView": {
         "additionalProperties": false,
         "properties": {
+          "autonomy": {
+            "default": "gated",
+            "title": "Autonomy",
+            "type": "string"
+          },
           "current_node": {
             "anyOf": [
               {
@@ -6448,6 +6517,11 @@
               }
             ],
             "title": "Failed Node"
+          },
+          "family": {
+            "default": "sdlc",
+            "title": "Family",
+            "type": "string"
           },
           "finished": {
             "title": "Finished",

@@ -131,11 +131,17 @@ class SessionConfig:
     stage_driver: str | None = None
     worker_driver: str | None = None
     reviewer_driver: str | None = None
+    role_drivers: dict[str, str] = field(default_factory=dict)
     monitor_model: str | None = None
     pi_provider: str | None = None
     thinking_level: str | None = None
     context_window: int | None = None
     worker_max_steps: int | None = 40
+    workspace_id: str | None = None
+    workspace_mode: str = "brownfield"
+    task_type: str = "feature"
+    base_ref: str | None = None
+    scope_paths: list[str] = field(default_factory=list)
     provider_builder: ProviderBuilder | None = None
     extra_provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -345,6 +351,11 @@ class SessionRunner:
             provider_config=provider_config,
             execution_drivers=drivers.model_dump(mode="json"),
             workspace_root=self.workspace_root,
+            workspace_id=self.config.workspace_id,
+            workspace_mode=self.config.workspace_mode,
+            task_type=self.config.task_type,
+            base_ref=self.config.base_ref,
+            scope_paths=list(self.config.scope_paths),
             actor="session",
         )
         toplevel = _git_toplevel(self.workspace_root)
@@ -439,6 +450,7 @@ class SessionRunner:
                     run_id,
                     pause_kind or PauseKind.CLARIFY,
                     node=node,
+                    gate=gate,
                     reason=str(exc),
                     message=str(exc),
                 )
@@ -452,9 +464,10 @@ class SessionRunner:
                     run_id,
                     PauseKind.PLAN_HANDOFF,
                     node=node,
+                    gate=gate,
                     reason="Plan already approved; re-run with --step-mode execute to implement.",
                 )
-            pending_gate = gate or self._gate_from_node(node)
+            pending_gate = gate or self._gate_from_node(node, definition=definition)
             if pending_gate is None:
                 if pause_kind == PauseKind.BLOCKED:
                     return self._recover_blocked(run_id, definition, snap, text)
@@ -489,6 +502,7 @@ class SessionRunner:
                     run_id,
                     pause_kind or PauseKind.APPROVAL,
                     node=node,
+                    gate=pending_gate,
                     reason=str(exc),
                     message=str(exc),
                 )
@@ -505,12 +519,14 @@ class SessionRunner:
             fallback_kind,
             snap,
             node=node,
+            gate=gate,
             reason="Could not map the reply to a safe session action.",
         )
         return self._emit_pause(
             run_id,
             fallback_kind,
             node=node,
+            gate=gate,
             reason="Could not map the reply to a safe session action.",
             message=(
                 "I could not map that reply to a safe action. Please answer the pending "
@@ -526,6 +542,7 @@ class SessionRunner:
             stage_driver=self.config.stage_driver,
             worker_driver=self.config.worker_driver,
             reviewer_driver=self.config.reviewer_driver,
+            role_drivers=self.config.role_drivers or None,
             monitor_model=self.config.monitor_model,
             pi_provider=self.config.pi_provider,
             thinking_level=self.config.thinking_level,
@@ -692,6 +709,11 @@ class SessionRunner:
             "constraints": self._constraints(run_id),
             "topology": effective.topology,
             "route": None,
+            "workspace_id": snap.get("workspace_id") or self.config.workspace_id,
+            "workspace_mode": snap.get("workspace_mode") or self.config.workspace_mode,
+            "task_type": snap.get("task_type") or self.config.task_type,
+            "base_ref": snap.get("base_ref") or self.config.base_ref,
+            "scope_paths": list(snap.get("scope_paths") or self.config.scope_paths),
             "_runtime": runtime,
         }
         for key in ("spec", "design", "plan"):
@@ -710,11 +732,27 @@ class SessionRunner:
 
         paused_node = result.get("_paused_node")
         pause_reason = str(result.get("_pause_reason") or "")
+        pause_gate = self._gate_from_node(
+            str(paused_node) if paused_node else None,
+            definition=effective,
+            explicit_gate=result.get("pause_gate"),
+        )
         final = self.store.get_run(run_id)
         if paused_node:
-            kind = self._coerce_pause_kind(result.get("pause_kind"), paused_node, final)
-            self._mark_awaiting_human(run_id, final, paused_node, pause_reason)
-            return self._emit_pause(run_id, kind, node=str(paused_node), reason=pause_reason)
+            kind = self._coerce_pause_kind(
+                result.get("pause_kind"),
+                str(paused_node),
+                final,
+                gate=pause_gate,
+            )
+            self._mark_awaiting_human(run_id, final, str(paused_node), pause_reason)
+            return self._emit_pause(
+                run_id,
+                kind,
+                node=str(paused_node),
+                gate=pause_gate,
+                reason=pause_reason,
+            )
 
         spec: GoalSpec | None = final["spec"]
         plan: TaskPlan | None = final["plan"]
@@ -725,8 +763,14 @@ class SessionRunner:
             )
         if self.config.step_mode == StepMode.PLAN_ONLY:
             return self._emit_plan_handoff(run_id, final, plan)
+        blocked = [
+            task
+            for task in (plan.tasks if plan is not None else [])
+            if task.status == TaskStatus.BLOCKED
+        ]
         if (
-            effective.stop_after != "execute"
+            effective.stop_after in ("goal", "design", "plan")
+            and not blocked
             and plan is not None
             and self.store.is_approved(
                 run_id=run_id,
@@ -747,11 +791,6 @@ class SessionRunner:
                     detail={"workflow": effective.name, "stop_after": effective.stop_after},
                 )
             return self._completed_envelope(run_id, self.store.get_run(run_id))
-        blocked = [
-            task
-            for task in (plan.tasks if plan is not None else [])
-            if task.status == TaskStatus.BLOCKED
-        ]
         if blocked or final["status"] in (RunStatus.AWAITING_HUMAN, RunStatus.PAUSED):
             reason = self._blocked_reason(blocked)
             self._mark_awaiting_human(run_id, final, None, reason)
@@ -790,6 +829,17 @@ class SessionRunner:
                 )
                 snap = self.store.get_run(run_id)
             return self._completed_envelope(run_id, snap)
+        if snap["status"] == RunStatus.AWAITING_HUMAN:
+            with suppress(ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="session",
+                    stage="session",
+                    detail={"resumed_at": entry},
+                )
+            snap = self.store.get_run(run_id)
         return self._drive(
             run_id=run_id,
             raw_input=self._current_input(run_id, snap),
@@ -1328,13 +1378,17 @@ class SessionRunner:
         kind: PauseKind,
         *,
         node: str | None,
+        gate: str | None = None,
         reason: str,
         message: str | None = None,
     ) -> SessionEnvelope:
         snap = self.store.get_run(run_id)
         spec: GoalSpec | None = snap["spec"]
         blockers = spec.unresolved_blockers() if spec is not None else []
-        text = message or self._pause_message(kind, snap, node=node, reason=reason)
+        resolved_gate = gate if gate is not None else self._gate_from_node(node)
+        text = message or self._pause_message(
+            kind, snap, node=node, gate=resolved_gate, reason=reason
+        )
         self.store.append_event(
             run_id=run_id,
             stage="session",
@@ -1343,7 +1397,7 @@ class SessionRunner:
             payload={
                 "pause_kind": kind.value,
                 "node": node,
-                "gate": self._gate_from_node(node),
+                "gate": resolved_gate,
                 "reason": reason,
                 "message": text,
                 "unresolved_blockers": blockers,
@@ -1380,11 +1434,12 @@ class SessionRunner:
     def _current_pause_envelope(
         self, snap: dict[str, Any], *, message: str
     ) -> SessionEnvelope:
-        pause_kind, _gate, node = self._pause_state(str(snap["run_id"]))
+        pause_kind, gate, node = self._pause_state(str(snap["run_id"]))
         return self._emit_pause(
             str(snap["run_id"]),
             pause_kind or PauseKind.BLOCKED,
             node=node,
+            gate=gate,
             reason=message,
             message=message,
         )
@@ -1501,19 +1556,26 @@ class SessionRunner:
         return None, None, None
 
     def _coerce_pause_kind(
-        self, raw: Any, paused_node: str, snap: dict[str, Any]
+        self,
+        raw: Any,
+        paused_node: str,
+        snap: dict[str, Any],
+        *,
+        gate: str | None = None,
     ) -> PauseKind:
         if isinstance(raw, str):
             try:
                 return PauseKind(raw)
             except ValueError:
                 pass
-        return self._infer_pause_kind(paused_node, snap)
+        return self._infer_pause_kind(paused_node, snap, gate=gate)
 
-    def _infer_pause_kind(self, paused_node: str, snap: dict[str, Any]) -> PauseKind:
-        gate = self._gate_from_node(paused_node)
-        if gate is not None:
-            if gate == "spec":
+    def _infer_pause_kind(
+        self, paused_node: str, snap: dict[str, Any], *, gate: str | None = None
+    ) -> PauseKind:
+        resolved_gate = gate if gate is not None else self._gate_from_node(paused_node)
+        if resolved_gate is not None:
+            if resolved_gate == "spec":
                 spec: GoalSpec | None = snap["spec"]
                 if spec is not None and spec.unresolved_blockers():
                     return PauseKind.CLARIFY
@@ -1522,9 +1584,22 @@ class SessionRunner:
         return PauseKind.BLOCKED
 
     @staticmethod
-    def _gate_from_node(node: str | None) -> str | None:
+    def _gate_from_node(
+        node: str | None,
+        *,
+        definition: WorkflowDefinition | None = None,
+        explicit_gate: Any = None,
+    ) -> str | None:
+        if isinstance(explicit_gate, str) and explicit_gate in GATE_SPECS:
+            return explicit_gate
         if node is None:
             return None
+        if definition is not None:
+            node_def = definition.node(node)
+            if node_def is not None and node_def.type == "human_gate":
+                declared = str(node_def.params.get("gate", "spec"))
+                if declared in GATE_SPECS:
+                    return declared
         return _GATE_BY_NODE.get(node)
 
     def _pause_message(
@@ -1533,6 +1608,7 @@ class SessionRunner:
         snap: dict[str, Any],
         *,
         node: str | None,
+        gate: str | None = None,
         reason: str,
     ) -> str:
         spec: GoalSpec | None = snap["spec"]
@@ -1554,9 +1630,9 @@ class SessionRunner:
                 return "\n".join(lines)
             return reason or "Additional clarification is required."
         if kind == PauseKind.APPROVAL:
-            gate = self._gate_from_node(node)
-            if gate is not None:
-                label = GATE_SPECS[gate]["label"]
+            resolved_gate = gate if gate is not None else self._gate_from_node(node)
+            if resolved_gate is not None:
+                label = GATE_SPECS[resolved_gate]["label"]
                 return reason or f"{label} is awaiting human approval."
             return reason or "The run is awaiting human approval."
         if kind == PauseKind.PLAN_HANDOFF:

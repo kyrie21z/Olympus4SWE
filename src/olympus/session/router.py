@@ -795,7 +795,19 @@ def _sanitize(
             ),
         )
     elif action == "clarify":
-        action = "unknown"
+        if spec is None and pause_kind == PauseKind.CLARIFY and message.strip():
+            feedback = feedback or message.strip()
+        else:
+            action = "unknown"
+    elif (
+        spec is None
+        and pause_kind == PauseKind.CLARIFY
+        and action == "unknown"
+        and message.strip()
+        and not _is_question(message)
+    ):
+        action = "clarify"
+        feedback = feedback or message.strip()
     if action == "approve" and (
         _negated_approval(lowered) or _negated_defaults(lowered) or _is_question(message)
     ):

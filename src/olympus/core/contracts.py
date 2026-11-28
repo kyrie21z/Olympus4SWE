@@ -790,3 +790,128 @@ class RunEvent(StrictModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     state_revision: int = Field(ge=0)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class EvidenceFact(StrictModel):
+    path: str = Field(min_length=1)
+    line: int | None = Field(default=None, ge=1)
+    observation: str = Field(min_length=1)
+
+
+class EvidenceBrief(FingerprintedModel):
+    brief_id: str = Field(default_factory=lambda: new_id("evid"))
+    summary: str = Field(min_length=1)
+    facts: list[EvidenceFact] = Field(default_factory=list)
+    repro_command: str | None = None
+    repro_exit_code: int | None = None
+    repro_excerpt: str = ""
+    repro_verified: bool = False
+    unresolved_questions: list[str] = Field(default_factory=list)
+    candidate_files: list[str] = Field(default_factory=list)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "brief_id"})
+
+
+class CandidateShape(StrictModel):
+    name: str = Field(min_length=1)
+    data_flow: str = Field(min_length=1)
+    tradeoffs: str = Field(min_length=1)
+
+
+class ArchitectSketch(FingerprintedModel):
+    sketch_id: str = Field(default_factory=lambda: new_id("arch"))
+    candidate_shapes: list[CandidateShape] = Field(min_length=2)
+    chosen_shape: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    state_owners: dict[str, str] = Field(default_factory=dict)
+    write_scope: list[str] = Field(min_length=1)
+    forbidden_globs: list[str] = Field(default_factory=list)
+    blast_radius: str = ""
+    verification_plan: list[str] = Field(min_length=1)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "sketch_id"})
+
+    @model_validator(mode="after")
+    def _validate_sketch(self) -> ArchitectSketch:
+        cleaned_scope = [item.strip() for item in self.write_scope if item.strip()]
+        if not cleaned_scope:
+            raise ValueError("ArchitectSketch.write_scope must contain at least one path")
+        self.write_scope = cleaned_scope
+        cleaned_plan = [item.strip() for item in self.verification_plan if item.strip()]
+        if not cleaned_plan:
+            raise ValueError(
+                "ArchitectSketch.verification_plan must contain at least one executable check"
+            )
+        self.verification_plan = cleaned_plan
+        shape_names = {shape.name.strip() for shape in self.candidate_shapes}
+        if self.chosen_shape.strip() not in shape_names:
+            raise ValueError(
+                f"chosen_shape {self.chosen_shape!r} must match one of candidate_shapes "
+                f"{sorted(shape_names)}"
+            )
+        return self
+
+
+class InterrogateFinding(StrictModel):
+    finding_id: str = Field(default_factory=lambda: new_id("find"))
+    severity: Literal["important", "nit"] = "important"
+    file_path: str = ""
+    claim: str = Field(min_length=1)
+    repro_command: str | None = None
+    exit_code: int | None = None
+    observed_output: str = ""
+    proven: bool = False
+    lane: Literal["interrogate", "correctness", "code_judo"] = "interrogate"
+
+
+class InterrogateReport(FingerprintedModel):
+    report_id: str = Field(default_factory=lambda: new_id("intr"))
+    verdict: Literal["pass", "findings", "blocked"] = "pass"
+    findings: list[InterrogateFinding] = Field(default_factory=list)
+    unproven_notes: list[str] = Field(default_factory=list)
+    summary: str = ""
+    reviewer_driver: str = ""
+    cold_start: bool = True
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "report_id"})
+
+    def proven_blocking_findings(self) -> list[InterrogateFinding]:
+        return [
+            finding
+            for finding in self.findings
+            if finding.severity == "important" and finding.proven
+        ]
+
+
+class SurfaceCheckResult(StrictModel):
+    surface: str = Field(min_length=1)
+    command: str = ""
+    status: Literal["pass", "fail", "inconclusive"]
+    exit_code: int | None = None
+    evidence: str = ""
+
+
+class SurfaceVerificationReport(FingerprintedModel):
+    verification_id: str = Field(default_factory=lambda: new_id("verf"))
+    passed: bool
+    checks: list[SurfaceCheckResult] = Field(default_factory=list)
+    summary: str = ""
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "verification_id"})
+
+    @model_validator(mode="after")
+    def _enforce_inconclusive_never_passes(self) -> SurfaceVerificationReport:
+        if self.passed:
+            if not self.checks:
+                raise ValueError("SurfaceVerificationReport cannot pass with zero checks")
+            non_passing = [check.surface for check in self.checks if check.status != "pass"]
+            if non_passing:
+                raise ValueError(
+                    "SurfaceVerificationReport cannot pass when checks are non-passing: "
+                    + ", ".join(non_passing)
+                )
+        return self

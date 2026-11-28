@@ -1708,6 +1708,31 @@ def build_run_projection(
                 event.payload.get("spec_id") in (None, "", spec.spec_id)
             ):
                 break
+    else:
+        last_craft_progress_seq = max(
+            (
+                event.event_seq
+                for event in events
+                if event.event_type
+                in (
+                    "craft.evidence_recorded",
+                    "craft.architect_recorded",
+                    "craft.build_completed",
+                )
+            ),
+            default=0,
+        )
+        clarification_notes = [
+            {
+                "event_seq": event.event_seq,
+                "created_at": event.created_at.isoformat(),
+                "feedback": str(event.payload.get("note") or "").strip(),
+                "consumed": event.event_seq < last_craft_progress_seq,
+            }
+            for event in events
+            if event.event_type == "craft.clarification_recorded"
+            and str(event.payload.get("note") or "").strip()
+        ]
 
     live_progress = _live_task_progress(tasks, events)
     review_deferred, escape_rejections, escape_findings = _task_review_flags(tasks, events)

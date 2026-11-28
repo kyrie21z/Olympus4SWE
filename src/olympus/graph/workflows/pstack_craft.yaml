@@ -1,0 +1,91 @@
+name: pstack_craft
+description: >-
+  Evidence-first brownfield craft workflow distilled from t3-pstack (poteto-mode):
+  autonomous-by-default exploration, two-shape architecture sketch, isolated worktree build with
+  DiffGate, diff hygiene (deslop), cold-start run-proven adversarial interrogation (Momus), and
+  first-class real-surface verification (Argus).
+family: pstack
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - brownfield multi-file feature with clear intent
+  - cross-boundary refactor and caller migration
+  - signature changes affecting multiple modules
+anti_patterns:
+  - vague greenfield product idea requiring upfront GoalSpec and DesignSpec alignment
+  - unknown-cause bug requiring failing reproduction before touching code
+  - trivial single-line known typo fix
+stop_after: verify
+topology: evidence_first
+nodes:
+  - name: explore
+    type: explore_reproduce
+    god: prometheus
+    phase: align
+    role: explorer
+    skill_refs:
+      - pstack/explore
+    params:
+      require_repro: false
+  - name: architect
+    type: architect_sketch
+    god: athena
+    phase: design
+    role: architect
+    skill_refs:
+      - pstack/architect
+  - name: build
+    type: build_direct
+    god: hephaestus
+    phase: execute
+    role: builder
+    skill_refs:
+      - pstack/build
+    max_visits: 3
+  - name: hygiene
+    type: hygiene_pass
+    god: hephaestus
+    phase: execute
+    role: hygiene
+    skill_refs:
+      - pstack/hygiene
+    max_visits: 3
+  - name: interrogate
+    type: interrogate_review
+    god: momus
+    phase: review
+    role: interrogator
+    skill_refs:
+      - pstack/interrogate
+      - pstack/thermo-review
+    max_visits: 3
+    params:
+      enable_thermo: false
+      max_cycles: 3
+  - name: verify_surface
+    type: verify_surface
+    god: argus
+    phase: verify
+    role: verifier
+    skill_refs:
+      - pstack/verify
+edges:
+  - source: START
+    target: explore
+  - source: explore
+    target: architect
+  - source: architect
+    target: build
+  - source: build
+    target: hygiene
+  - source: hygiene
+    target: interrogate
+  - source: verify_surface
+    target: END
+routers:
+  - at: interrogate
+    key: route
+    default: verify_surface
+    rules:
+      findings: build
+      pass: verify_surface
+gates: {}

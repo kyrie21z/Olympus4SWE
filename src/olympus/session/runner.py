@@ -72,7 +72,15 @@ from olympus.stages.align import (
 ProviderBuilder = Callable[..., LLMProvider]
 
 _GATE_BY_NODE: dict[str, str] = {spec["node"]: gate for gate, spec in GATE_SPECS.items()}
-_EXECUTE_TYPES = frozenset({"execute_task_dag"})
+_EXECUTE_TYPES = frozenset(
+    {
+        "execute_task_dag",
+        "build_direct",
+        "hygiene_pass",
+        "interrogate_review",
+        "verify_surface",
+    }
+)
 _PLAN_ONLY_STOP = "plan"
 _MAX_IN_PLACE_RECOVERIES = 2
 _MAX_PLAN_RECOVERIES = 3
@@ -437,6 +445,16 @@ class SessionRunner:
             completed=False,
         )
         if intent.action == "clarify":
+            if snap.get("spec") is None:
+                clarify_text = intent.feedback.strip() or text
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="craft",
+                    event_type="craft.clarification_recorded",
+                    actor="human",
+                    payload={"note": clarify_text, "answers": dict(intent.answers)},
+                )
+                return self._continue(run_id, definition)
             try:
                 self.control.clarify_spec(
                     run_id=run_id,
@@ -922,6 +940,8 @@ class SessionRunner:
         blocked = self._execution_blocked_tasks(run_id, snap)
         if blocked:
             return self._recover_blocked_in_place(run_id, definition, snap, clean, blocked)
+        if definition.family != "sdlc" and snap.get("plan") is None:
+            return self._recover_blocked_craft(run_id, definition, snap, clean)
         if self._has_bound_approved_plan(run_id, snap):
             plan: TaskPlan | None = snap["plan"]
             pending = [
@@ -938,6 +958,61 @@ class SessionRunner:
             if pending:
                 return self._resume_execution_in_place(run_id, definition, snap, clean)
         return self._recover_blocked_planning(run_id, definition, snap, clean)
+
+    def _recover_blocked_craft(
+        self,
+        run_id: str,
+        definition: WorkflowDefinition,
+        snap: dict[str, Any],
+        hint: str,
+    ) -> SessionEnvelope:
+        """Resume a blocked non-SDLC craft run without re-running explore or stale cycles."""
+        _kind, _gate, paused_node = self._pause_state(run_id)
+        self.store.append_event(
+            run_id=run_id,
+            stage="craft",
+            event_type="craft.clarification_recorded",
+            actor="human",
+            payload={"note": hint, "recovery": True},
+        )
+        self.store.append_event(
+            run_id=run_id,
+            stage="craft",
+            event_type="craft.recovery_reset",
+            actor="human",
+            payload={"hint": hint, "paused_node": paused_node},
+        )
+        build_node = next(
+            (n.name for n in definition.nodes if n.type == "build_direct"), None
+        )
+        has_architect = any(
+            ev.event_type == "craft.architect_recorded"
+            for ev in self.store.list_events(run_id)
+        )
+        if build_node is not None and has_architect:
+            entry: str | None = build_node
+        elif paused_node is not None and definition.node(paused_node) is not None:
+            entry = paused_node
+        else:
+            entry = resolve_resume_node(definition, snap, store=self.store)
+        if snap["status"] == RunStatus.AWAITING_HUMAN:
+            with suppress(ConcurrencyConflictError):
+                self.store.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    expected_revision=int(snap["state_revision"]),
+                    actor="session",
+                    stage="session",
+                    detail={"resumed_at": entry},
+                )
+            snap = self.store.get_run(run_id)
+        augmented = self._augment_input(run_id, snap, hint, "User recovery hint")
+        return self._drive(
+            run_id=run_id,
+            raw_input=augmented,
+            start_from=entry,
+            definition=definition,
+        )
 
     def _has_bound_approved_plan(self, run_id: str, snap: dict[str, Any]) -> bool:
         """Return True when the run has an approved TaskPlan bound to approved upstream specs."""

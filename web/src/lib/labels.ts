@@ -343,8 +343,16 @@ export function clarifyPanelVisibility(projection: RunProjection | null | undefi
   const pending = projection ? pendingAmbiguities(projection) : [];
   const submittedNotes = projection?.clarification_notes || [];
   const hasUnconsumedNotes = !isTerminal && submittedNotes.some((note) => !note.consumed);
+  const pausedCraftClarify = Boolean(
+    inAlign &&
+      !projection?.spec &&
+      (projection?.status === "awaiting_human" || projection?.status === "paused") &&
+      projection?.workflow?.paused?.node &&
+      projection?.workflow?.family !== "sdlc",
+  );
   const showForm =
     pending.length > 0 ||
+    pausedCraftClarify ||
     Boolean(inAlign && projection?.spec && projection.resynthesis_error);
   const showNotes = submittedNotes.length > 0 && (inAlign || hasUnconsumedNotes);
   return {

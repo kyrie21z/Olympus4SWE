@@ -770,3 +770,80 @@ def test_clarify_panel_hides_after_spec_approval_even_with_unanswered_non_blocki
     expect(drawer.locator("#clarify-panel")).to_have_count(0)
     expect(drawer.locator("#btn-clarify-submit")).to_have_count(0)
     page.close()
+
+
+def test_pstack_craft_paused_clarify_form_visible_and_submits_in_browser(board_server, browser):
+    """Non-GoalSpec pstack_craft paused for clarification renders and submits the clarify form."""
+    store, _, url = board_server
+
+    def _seed_paused_craft(run_id: str, title: str) -> str:
+        store.create_run(run_id=run_id, title=title, workflow_name="pstack_craft")
+        store.append_event(
+            run_id=run_id,
+            stage="graph",
+            event_type="graph.paused",
+            actor="workflow_engine",
+            payload={
+                "node": "explore",
+                "reason": "Clarify whether integers or floats are supported",
+                "pause_kind": "clarify",
+            },
+        )
+        store.set_run_status(
+            run_id,
+            RunStatus.AWAITING_HUMAN,
+            detail={"paused_node": "explore", "reason": "Clarify input types"},
+        )
+        return run_id
+
+    drawer_run_id = _seed_paused_craft("run-pstack-craft-drawer", "Pstack Craft Drawer Clarify")
+    cockpit_run_id = _seed_paused_craft("run-pstack-craft-cockpit", "Pstack Craft Cockpit Clarify")
+
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    expect = playwright.expect
+
+    # 1. Quick Ruling Drawer on Oracle Board must show and submit the clarify form.
+    page.goto(f"{url}/")
+    page.locator(f"[data-quick-rule='{drawer_run_id}']").click()
+    drawer = page.locator("#quick-ruling-drawer")
+    expect(drawer).to_be_visible()
+    expect(drawer.locator("#clarify-panel")).to_be_visible()
+    expect(drawer.locator("#btn-clarify-submit")).to_be_visible()
+    drawer.locator("#clarify-note-input").fill("Drawer note: integers only")
+    drawer.locator("#btn-clarify-submit").click()
+    expect(drawer.locator("#clarify-notes")).to_contain_text("Drawer note: integers only")
+
+    drawer_events = [
+        ev
+        for ev in store.list_events(drawer_run_id)
+        if ev.event_type == "craft.clarification_recorded"
+    ]
+    assert len(drawer_events) == 1
+    assert drawer_events[0].payload["note"] == "Drawer note: integers only"
+
+    # 2. Main Cockpit detail view must also render the clarify form and persist submitted note.
+    page.goto(f"{url}/?run={cockpit_run_id}#topology")
+    expect(page.locator("#clarify-panel")).to_be_visible()
+    page.locator("#clarify-note-input").fill("Support integers only")
+    page.locator("#btn-clarify-submit").click()
+    expect(page.locator("#clarify-notes")).to_contain_text("Support integers only")
+
+    cockpit_events = [
+        ev
+        for ev in store.list_events(cockpit_run_id)
+        if ev.event_type == "craft.clarification_recorded"
+    ]
+    assert len(cockpit_events) == 1
+    assert cockpit_events[0].payload["note"] == "Support integers only"
+
+    # 3. Once explore emits craft.evidence_recorded, earlier notes project as consumed.
+    store.append_event(
+        run_id=cockpit_run_id,
+        stage="craft",
+        event_type="craft.evidence_recorded",
+        actor="prometheus",
+        payload={"summary": "Explored after clarification"},
+    )
+    page.reload()
+    expect(page.locator(".clarify-note-pill[data-consumed='true']")).to_have_count(1)
+    page.close()

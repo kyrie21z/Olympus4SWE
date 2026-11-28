@@ -27,6 +27,7 @@ from olympus.core.contracts import (
     TaskNode,
     TaskPlan,
     TaskStatus,
+    utc_now,
 )
 from olympus.core.dag import validate_goal_spec
 from olympus.core.store import ConcurrencyConflictError, RunStore
@@ -497,6 +498,103 @@ class RunControl:
             action="clarify",
             expected_state_revision=expected_revision,
             payload=payload,
+            handler=handler,
+        )
+
+    def clarify_craft(
+        self,
+        run_id: str,
+        *,
+        answers: dict[str, str],
+        resolutions: dict[str, str] | None = None,
+        clarification_note: str = "",
+        actor: str = "zeus",
+        expected_revision: int | None = None,
+        operation_id: str | None = None,
+        command_meta: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a non-GoalSpec craft clarification with revision CAS and optional idempotency."""
+        res_map = resolutions or {}
+        note_parts = [
+            clarification_note.strip(),
+            *(f"{k}: {v}" for k, v in answers.items() if str(v).strip()),
+            *(f"{k}: {v}" for k, v in res_map.items() if str(v).strip()),
+        ]
+        note = "\n".join(part for part in note_parts if part).strip()
+        if not note:
+            raise ValueError(
+                "clarify requires non-empty answers, resolutions, or clarification_note"
+            )
+        event_payload: dict[str, Any] = {
+            "note": note,
+            "answers": dict(answers),
+            "resolutions": dict(res_map),
+        }
+
+        if operation_id is None:
+            snap = self.store.get_run(run_id, expected_revision=expected_revision)
+            cas_revision = (
+                expected_revision if expected_revision is not None else int(snap["state_revision"])
+            )
+            with self.store._tx() as conn:
+                cur_rev = int(self.store._get_run_row(conn, run_id)["state_revision"])
+                if cur_rev != cas_revision:
+                    raise ConcurrencyConflictError(
+                        f"Revision mismatch: expected {cas_revision}, got {cur_rev}"
+                    )
+                new_rev = cur_rev + 1
+                conn.execute(
+                    "UPDATE runs SET state_revision = ?, updated_at = ? WHERE run_id = ?",
+                    (new_rev, utc_now().isoformat(), run_id),
+                )
+                self.store._insert_event(
+                    conn,
+                    run_id=run_id,
+                    stage="craft",
+                    event_type="craft.clarification_recorded",
+                    actor=actor,
+                    payload=event_payload,
+                    state_revision=new_rev,
+                )
+            return {
+                "run_id": run_id,
+                "clarification_note": note,
+                "state_revision": new_rev,
+            }
+
+        cmd_payload: dict[str, Any] = {
+            **event_payload,
+            **(command_meta or {}),
+        }
+
+        def handler(conn: sqlite3.Connection, cur_rev: int) -> dict[str, Any]:
+            new_rev = cur_rev + 1
+            conn.execute(
+                "UPDATE runs SET state_revision = ?, updated_at = ? WHERE run_id = ?",
+                (new_rev, utc_now().isoformat(), run_id),
+            )
+            self.store._insert_event(
+                conn,
+                run_id=run_id,
+                stage="craft",
+                event_type="craft.clarification_recorded",
+                actor=actor,
+                payload=event_payload,
+                state_revision=new_rev,
+            )
+            return {
+                "run_id": run_id,
+                "clarification_note": note,
+                "state_revision": new_rev,
+            }
+
+        return self.store.apply_idempotent_command(
+            operation_id=operation_id,
+            run_id=run_id,
+            actor=actor,
+            action="clarify",
+            expected_state_revision=expected_revision,
+            payload=cmd_payload,
             handler=handler,
         )
 

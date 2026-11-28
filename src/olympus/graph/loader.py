@@ -27,6 +27,7 @@ from olympus.harness.activity import LiveActivity
 from olympus.harness.driver import ActiveTurnHandle, DriverRegistry, ExecutionDriversConfig
 from olympus.providers.base import LLMProvider
 from olympus.stages.align import AlignStage
+from olympus.stages.craft import CraftPause, CraftStage
 from olympus.stages.design import DesignStage, triage_input
 from olympus.stages.orchestrate import OrchestrateStage
 
@@ -45,6 +46,12 @@ _NODE_TYPES: tuple[str, ...] = (
     "validate_plan",
     "execute_task_dag",
     "human_gate",
+    "explore_reproduce",
+    "architect_sketch",
+    "build_direct",
+    "hygiene_pass",
+    "interrogate_review",
+    "verify_surface",
 )
 
 
@@ -518,6 +525,143 @@ def _node_execute(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str,
     }
 
 
+def _craft_stage(runtime: WorkflowRuntime) -> CraftStage:
+    return CraftStage(
+        store=runtime.store,
+        workspace_root=runtime.workspace_root,
+        provider=runtime.provider,
+        artifacts_root=runtime.artifacts_root,
+        sandbox_root=runtime.sandbox_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
+        model_provider=runtime.model_provider,
+        on_driver_handle=runtime.on_driver_handle,
+    )
+
+
+def _node_explore_reproduce(
+    state: dict[str, Any], params: Mapping[str, Any]
+) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    try:
+        return _craft_stage(runtime).explore_reproduce(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            constraints=list(state.get("constraints", [])),
+            scope_paths=list(state.get("scope_paths", [])),
+            node_name=str(params.get("_node_name") or "explore"),
+            role=str(params.get("_node_role") or "explorer"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            require_repro=bool(params.get("require_repro", False)),
+            max_steps=int(params.get("max_steps", runtime.max_steps)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
+def _node_architect_sketch(
+    state: dict[str, Any], params: Mapping[str, Any]
+) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    try:
+        return _craft_stage(runtime).architect_sketch(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            state=state,
+            constraints=list(state.get("constraints", [])),
+            scope_paths=list(state.get("scope_paths", [])),
+            node_name=str(params.get("_node_name") or "architect"),
+            role=str(params.get("_node_role") or "architect"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            max_steps=int(params.get("max_steps", runtime.max_steps)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
+def _node_build_direct(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    try:
+        return _craft_stage(runtime).build_direct(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            state=state,
+            node_name=str(params.get("_node_name") or "build"),
+            role=str(params.get("_node_role") or "builder"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            strict_scope=bool(params.get("strict_scope", True)),
+            max_diff_gate_retries=int(params.get("max_diff_gate_retries", 2)),
+            max_steps=int(
+                params.get("max_steps") or runtime.worker_max_steps or runtime.max_steps
+            ),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
+def _node_hygiene_pass(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    try:
+        return _craft_stage(runtime).hygiene_pass(
+            run_id=run_id,
+            state=state,
+            node_name=str(params.get("_node_name") or "hygiene"),
+            role=str(params.get("_node_role") or "hygiene"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            strict_scope=bool(params.get("strict_scope", True)),
+            max_steps=int(params.get("max_steps", runtime.max_steps)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
+def _node_interrogate_review(
+    state: dict[str, Any], params: Mapping[str, Any]
+) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    visit_cap = int(params.get("_node_loop_visit_cap") or params.get("_node_max_visits") or 3)
+    requested_cycles = int(params.get("max_cycles") or visit_cap)
+    max_cycles = max(1, min(requested_cycles, visit_cap))
+    try:
+        return _craft_stage(runtime).interrogate_review(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            state=state,
+            node_name=str(params.get("_node_name") or "interrogate"),
+            role=str(params.get("_node_role") or "interrogator"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ()),
+            enable_thermo=bool(params.get("enable_thermo", False)),
+            max_cycles=max_cycles,
+            max_steps=int(params.get("max_steps", runtime.max_steps)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
+def _node_verify_surface(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    raw_commands = params.get("commands")
+    commands = list(raw_commands) if isinstance(raw_commands, list) else None
+    try:
+        return _craft_stage(runtime).verify_surface(
+            run_id=run_id,
+            state=state,
+            node_name=str(params.get("_node_name") or "verify_surface"),
+            role=str(params.get("_node_role") or "verifier"),
+            commands=commands,
+            apply_to_workspace=runtime.apply_to_workspace,
+            timeout_s=int(params.get("timeout_s", 120)),
+        )
+    except CraftPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
 _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any]]] = {
     "intake_triage": _node_intake,
     "align_goal": _node_align,
@@ -528,6 +672,12 @@ _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any
     "validate_plan": _node_validate_plan,
     "execute_task_dag": _node_execute,
     "human_gate": _node_human_gate,
+    "explore_reproduce": _node_explore_reproduce,
+    "architect_sketch": _node_architect_sketch,
+    "build_direct": _node_build_direct,
+    "hygiene_pass": _node_hygiene_pass,
+    "interrogate_review": _node_interrogate_review,
+    "verify_surface": _node_verify_surface,
 }
 
 
@@ -571,6 +721,31 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
             gate_name = str(params.get("gate", "spec"))
             params.setdefault("enabled", gate_flags.get(f"approve_{gate_name}", True))
             params.setdefault("_node_name", node_def.name)
+        elif node_def.type in (
+            "explore_reproduce",
+            "architect_sketch",
+            "build_direct",
+            "hygiene_pass",
+            "interrogate_review",
+            "verify_surface",
+        ):
+            params.setdefault("_node_name", node_def.name)
+            if node_def.role is not None:
+                params.setdefault("_node_role", node_def.role)
+            if node_def.skill_refs:
+                params.setdefault("_node_skill_refs", tuple(node_def.skill_refs))
+            params.setdefault("_node_max_visits", node_def.max_visits)
+            if node_def.type == "interrogate_review":
+                loop_caps = [node_def.max_visits]
+                for router in definition.routers:
+                    if router.at != node_def.name:
+                        continue
+                    findings_target = router.rules.get("findings")
+                    if findings_target:
+                        target_def = definition.node(findings_target)
+                        if target_def is not None:
+                            loop_caps.append(target_def.max_visits)
+                params.setdefault("_node_loop_visit_cap", min(loop_caps))
         graph.add_node(
             Node(
                 name=node_def.name,

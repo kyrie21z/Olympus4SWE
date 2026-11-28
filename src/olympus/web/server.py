@@ -890,26 +890,39 @@ class AriadneApp:
                 else plan_result.model_dump(mode="json")
             )
         elif action == "clarify":
-            clarify_result = self.control.clarify_spec(
-                run_id=run_id,
-                answers=dict(body.get("answers") or {}),
-                resolutions=dict(body.get("resolutions") or {}),
-                extra_out_of_scope=list(body.get("out_of_scope") or []),
-                clarification_note=str(body.get("clarification_note") or ""),
-                actor=actor,
-                expected_revision=expected_rev,
-                operation_id=operation_id,
-                command_meta=dispatch_meta,
-            )
-            cmd_result = (
-                clarify_result
-                if isinstance(clarify_result, dict)
-                else {
-                    "run_id": run_id,
-                    "version": clarify_result.version,
-                    "spec_hash": clarify_result.content_hash,
-                }
-            )
+            run_snap = self.store.get_run(run_id)
+            if run_snap.get("spec") is None:
+                cmd_result = self.control.clarify_craft(
+                    run_id=run_id,
+                    answers=dict(body.get("answers") or {}),
+                    resolutions=dict(body.get("resolutions") or {}),
+                    clarification_note=str(body.get("clarification_note") or ""),
+                    actor=actor,
+                    expected_revision=expected_rev,
+                    operation_id=operation_id,
+                    command_meta=dispatch_meta,
+                )
+            else:
+                clarify_result = self.control.clarify_spec(
+                    run_id=run_id,
+                    answers=dict(body.get("answers") or {}),
+                    resolutions=dict(body.get("resolutions") or {}),
+                    extra_out_of_scope=list(body.get("out_of_scope") or []),
+                    clarification_note=str(body.get("clarification_note") or ""),
+                    actor=actor,
+                    expected_revision=expected_rev,
+                    operation_id=operation_id,
+                    command_meta=dispatch_meta,
+                )
+                cmd_result = (
+                    clarify_result
+                    if isinstance(clarify_result, dict)
+                    else {
+                        "run_id": run_id,
+                        "version": clarify_result.version,
+                        "spec_hash": clarify_result.content_hash,
+                    }
+                )
         elif action == "retry_task":
             task_id = str(body.get("task_id", "")).strip()
             if not task_id:

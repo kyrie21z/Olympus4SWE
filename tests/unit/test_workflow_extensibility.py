@@ -28,7 +28,6 @@ from olympus.graph import (
     build_workflow_view,
     describe_workflow,
     extract_paused_cursor,
-    list_builtin_workflows,
     load_workflow,
     resolve_resume_node,
 )
@@ -102,8 +101,11 @@ def _custom_pstack_definition() -> WorkflowDefinition:
     )
 
 
+_LEGACY_SDLC_WORKFLOWS = ("full_sdlc_tdd", "product_blueprint", "repo_fast_patch")
+
+
 def test_builtin_workflows_keep_backward_compatible_manifests() -> None:
-    for name in list_builtin_workflows():
+    for name in _LEGACY_SDLC_WORKFLOWS:
         definition = load_workflow(name)
         assert definition.family == "sdlc"
         assert definition.autonomy == "gated"
@@ -443,7 +445,7 @@ def test_headless_session_runner_propagates_workspace_context_and_role_drivers(
 
 def test_builtin_workflow_model_dump_preserves_legacy_workflow_hash() -> None:
     """New default manifest/node fields must not change legacy content_hash on upgrade."""
-    for name in list_builtin_workflows():
+    for name in _LEGACY_SDLC_WORKFLOWS:
         dumped = load_workflow(name).model_dump(mode="json")
         for new_wf_key in ("family", "autonomy", "applicable_scenarios", "anti_patterns"):
             assert new_wf_key not in dumped

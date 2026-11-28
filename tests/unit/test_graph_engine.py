@@ -170,7 +170,12 @@ def test_node_error_routes_to_on_error_target() -> None:
 
 def test_all_builtin_workflows_load_and_describe() -> None:
     names = list_builtin_workflows()
-    assert set(names) == {"product_blueprint", "full_sdlc_tdd", "repo_fast_patch"}
+    assert set(names) == {
+        "product_blueprint",
+        "full_sdlc_tdd",
+        "repo_fast_patch",
+        "pstack_craft",
+    }
 
     blueprint = load_workflow("product_blueprint")
     assert blueprint.stop_after == "plan"

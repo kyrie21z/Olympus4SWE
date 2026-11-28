@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Any, ClassVar, Literal, Self
 from uuid import uuid4
 
@@ -1198,3 +1200,156 @@ class ArenaVerdict(FingerprintedModel):
             total = sum(crit_map.get(k, 0.0) * w for k, w in weights.items())
             totals[cid] = round(total, 4)
         return totals
+
+
+def _normalize_repo_relative_path(raw: str, *, field_name: str) -> str:
+    cleaned = raw.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    if not cleaned:
+        raise ValueError(f"{field_name} entries must be non-empty relative paths")
+    posix = PurePosixPath(cleaned)
+    if posix.is_absolute() or (len(cleaned) >= 2 and cleaned[1] == ":"):
+        raise ValueError(f"{field_name} entry must be repo-relative, got {raw!r}")
+    if ".." in posix.parts:
+        raise ValueError(f"{field_name} entry must not traverse outside repo: {raw!r}")
+    normalized = posix.as_posix()
+    if normalized in ("", "."):
+        raise ValueError(f"{field_name} entry must reference a concrete path: {raw!r}")
+    return normalized
+
+
+class HillclimbConfig(FingerprintedModel):
+    config_id: str = Field(default_factory=lambda: new_id("hcfg"))
+    frozen_harness_paths: list[str] = Field(min_length=1)
+    metric_command: str = Field(min_length=1)
+    metric_regex: str = Field(min_length=1)
+    direction: Literal["minimize", "maximize"] = "minimize"
+    target_value: float | None = None
+    max_iterations: int = Field(default=5, ge=1, le=100)
+    plateau_patience: int = Field(default=3, ge=1, le=50)
+    write_scope: list[str] = Field(min_length=1)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "config_id"})
+
+    @model_validator(mode="after")
+    def _validate_hillclimb_config(self) -> HillclimbConfig:
+        frozen_norm = list(
+            dict.fromkeys(
+                _normalize_repo_relative_path(item, field_name="frozen_harness_paths")
+                for item in self.frozen_harness_paths
+            )
+        )
+        scope_norm = list(
+            dict.fromkeys(
+                _normalize_repo_relative_path(item, field_name="write_scope")
+                for item in self.write_scope
+            )
+        )
+        overlap = sorted(set(frozen_norm) & set(scope_norm))
+        if overlap:
+            raise ValueError(
+                "HillclimbConfig.write_scope must not overlap frozen_harness_paths: "
+                + ", ".join(overlap)
+            )
+        self.frozen_harness_paths = frozen_norm
+        self.write_scope = scope_norm
+
+        cmd = self.metric_command.strip()
+        if not cmd:
+            raise ValueError("HillclimbConfig.metric_command must be non-empty")
+        self.metric_command = cmd
+
+        try:
+            re.compile(self.metric_regex)
+        except re.error as exc:
+            raise ValueError(f"HillclimbConfig.metric_regex is invalid: {exc}") from exc
+
+        if self.target_value is not None and not math.isfinite(self.target_value):
+            raise ValueError("HillclimbConfig.target_value must be finite")
+        return self
+
+
+class HillclimbIterationRow(FingerprintedModel):
+    row_id: str = Field(default_factory=lambda: new_id("hrow"))
+    iteration: int = Field(ge=1)
+    hypothesis: str = Field(min_length=1)
+    metric_before: float
+    metric_after: float | None = None
+    decision: Literal["keep", "revert", "rejected_tamper", "error"]
+    commit_sha: str | None = None
+    reason: str = ""
+    elapsed_s: float = Field(default=0.0, ge=0.0)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "row_id"})
+
+    @model_validator(mode="after")
+    def _validate_row(self) -> HillclimbIterationRow:
+        hypothesis = self.hypothesis.strip()
+        if not hypothesis:
+            raise ValueError("HillclimbIterationRow.hypothesis must be non-empty")
+        self.hypothesis = hypothesis
+
+        if not math.isfinite(self.metric_before):
+            raise ValueError("HillclimbIterationRow.metric_before must be finite")
+        if self.metric_after is not None and not math.isfinite(self.metric_after):
+            raise ValueError("HillclimbIterationRow.metric_after must be finite")
+        if not math.isfinite(self.elapsed_s):
+            raise ValueError("HillclimbIterationRow.elapsed_s must be finite")
+
+        if self.commit_sha is not None:
+            cleaned_sha = self.commit_sha.strip()
+            self.commit_sha = cleaned_sha or None
+
+        if self.decision == "keep":
+            if self.metric_after is None:
+                raise ValueError("HillclimbIterationRow with decision='keep' requires metric_after")
+            if not self.commit_sha:
+                raise ValueError("HillclimbIterationRow with decision='keep' requires commit_sha")
+        elif self.commit_sha is not None:
+            raise ValueError(
+                f"HillclimbIterationRow with decision={self.decision!r} must not keep a commit_sha"
+            )
+        return self
+
+
+class HillclimbReport(FingerprintedModel):
+    report_id: str = Field(default_factory=lambda: new_id("hrep"))
+    baseline_metric: float
+    best_metric: float
+    kept_iterations: int = Field(ge=0)
+    reverted_iterations: int = Field(ge=0)
+    stopped_reason: Literal["target_reached", "plateau", "max_iterations", "error", "blocked"]
+    rows: list[HillclimbIterationRow] = Field(default_factory=list)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"content_hash", "report_id"})
+
+    @model_validator(mode="after")
+    def _validate_report(self) -> HillclimbReport:
+        if not math.isfinite(self.baseline_metric):
+            raise ValueError("HillclimbReport.baseline_metric must be finite")
+        if not math.isfinite(self.best_metric):
+            raise ValueError("HillclimbReport.best_metric must be finite")
+        kept = sum(1 for row in self.rows if row.decision == "keep")
+        reverted = sum(1 for row in self.rows if row.decision != "keep")
+        if self.kept_iterations != kept:
+            raise ValueError(
+                f"HillclimbReport.kept_iterations ({self.kept_iterations}) must match "
+                f"rows keep count ({kept})"
+            )
+        if self.reverted_iterations != reverted:
+            raise ValueError(
+                f"HillclimbReport.reverted_iterations ({self.reverted_iterations}) must match "
+                f"rows non-keep count ({reverted})"
+            )
+        prev_iter = 0
+        for row in self.rows:
+            if row.iteration <= prev_iter:
+                raise ValueError(
+                    "HillclimbReport.rows iteration numbers must be strictly increasing"
+                )
+            prev_iter = row.iteration
+        return self

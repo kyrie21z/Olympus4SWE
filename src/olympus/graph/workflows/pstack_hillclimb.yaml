@@ -1,0 +1,55 @@
+name: pstack_hillclimb
+description: >-
+  Frozen-harness metric hill-climbing workflow distilled from t3-pstack:
+  read-only evidence exploration (Prometheus), deterministic SHA-256 anti-tamper keep/revert
+  optimization loop with SQLite decision trail (Hephaestus), and real-surface verification
+  with atomic host promotion (Argus).
+family: pstack
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - measurable performance optimization with a frozen benchmark harness
+  - latency, throughput, operation-count, or build-time reduction against a deterministic metric
+  - iterative algorithmic optimization where regressions must auto-revert cleanly
+anti_patterns:
+  - ambiguous greenfield product ideas without a quantifiable scalar metric
+  - subjective UI redesigns lacking an objective frozen benchmark script
+  - tasks requiring changes to the evaluation harness itself
+stop_after: verify
+topology: evidence_first
+nodes:
+  - name: explore
+    type: explore_reproduce
+    god: prometheus
+    phase: align
+    role: explorer
+    skill_refs:
+      - pstack/explore
+    params:
+      require_repro: false
+  - name: hillclimb
+    type: hillclimb_loop
+    god: hephaestus
+    phase: execute
+    role: builder
+    skill_refs:
+      - pstack/hillclimb
+    params:
+      apply_to_workspace: false
+  - name: verify_surface
+    type: verify_surface
+    god: argus
+    phase: verify
+    role: verifier
+    skill_refs:
+      - pstack/verify
+edges:
+  - source: START
+    target: explore
+  - source: explore
+    target: hillclimb
+  - source: hillclimb
+    target: verify_surface
+  - source: verify_surface
+    target: END
+routers: []
+gates: {}

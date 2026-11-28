@@ -31,6 +31,7 @@ from olympus.stages.align import AlignStage
 from olympus.stages.arena import ArenaStage
 from olympus.stages.craft import CraftPause, CraftStage
 from olympus.stages.design import DesignStage, triage_input
+from olympus.stages.hillclimb import HillclimbPause, HillclimbStage
 from olympus.stages.orchestrate import OrchestrateStage
 
 WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
@@ -55,6 +56,7 @@ _NODE_TYPES: tuple[str, ...] = (
     "interrogate_review",
     "verify_surface",
     "arena_race",
+    "hillclimb_loop",
 )
 
 
@@ -700,11 +702,87 @@ def _node_interrogate_review(
         raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
 
 
+def _hillclimb_stage(runtime: WorkflowRuntime) -> HillclimbStage:
+    return HillclimbStage(
+        store=runtime.store,
+        workspace_root=runtime.workspace_root,
+        provider=runtime.provider,
+        artifacts_root=runtime.artifacts_root,
+        sandbox_root=runtime.sandbox_root,
+        execution_drivers=runtime.execution_drivers,
+        driver_registry=runtime.driver_registry,
+        model_provider=runtime.model_provider,
+        on_driver_handle=runtime.on_driver_handle,
+    )
+
+
+def _is_hillclimb_run(runtime: WorkflowRuntime, run_id: str, state: Mapping[str, Any]) -> bool:
+    """Identify hillclimb runs even on direct resume at ``verify_surface`` with fresh state."""
+    if "architect_sketch" in state:
+        return False
+    if "hillclimb_report" in state or "hillclimb_config" in state:
+        return True
+    if (runtime.artifacts_root / run_id / "hillclimb" / "state.json").is_file():
+        return True
+    for event in runtime.store.list_events(run_id):
+        if event.event_type in {
+            "hillclimb.baseline_recorded",
+            "hillclimb.iteration_recorded",
+            "hillclimb.completed",
+        }:
+            return True
+    try:
+        snap = runtime.store.get_run(run_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return snap.get("workflow_name") == "pstack_hillclimb"
+
+
+def _node_hillclimb_loop(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = _runtime(state)
+    run_id = _run_id(state)
+    raw_cfg = params.get("hillclimb_config")
+    if not isinstance(raw_cfg, Mapping):
+        extra_cfg = runtime.extra.get("hillclimb_config")
+        raw_cfg = extra_cfg if isinstance(extra_cfg, Mapping) else None
+    explicit_cfg: Mapping[str, Any] | None = raw_cfg if isinstance(raw_cfg, Mapping) else None
+    try:
+        return _hillclimb_stage(runtime).hillclimb_loop(
+            run_id=run_id,
+            raw_input=str(state.get("raw_input", "")),
+            state=state,
+            config=explicit_cfg,
+            node_name=str(params.get("_node_name") or "hillclimb"),
+            role=str(params.get("_node_role") or "builder"),
+            skill_refs=tuple(params.get("_node_skill_refs") or ("pstack/hillclimb",)),
+            max_steps=int(
+                params.get("max_steps") or runtime.worker_max_steps or runtime.max_steps
+            ),
+            metric_timeout_s=int(params.get("metric_timeout_s", 60)),
+            apply_to_workspace=bool(params.get("apply_to_workspace", False)),
+        )
+    except HillclimbPause as paused:
+        raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
+
+
 def _node_verify_surface(state: dict[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
     runtime = _runtime(state)
     run_id = _run_id(state)
     raw_commands = params.get("commands")
     commands = list(raw_commands) if isinstance(raw_commands, list) else None
+    if _is_hillclimb_run(runtime, run_id, state):
+        try:
+            return _hillclimb_stage(runtime).verify_surface(
+                run_id=run_id,
+                state=state,
+                node_name=str(params.get("_node_name") or "verify_surface"),
+                role=str(params.get("_node_role") or "verifier"),
+                commands=commands,
+                apply_to_workspace=runtime.apply_to_workspace,
+                timeout_s=int(params.get("timeout_s", 120)),
+            )
+        except HillclimbPause as paused:
+            raise GraphPaused(paused.node_name, paused.reason, paused.state_updates) from paused
     try:
         return _craft_stage(runtime).verify_surface(
             run_id=run_id,
@@ -784,6 +862,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any
     "interrogate_review": _node_interrogate_review,
     "verify_surface": _node_verify_surface,
     "arena_race": _node_arena_race,
+    "hillclimb_loop": _node_hillclimb_loop,
 }
 
 
@@ -835,6 +914,7 @@ def build_graph(definition: WorkflowDefinition, *, runtime: WorkflowRuntime | No
             "interrogate_review",
             "verify_surface",
             "arena_race",
+            "hillclimb_loop",
         ):
             params.setdefault("_node_name", node_def.name)
             if node_def.role is not None:

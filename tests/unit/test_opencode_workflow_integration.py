@@ -1366,7 +1366,11 @@ def test_structured_turn_falls_back_when_driver_rejects_disable_tools(
     assert invocations[1]["permissions"] == {"*": "deny"}
     assert invocations[1].get("rejected_zero_tools") is True
     assert invocations[2]["permissions"].get("read") == "allow"
+    assert invocations[2]["permissions"].get("*") == "deny"
+    assert invocations[2]["steps_cap"] == 2
     assert invocations[3]["permissions"].get("read") == "allow"
+    assert invocations[3]["permissions"].get("*") == "deny"
+    assert invocations[3]["steps_cap"] == 2
 
     # 2. Budget cap is still strictly enforced before the fallback turn.
     capped_run = store.create_run(
@@ -1419,11 +1423,12 @@ def test_structured_turn_falls_back_when_driver_rejects_disable_tools(
         )
     assert capped_driver.calls == 2
 
-    # 3. Cancelled turn on disable_tools=True must NEVER trigger fallback.
-    class _CancellingDriver(AgentDriver):
-        name = "cancelling_ext"
+    # 3. Cancelled or timed-out turns on disable_tools=True must NEVER trigger fallback.
+    class _NonRetryableStopDriver(AgentDriver):
+        name = "non_retryable_ext"
 
-        def __init__(self) -> None:
+        def __init__(self, stop_reason: str) -> None:
+            self.stop_reason = stop_reason
             self.calls = 0
 
         def run_turn(self, request: DriverTurnRequest, on_event: Any = None) -> TurnOutcome:
@@ -1431,7 +1436,7 @@ def test_structured_turn_falls_back_when_driver_rejects_disable_tools(
             if request.disable_tools:
                 return TurnOutcome(
                     completed=False,
-                    stop_reason="cancelled",
+                    stop_reason=self.stop_reason,
                     final_content="",
                     steps_taken=0,
                 )
@@ -1444,20 +1449,21 @@ def test_structured_turn_falls_back_when_driver_rejects_disable_tools(
                 total_output_tokens=10,
             )
 
-    cancel_driver = _CancellingDriver()
-    with pytest.raises(StructuredTurnError, match="cancelled"):
-        run_structured_turn(
-            loop=loop,
-            driver=cancel_driver,
-            driver_model=None,
-            store=None,
-            run_id=None,
-            workspace_root=repo,
-            actor="prometheus:explore",
-            system_prompt="Return EvidenceBrief JSON",
-            user_prompt="Inspect app.py",
-            model_cls=EvidenceBrief,
-            max_steps=4,
-            max_parse_retries=2,
-        )
-    assert cancel_driver.calls == 2
+    for non_retryable in ("cancelled", "timed_out", "opencode_error: request timed out"):
+        stop_driver = _NonRetryableStopDriver(non_retryable)
+        with pytest.raises(StructuredTurnError, match=non_retryable):
+            run_structured_turn(
+                loop=loop,
+                driver=stop_driver,
+                driver_model=None,
+                store=None,
+                run_id=None,
+                workspace_root=repo,
+                actor="prometheus:explore",
+                system_prompt="Return EvidenceBrief JSON",
+                user_prompt="Inspect app.py",
+                model_cls=EvidenceBrief,
+                max_steps=4,
+                max_parse_retries=2,
+            )
+        assert stop_driver.calls == 2

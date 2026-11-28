@@ -47,7 +47,19 @@ def _validation_prompt(
 
 def _is_non_retryable_stop_reason(reason: str) -> bool:
     lowered = reason.lower()
-    return any(token in lowered for token in ("cancel", "interrupt", "abort", "budget"))
+    return any(
+        token in lowered
+        for token in (
+            "cancel",
+            "interrupt",
+            "abort",
+            "budget",
+            "timeout",
+            "timed_out",
+            "timed out",
+            "deadline",
+        )
+    )
 
 
 def _settle_turn_usage(

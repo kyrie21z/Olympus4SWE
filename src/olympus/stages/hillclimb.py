@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -89,6 +90,61 @@ _GIT_COMMIT_ENV_ARGS: tuple[str, ...] = (
     "-c",
     "user.email=hillclimb@olympus.local",
 )
+_FORBIDDEN_CMD_FLAGS: frozenset[str] = frozenset(
+    {
+        "-c",
+        "-e",
+        "-p",
+        "--eval",
+        "--exec",
+        "--fix",
+        "--fix-only",
+        "--unsafe-fixes",
+        "--add-noqa",
+        "-w",
+        "--write",
+        "--in-place",
+        "-o",
+        "--output",
+        "--output-file",
+        "--basetemp",
+        "--junitxml",
+        "--junit-xml",
+        "--cache-dir",
+        "--cov-report",
+        "--log-file",
+        "--resultlog",
+        "--html",
+        "--json-report",
+        "--config",
+        "--config-file",
+        "--confcutdir",
+        "--rootdir",
+        "--override-ini",
+        "--with",
+        "--from",
+        "--script",
+        "--directory",
+        "--project",
+        "--python-executable",
+        "--shadow-file",
+        "--custom-typeshed-dir",
+    }
+)
+_FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "o", "p", "w"})
+_SAFE_ENV_PASSTHROUGH_KEYS: tuple[str, ...] = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "VIRTUAL_ENV",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+)
 
 
 class _SandboxIsolationUnavailableError(RuntimeError):
@@ -149,6 +205,84 @@ def _probe_bwrap() -> str | None:
     except OSError:
         return None
     return bwrap_bin if probe.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_bwrap_unshare_net() -> bool:
+    """Return True when ``bwrap --unshare-net`` works in this environment."""
+    bwrap_bin = _probe_bwrap()
+    if bwrap_bin is None:
+        return False
+    try:
+        probe = subprocess.run(
+            [
+                bwrap_bin,
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "/bin/true",
+            ],
+            shell=False,
+            capture_output=True,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+def _has_forbidden_flag(arg: str) -> str | None:
+    """Detect forbidden long, attached-value, or bundled short flags in commands."""
+    if not arg.startswith("-") or arg == "-":
+        return None
+    flag_name = arg.split("=", 1)[0].lower()
+    if flag_name in _FORBIDDEN_CMD_FLAGS:
+        return f"flag {flag_name!r} is forbidden in sandboxed command"
+    if arg.startswith("--"):
+        return None
+    short_body = arg[1:].lower()
+    if not short_body:
+        return None
+    if short_body[0] in _FORBIDDEN_SHORT_FLAGS:
+        return f"short flag -{short_body[0]} (in {arg!r}) is forbidden in sandboxed command"
+    if short_body[0] not in {"k", "m"}:
+        for ch in short_body:
+            if ch in _FORBIDDEN_SHORT_FLAGS:
+                return f"bundled short flag -{ch} (in {arg!r}) is forbidden in sandboxed command"
+    return None
+
+
+def _minimal_sandbox_env(
+    *,
+    safe_path: str,
+    metric_tmp: Path,
+    metric_home: Path,
+) -> dict[str, str]:
+    """Build a minimal sanitized subprocess env without leaking host secrets."""
+    env: dict[str, str] = {}
+    for key in _SAFE_ENV_PASSTHROUGH_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    env["PATH"] = safe_path
+    env["HOME"] = str(metric_home)
+    env["CI"] = "1"
+    env["TMPDIR"] = str(metric_tmp)
+    env["TEMP"] = str(metric_tmp)
+    env["TMP"] = str(metric_tmp)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["RUFF_NO_CACHE"] = "1"
+    env["RUFF_CACHE_DIR"] = str(metric_tmp / "ruff_cache")
+    env["MYPY_CACHE_DIR"] = str(metric_tmp / "mypy_cache")
+    env["PYTEST_ADDOPTS"] = f"-o cache_dir={metric_tmp / 'pytest_cache'} -p no:cacheprovider"
+    return env
 
 
 def _trusted_bin_dirs(
@@ -270,6 +404,10 @@ def _parse_safe_argv(
     )
     if exe_issue is not None or trusted0 is None:
         return None, exe_issue or "untrusted executable"
+    for arg in argv[1:]:
+        flag_issue = _has_forbidden_flag(arg)
+        if flag_issue is not None:
+            return None, flag_issue
     return [trusted0, *argv[1:]], None
 
 
@@ -280,8 +418,13 @@ def _run_argv_command(
     timeout_s: int = 60,
     host_root: Path | None = None,
     require_fs_isolation: bool = True,
+    read_only_files: Sequence[Path] = (),
 ) -> tuple[int | None, str]:
-    """Execute one tokenized command (``shell=False``) with read-only host FS via ``bwrap``."""
+    """Execute one tokenized command (``shell=False``) with hardened ``bwrap`` isolation.
+
+    Returns ``(returncode, raw_combined_output)`` untruncated so callers can parse metrics
+    against the complete output before trimming excerpts for storage/display.
+    """
     bwrap_bin = _probe_bwrap()
     if bwrap_bin is None and require_fs_isolation:
         raise _SandboxIsolationUnavailableError(
@@ -294,42 +437,48 @@ def _run_argv_command(
     metric_home = metric_tmp / "home"
     metric_home.mkdir(parents=True, exist_ok=True)
     safe_path = _sanitized_path(host_root=host_root, sandbox_root=cwd_resolved)
-
-    env = dict(os.environ)
-    env["PATH"] = safe_path
-    env["HOME"] = str(metric_home)
-    env.setdefault("CI", "1")
-    env["TMPDIR"] = str(metric_tmp)
-    env["TEMP"] = str(metric_tmp)
-    env["TMP"] = str(metric_tmp)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["RUFF_NO_CACHE"] = "1"
-    env["RUFF_CACHE_DIR"] = str(metric_tmp / "ruff_cache")
-    env["MYPY_CACHE_DIR"] = str(metric_tmp / "mypy_cache")
-    env["PYTEST_ADDOPTS"] = f"-o cache_dir={metric_tmp / 'pytest_cache'} -p no:cacheprovider"
+    env = _minimal_sandbox_env(
+        safe_path=safe_path,
+        metric_tmp=metric_tmp,
+        metric_home=metric_home,
+    )
 
     cmd: list[str] = list(argv)
     if bwrap_bin is not None:
-        cmd = [
-            bwrap_bin,
-            "--ro-bind",
-            "/",
-            "/",
-            "--bind",
-            str(cwd_resolved),
-            str(cwd_resolved),
-            "--bind",
-            str(metric_tmp),
-            str(metric_tmp),
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--chdir",
-            str(cwd_resolved),
-            "--",
-            *argv,
-        ]
+        bwrap_cmd: list[str] = [bwrap_bin]
+        if _probe_bwrap_unshare_net():
+            bwrap_cmd.append("--unshare-net")
+        bwrap_cmd.extend(
+            [
+                "--ro-bind",
+                "/",
+                "/",
+                "--bind",
+                str(cwd_resolved),
+                str(cwd_resolved),
+            ]
+        )
+        # Overlay frozen harness files read-only inside the sandbox mount namespace.
+        for ro_file in read_only_files:
+            ro_resolved = ro_file.resolve()
+            if ro_resolved.is_file() and ro_resolved.is_relative_to(cwd_resolved):
+                bwrap_cmd.extend(["--ro-bind", str(ro_resolved), str(ro_resolved)])
+        bwrap_cmd.extend(
+            [
+                "--bind",
+                str(metric_tmp),
+                str(metric_tmp),
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--chdir",
+                str(cwd_resolved),
+                "--",
+                *argv,
+            ]
+        )
+        cmd = bwrap_cmd
     try:
         proc = subprocess.run(
             cmd,
@@ -346,17 +495,17 @@ def _run_argv_command(
         out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         err = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
         combined = "\n".join(part for part in (out, err) if part).strip()
-        return None, _trim_output(f"Command timed out after {timeout_s}s.\n{combined}")
+        return None, f"Command timed out after {timeout_s}s.\n{combined}".strip()
     except FileNotFoundError:
         return 127, f"Command not found: {argv[0]}"
     except PermissionError:
         return 126, f"Command not executable: {argv[0]}"
     except OSError as exc:
-        return None, _trim_output(f"Command execution error: {exc}")
+        return None, f"Command execution error: {exc}"
     finally:
         shutil.rmtree(metric_tmp, ignore_errors=True)
     combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part and part.strip())
-    return proc.returncode, _trim_output(combined)
+    return proc.returncode, combined
 
 
 def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -410,9 +559,9 @@ def _git_revert_to_commit(cwd: Path, commit_sha: str) -> None:
     reset_proc = _run_git(cwd, "reset", "--hard", commit_sha)
     if reset_proc.returncode != 0:
         raise RuntimeError(f"git reset --hard {commit_sha} failed: {reset_proc.stderr.strip()}")
-    clean_proc = _run_git(cwd, "clean", "-fd")
+    clean_proc = _run_git(cwd, "clean", "-fdx")
     if clean_proc.returncode != 0:
-        raise RuntimeError(f"git clean -fd failed: {clean_proc.stderr.strip()}")
+        raise RuntimeError(f"git clean -fdx failed: {clean_proc.stderr.strip()}")
 
 
 def _sha256_file_checked(workspace_root: Path, rel: str) -> str:
@@ -466,19 +615,28 @@ def detect_frozen_harness_tamper(
 
 
 def parse_metric_value(output: str, metric_regex: str) -> tuple[float | None, str | None]:
-    """Parse a finite numeric metric from command output via ``metric_regex``."""
+    """Parse an unambiguous finite numeric metric from untruncated command output."""
     pattern = re.compile(metric_regex)
-    match = pattern.search(output)
-    if match is None:
+    matches = list(pattern.finditer(output))
+    if not matches:
         return None, f"metric_regex {metric_regex!r} did not match command output"
-    raw = match.group(1) if match.lastindex else match.group(0)
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return None, f"matched metric token {raw!r} is not a valid float"
-    if not math.isfinite(value):
-        return None, f"matched metric value {raw!r} is not finite"
-    return value, None
+    parsed: list[float] = []
+    for match in matches:
+        raw = match.group(1) if match.lastindex else match.group(0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, f"matched metric token {raw!r} is not a valid float"
+        if not math.isfinite(value):
+            return None, f"matched metric value {raw!r} is not finite"
+        parsed.append(value)
+    distinct = list(dict.fromkeys(parsed))
+    if len(distinct) > 1:
+        return (
+            None,
+            f"ambiguous metric_regex {metric_regex!r}: matched conflicting values {distinct}",
+        )
+    return distinct[0], None
 
 
 def is_strictly_better(
@@ -510,6 +668,53 @@ def _extract_hypothesis(final_text: str, iteration: int) -> str:
         if cleaned:
             return cleaned[:240]
     return f"Iteration {iteration} optimization hypothesis"
+
+
+def _atomic_replace_from_src(src: Path, dst: Path) -> None:
+    """Copy ``src`` to a temp sibling and ``os.replace`` so hard-linked aliases stay intact."""
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".olympus-promote-{dst.name}.",
+        dir=str(dst.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(raw_tmp)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_replace_bytes(dst: Path, data: bytes, mode: int) -> None:
+    """Atomically write ``data`` + ``mode`` via temp sibling without mutating hard links."""
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".olympus-rollback-{dst.name}.",
+        dir=str(dst.parent),
+    )
+    tmp_path = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, dst)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _frozen_ro_files(sandbox_path: Path, frozen_paths: Sequence[str]) -> list[Path]:
+    """Resolve existing regular frozen harness files strictly inside ``sandbox_path``."""
+    ws_resolved = sandbox_path.resolve()
+    ro_files: list[Path] = []
+    for rel in frozen_paths:
+        candidate = sandbox_path / rel
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved != ws_resolved and resolved.is_relative_to(ws_resolved):
+            ro_files.append(resolved)
+    return ro_files
 
 
 class HillclimbStage:
@@ -740,6 +945,7 @@ class HillclimbStage:
         sandbox_path: Path,
         timeout_s: int,
         node_name: str,
+        read_only_files: Sequence[Path] = (),
     ) -> tuple[int | None, str, str | None]:
         argv, argv_issue = _parse_safe_argv(
             command,
@@ -758,6 +964,7 @@ class HillclimbStage:
                 timeout_s=timeout_s,
                 host_root=self.workspace_root,
                 require_fs_isolation=not self._allow_unsandboxed_metric,
+                read_only_files=read_only_files,
             )
         except _SandboxIsolationUnavailableError as exc:
             raise HillclimbPause(
@@ -776,22 +983,27 @@ class HillclimbStage:
         timeout_s: int,
         node_name: str,
     ) -> tuple[float | None, str | None, str]:
-        code, output, cmd_issue = self._run_safe_command(
+        ro_files = _frozen_ro_files(sandbox_path, config.frozen_harness_paths)
+        code, raw_output, cmd_issue = self._run_safe_command(
             config.metric_command,
             sandbox_path=sandbox_path,
             timeout_s=timeout_s,
             node_name=node_name,
+            read_only_files=ro_files,
         )
+        excerpt = _trim_output(raw_output)
         if cmd_issue is not None:
-            return None, f"Rejected metric_command: {cmd_issue}", output
+            return None, f"Rejected metric_command: {cmd_issue}", excerpt
+        tail = excerpt[-400:] if len(excerpt) > 400 else excerpt
         if code is None:
-            return None, f"metric_command failed or timed out: {output[:200]}", output
+            return None, f"metric_command failed or timed out: {tail}", excerpt
         if code != 0:
-            return None, f"metric_command exited {code}: {output[:200]}", output
-        value, parse_err = parse_metric_value(output, config.metric_regex)
+            return None, f"metric_command exited {code}: {tail}", excerpt
+        # Parse against full untruncated stdout+stderr before trimming excerpts.
+        value, parse_err = parse_metric_value(raw_output, config.metric_regex)
         if parse_err is not None or value is None:
-            return None, f"{parse_err} (output={output[:200]!r})", output
-        return value, None, output
+            return None, f"{parse_err} (output={tail!r})", excerpt
+        return value, None, excerpt
 
     def _promote_sandbox_to_workspace(
         self,
@@ -800,8 +1012,33 @@ class HillclimbStage:
         config: HillclimbConfig,
         *,
         frozen_hashes: Mapping[str, str],
+        expected_commit_sha: str | None = None,
         node_name: str = "hillclimb",
     ) -> list[str]:
+        if expected_commit_sha is not None:
+            if not handle.is_git_worktree:
+                raise HillclimbPause(
+                    node_name,
+                    "Refusing to promote: sandbox is not a git worktree",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            head_sha = _git_head_sha(handle.workspace_path)
+            if head_sha != expected_commit_sha:
+                raise HillclimbPause(
+                    node_name,
+                    f"Refusing to promote: sandbox HEAD ({head_sha}) does not match "
+                    f"recorded winning commit ({expected_commit_sha})",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            if _git_has_changes(handle.workspace_path):
+                raise HillclimbPause(
+                    node_name,
+                    "Refusing to promote: sandbox working tree has uncommitted mutations",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
         tampered = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
         if tampered:
             raise HillclimbPause(
@@ -900,6 +1137,21 @@ class HillclimbStage:
             copy_plan.append((src, dst, link_target))
             applied.append(rel)
 
+        # Reject any symlinked ancestor directory on delete targets (prevents deleting through
+        # an in-repo symlinked directory even if its target sits inside ws_root).
+        for target in delete_plan:
+            ancestor = target.parent
+            while ancestor != ws_root and ancestor.is_relative_to(ws_root):
+                if ancestor.is_symlink():
+                    raise HillclimbPause(
+                        node_name,
+                        f"Refusing to delete path through symlinked ancestor directory: "
+                        f"{target.relative_to(ws_root)}",
+                        route="blocked",
+                        pause_kind="blocked",
+                    )
+                ancestor = ancestor.parent
+
         delete_set = set(delete_plan)
         for _src, dst, _link_target in copy_plan:
             ancestor = dst.parent
@@ -917,7 +1169,7 @@ class HillclimbStage:
                 ancestor = ancestor.parent
 
         # Phase 2: transactional apply with full backup+mode rollback on any OSError.
-        backups: list[tuple[Path, str, tuple[bytes, int] | str | None]] = []
+        backups: list[tuple[Path, str, tuple[bytes, int] | str | int | None]] = []
         created_dirs: list[Path] = []
         try:
             for target in delete_plan:
@@ -931,9 +1183,11 @@ class HillclimbStage:
                 parent = target.parent
                 while parent != ws_root and parent.is_relative_to(ws_root):
                     try:
+                        dir_mode = stat.S_IMODE(parent.stat().st_mode)
                         parent.rmdir()
                     except OSError:
                         break
+                    backups.append((parent, "removed_dir", dir_mode))
                     parent = parent.parent
             for src, dst, link_target in copy_plan:
                 missing_parents: list[Path] = []
@@ -957,14 +1211,21 @@ class HillclimbStage:
                         dst.unlink()
                     os.symlink(link_target, dst)
                 else:
-                    shutil.copy2(src, dst)
+                    # Atomic temp-sibling replace avoids mutating hard-linked aliases in place.
+                    _atomic_replace_from_src(src, dst)
         except OSError as exc:
             rollback_errors: list[str] = []
+            restore_dir_modes: list[tuple[Path, int]] = []
             for path, kind, saved in reversed(backups):
                 try:
                     if kind == "missing":
                         if path.is_symlink() or path.is_file():
                             path.unlink(missing_ok=True)
+                    elif kind == "removed_dir" and isinstance(saved, int):
+                        path.mkdir(parents=True, exist_ok=True)
+                        # Keep writable until deleted children are restored, then restore mode.
+                        os.chmod(path, saved | 0o700)
+                        restore_dir_modes.append((path, saved))
                     elif kind == "symlink" and isinstance(saved, str):
                         if path.is_symlink() and os.readlink(path) == saved:
                             continue
@@ -983,10 +1244,16 @@ class HillclimbStage:
                         ):
                             continue
                         path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(data)
-                        os.chmod(path, saved_mode)
+                        _atomic_replace_bytes(path, data, saved_mode)
                 except OSError as rb_exc:
                     rollback_errors.append(f"{path.name}: {rb_exc}")
+            for dir_path, dir_mode in sorted(
+                restore_dir_modes, key=lambda item: len(item[0].parts), reverse=True
+            ):
+                try:
+                    os.chmod(dir_path, dir_mode)
+                except OSError as mode_exc:
+                    rollback_errors.append(f"{dir_path.name}: {mode_exc}")
             for directory in sorted(
                 created_dirs, key=lambda item: len(item.parts), reverse=True
             ):
@@ -1047,6 +1314,26 @@ class HillclimbStage:
                 pause_kind="blocked",
             ) from exc
 
+    def _load_sqlite_history(
+        self, run_id: str
+    ) -> tuple[dict[str, Any] | None, list[HillclimbIterationRow]]:
+        """Load baseline payload and recorded iteration rows from SQLite for resume/verification."""
+        baseline_payload: dict[str, Any] | None = None
+        prior_rows: list[HillclimbIterationRow] = []
+        for event in self.store.list_events(run_id):
+            if (
+                event.event_type == "hillclimb.baseline_recorded"
+                and baseline_payload is None
+                and isinstance(event.payload, Mapping)
+            ):
+                baseline_payload = dict(event.payload)
+            elif (
+                event.event_type == "hillclimb.iteration_recorded"
+                and isinstance(event.payload, Mapping)
+            ):
+                prior_rows.append(HillclimbIterationRow.model_validate(event.payload))
+        return baseline_payload, prior_rows
+
     # ------------------------------------------------------------------ composite primitive
 
     def hillclimb_loop(
@@ -1080,64 +1367,123 @@ class HillclimbStage:
                 pause_kind="blocked",
             )
 
-        # 1. Freeze harness SHA-256 fingerprints BEFORE iteration 1.
-        try:
-            frozen_hashes = snapshot_frozen_harness(
-                handle.workspace_path, cfg.frozen_harness_paths
-            )
-        except (OSError, ValueError) as exc:
-            raise HillclimbPause(
-                node_name,
-                f"Failed to freeze harness before iteration 1: {exc}",
-                route="blocked",
-                pause_kind="blocked",
-            ) from exc
-
-        last_kept_sha = _git_head_sha(handle.workspace_path)
-
-        # 2. Measure baseline metric inside the isolated worktree (fail closed).
-        baseline_metric, base_err, _base_output = self._measure_metric(
-            sandbox_path=handle.workspace_path,
-            config=cfg,
-            timeout_s=metric_timeout_s,
-            node_name=node_name,
-        )
-        post_base_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
-        if post_base_tamper:
-            raise HillclimbPause(
-                node_name,
-                "Frozen harness mutated during baseline measurement: "
-                + ", ".join(post_base_tamper),
-                route="blocked",
-                pause_kind="blocked",
-            )
-        if base_err is not None or baseline_metric is None:
-            raise HillclimbPause(
-                node_name,
-                f"Baseline metric measurement failed: {base_err}",
-                route="blocked",
-                pause_kind="blocked",
-            )
-
-        self.store.append_event(
-            run_id=run_id,
-            stage="hillclimb",
-            event_type="hillclimb.baseline_recorded",
-            actor="hephaestus",
-            payload={
-                "config_id": cfg.config_id,
-                "config_hash": cfg.content_hash,
-                "baseline_metric": baseline_metric,
-                "direction": cfg.direction,
-                "target_value": cfg.target_value,
-                "base_commit": last_kept_sha,
-                "frozen_hashes": dict(frozen_hashes),
-            },
-        )
-
-        best_metric = baseline_metric
-        rows: list[HillclimbIterationRow] = []
+        prior_baseline, prior_rows = self._load_sqlite_history(run_id)
+        rows: list[HillclimbIterationRow] = list(prior_rows)
         consecutive_non_improving = 0
+
+        if prior_baseline is not None:
+            # Resume/retry on an existing run_id: preserve prior SQLite rows & baseline.
+            raw_frozen = prior_baseline.get("frozen_hashes")
+            if not isinstance(raw_frozen, Mapping) or not raw_frozen:
+                raise HillclimbPause(
+                    node_name,
+                    "Recorded hillclimb baseline is missing frozen_hashes on resume",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            frozen_hashes = {str(k): str(v) for k, v in raw_frozen.items()}
+            if sorted(frozen_hashes) != sorted(cfg.frozen_harness_paths):
+                raise HillclimbPause(
+                    node_name,
+                    "Cannot resume hillclimb_loop: frozen_harness_paths changed since baseline",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            raw_base_metric = prior_baseline.get("baseline_metric")
+            raw_base_commit = prior_baseline.get("base_commit")
+            if not isinstance(raw_base_metric, (int, float)) or not isinstance(
+                raw_base_commit, str
+            ):
+                raise HillclimbPause(
+                    node_name,
+                    "Recorded hillclimb baseline is malformed on resume",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            baseline_metric = float(raw_base_metric)
+            best_metric = baseline_metric
+            last_kept_sha = raw_base_commit
+            for prev_row in rows:
+                if prev_row.decision == "keep":
+                    assert prev_row.metric_after is not None and prev_row.commit_sha is not None
+                    best_metric = prev_row.metric_after
+                    last_kept_sha = prev_row.commit_sha
+                    consecutive_non_improving = 0
+                else:
+                    consecutive_non_improving += 1
+            # Reconcile worktree cleanly back to last_kept_sha before resuming.
+            if (
+                _git_head_sha(handle.workspace_path) != last_kept_sha
+                or _git_has_changes(handle.workspace_path)
+            ):
+                _git_revert_to_commit(handle.workspace_path, last_kept_sha)
+            resume_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
+            if resume_tamper:
+                raise HillclimbPause(
+                    node_name,
+                    "Frozen harness does not match recorded baseline on resume: "
+                    + ", ".join(resume_tamper),
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+        else:
+            # 1. Freeze harness SHA-256 fingerprints BEFORE iteration 1.
+            try:
+                frozen_hashes = snapshot_frozen_harness(
+                    handle.workspace_path, cfg.frozen_harness_paths
+                )
+            except (OSError, ValueError) as exc:
+                raise HillclimbPause(
+                    node_name,
+                    f"Failed to freeze harness before iteration 1: {exc}",
+                    route="blocked",
+                    pause_kind="blocked",
+                ) from exc
+
+            last_kept_sha = _git_head_sha(handle.workspace_path)
+
+            # 2. Measure baseline metric inside the isolated worktree (fail closed).
+            measured_base, base_err, _base_output = self._measure_metric(
+                sandbox_path=handle.workspace_path,
+                config=cfg,
+                timeout_s=metric_timeout_s,
+                node_name=node_name,
+            )
+            post_base_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
+            if post_base_tamper:
+                raise HillclimbPause(
+                    node_name,
+                    "Frozen harness mutated during baseline measurement: "
+                    + ", ".join(post_base_tamper),
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            if base_err is not None or measured_base is None:
+                raise HillclimbPause(
+                    node_name,
+                    f"Baseline metric measurement failed: {base_err}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            baseline_metric = measured_base
+
+            self.store.append_event(
+                run_id=run_id,
+                stage="hillclimb",
+                event_type="hillclimb.baseline_recorded",
+                actor="hephaestus",
+                payload={
+                    "config_id": cfg.config_id,
+                    "config_hash": cfg.content_hash,
+                    "baseline_metric": baseline_metric,
+                    "direction": cfg.direction,
+                    "target_value": cfg.target_value,
+                    "base_commit": last_kept_sha,
+                    "frozen_hashes": dict(frozen_hashes),
+                },
+            )
+            best_metric = baseline_metric
+
         stopped_reason: Literal[
             "target_reached", "plateau", "max_iterations", "error", "blocked"
         ] = "max_iterations"
@@ -1156,7 +1502,7 @@ class HillclimbStage:
             skill_refs,
         )
 
-        # Persist initial trail before iteration 1 so even early stops have an artifact.
+        # Persist current trail (preserving any resumed SQLite rows) before running new iterations.
         trail_path = self._write_decision_trail(
             run_id,
             config=cfg,
@@ -1167,10 +1513,15 @@ class HillclimbStage:
             stopped_reason=None,
         )
 
+        start_iteration = (rows[-1].iteration + 1) if rows else 1
         if is_target_reached(best_metric, cfg.target_value, cfg.direction):
             stopped_reason = "target_reached"
+        elif consecutive_non_improving >= cfg.plateau_patience:
+            stopped_reason = "plateau"
+        elif start_iteration > cfg.max_iterations:
+            stopped_reason = "max_iterations"
         else:
-            for iteration in range(1, cfg.max_iterations + 1):
+            for iteration in range(start_iteration, cfg.max_iterations + 1):
                 iter_t0 = time.monotonic()
                 metric_before = best_metric
                 history_lines = (
@@ -1279,80 +1630,93 @@ class HillclimbStage:
                             reason = "No edits produced inside write_scope"
                         consecutive_non_improving += 1
                     else:
-                        # Step C: Measure candidate metric safely and re-check anti-tamper.
-                        measured, measure_err, _measure_out = self._measure_metric(
-                            sandbox_path=handle.workspace_path,
-                            config=cfg,
-                            timeout_s=metric_timeout_s,
-                            node_name=node_name,
-                        )
-                        runtime_tamper = detect_frozen_harness_tamper(
+                        # Re-verify frozen harness right before metric execution (fail closed).
+                        pre_metric_tamper = detect_frozen_harness_tamper(
                             handle.workspace_path, frozen_hashes
                         )
-                        if runtime_tamper:
+                        if pre_metric_tamper:
                             _git_revert_to_commit(handle.workspace_path, last_kept_sha)
                             decision = "rejected_tamper"
                             reason = (
-                                "Rejected and reverted: frozen harness modified during metric run "
-                                f"({', '.join(runtime_tamper)})"
+                                "Rejected and reverted before metric run: frozen harness modified "
+                                f"({', '.join(pre_metric_tamper)})"
                             )
                             consecutive_non_improving += 1
-                        elif measure_err is not None or measured is None:
-                            _git_revert_to_commit(handle.workspace_path, last_kept_sha)
-                            decision = "error"
-                            reason = f"Reverted after metric error: {measure_err}"
-                            consecutive_non_improving += 1
-                        elif is_strictly_better(measured, best_metric, cfg.direction):
-                            # Re-clean ephemeral artifacts created during metric run before commit.
-                            clean_ephemeral_artifacts(
-                                handle,
-                                baseline,
-                                write_scope=[*cfg.write_scope, *cfg.frozen_harness_paths],
+                        else:
+                            # Step C: Measure candidate metric safely and re-check anti-tamper.
+                            measured, measure_err, _measure_out = self._measure_metric(
+                                sandbox_path=handle.workspace_path,
+                                config=cfg,
+                                timeout_s=metric_timeout_s,
+                                node_name=node_name,
                             )
-                            post_gate = run_diff_gate(
-                                handle,
-                                baseline,
-                                allowed_write_scope=cfg.write_scope,
-                                forbidden_globs=cfg.frozen_harness_paths,
-                                strict_scope=True,
+                            runtime_tamper = detect_frozen_harness_tamper(
+                                handle.workspace_path, frozen_hashes
                             )
-                            if post_gate.rejected:
+                            if runtime_tamper:
                                 _git_revert_to_commit(handle.workspace_path, last_kept_sha)
-                                decision = "error"
+                                decision = "rejected_tamper"
                                 reason = (
-                                    "Reverted: metric run produced out-of-scope mutations "
-                                    f"({post_gate.rejection_message()})"
+                                    "Rejected and reverted: frozen harness modified during "
+                                    f"metric run ({', '.join(runtime_tamper)})"
                                 )
                                 consecutive_non_improving += 1
-                            else:
-                                if _git_has_changes(handle.workspace_path):
-                                    commit_sha = _git_commit_all(
-                                        handle.workspace_path,
-                                        iteration=iteration,
-                                        hypothesis=hypothesis,
+                            elif measure_err is not None or measured is None:
+                                _git_revert_to_commit(handle.workspace_path, last_kept_sha)
+                                decision = "error"
+                                reason = f"Reverted after metric error: {measure_err}"
+                                consecutive_non_improving += 1
+                            elif is_strictly_better(measured, best_metric, cfg.direction):
+                                # Re-clean ephemeral artifacts created during metric run.
+                                clean_ephemeral_artifacts(
+                                    handle,
+                                    baseline,
+                                    write_scope=[*cfg.write_scope, *cfg.frozen_harness_paths],
+                                )
+                                post_gate = run_diff_gate(
+                                    handle,
+                                    baseline,
+                                    allowed_write_scope=cfg.write_scope,
+                                    forbidden_globs=cfg.frozen_harness_paths,
+                                    strict_scope=True,
+                                )
+                                if post_gate.rejected:
+                                    _git_revert_to_commit(handle.workspace_path, last_kept_sha)
+                                    decision = "error"
+                                    reason = (
+                                        "Reverted: metric run produced out-of-scope mutations "
+                                        f"({post_gate.rejection_message()})"
                                     )
+                                    consecutive_non_improving += 1
                                 else:
-                                    commit_sha = _git_head_sha(handle.workspace_path)
-                                last_kept_sha = commit_sha
-                                best_metric = measured
+                                    if _git_has_changes(handle.workspace_path):
+                                        commit_sha = _git_commit_all(
+                                            handle.workspace_path,
+                                            iteration=iteration,
+                                            hypothesis=hypothesis,
+                                        )
+                                    else:
+                                        commit_sha = _git_head_sha(handle.workspace_path)
+                                    last_kept_sha = commit_sha
+                                    best_metric = measured
+                                    metric_after = measured
+                                    decision = "keep"
+                                    delta = measured - metric_before
+                                    reason = (
+                                        f"Improved ({cfg.direction}): "
+                                        f"{metric_before:g} -> {measured:g} (delta={delta:+g})"
+                                    )
+                                    consecutive_non_improving = 0
+                            else:
+                                _git_revert_to_commit(handle.workspace_path, last_kept_sha)
                                 metric_after = measured
-                                decision = "keep"
+                                decision = "revert"
                                 delta = measured - metric_before
                                 reason = (
-                                    f"Improved ({cfg.direction}): "
+                                    f"No improvement ({cfg.direction}): "
                                     f"{metric_before:g} -> {measured:g} (delta={delta:+g})"
                                 )
-                                consecutive_non_improving = 0
-                        else:
-                            _git_revert_to_commit(handle.workspace_path, last_kept_sha)
-                            metric_after = measured
-                            decision = "revert"
-                            delta = measured - metric_before
-                            reason = (
-                                f"No improvement ({cfg.direction}): "
-                                f"{metric_before:g} -> {measured:g} (delta={delta:+g})"
-                            )
-                            consecutive_non_improving += 1
+                                consecutive_non_improving += 1
 
                 elapsed_s = round(max(0.0, time.monotonic() - iter_t0), 6)
                 row = HillclimbIterationRow(
@@ -1454,6 +1818,7 @@ class HillclimbStage:
                 baseline,
                 cfg,
                 frozen_hashes=frozen_hashes,
+                expected_commit_sha=last_kept_sha,
                 node_name=node_name,
             )
             remove_sandbox(handle)
@@ -1462,12 +1827,62 @@ class HillclimbStage:
             "hillclimb_config": dumped_cfg,
             "hillclimb_report": dumped_report,
             "hillclimb_frozen_hashes": dict(frozen_hashes),
+            "hillclimb_winning_commit_sha": last_kept_sha,
             "hillclimb_decision_trail_path": str(trail_path),
             "applied_paths": applied_paths,
             "route": "done",
         }
 
     # ------------------------------------------------------------------ verify_surface
+
+    def _resolve_winning_commit_sha(
+        self,
+        run_id: str,
+        report: HillclimbReport,
+        *,
+        node_name: str,
+    ) -> str:
+        """Bind verification and promotion strictly to the SQLite-recorded winning commit."""
+        baseline_payload, sqlite_rows = self._load_sqlite_history(run_id)
+        if baseline_payload is None:
+            raise HillclimbPause(
+                node_name,
+                "Missing SQLite hillclimb.baseline_recorded audit event for verification",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        base_commit = baseline_payload.get("base_commit")
+        if not isinstance(base_commit, str) or not base_commit.strip():
+            raise HillclimbPause(
+                node_name,
+                "SQLite hillclimb.baseline_recorded event is missing base_commit",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        kept_sqlite = [row for row in sqlite_rows if row.decision == "keep"]
+        expected_sha = (
+            kept_sqlite[-1].commit_sha
+            if kept_sqlite and kept_sqlite[-1].commit_sha
+            else base_commit.strip()
+        )
+        kept_report = [row for row in report.rows if row.decision == "keep"]
+        if len(kept_report) != len(kept_sqlite):
+            raise HillclimbPause(
+                node_name,
+                f"HillclimbReport kept count ({len(kept_report)}) disagrees with SQLite "
+                f"decision trail ({len(kept_sqlite)})",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        if kept_report and kept_report[-1].commit_sha != expected_sha:
+            raise HillclimbPause(
+                node_name,
+                f"HillclimbReport winning commit ({kept_report[-1].commit_sha}) disagrees "
+                f"with SQLite winning commit ({expected_sha})",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        return expected_sha
 
     def verify_surface(
         self,
@@ -1491,7 +1906,12 @@ class HillclimbStage:
                 pause_kind="blocked",
             )
         persisted = self._load_persisted(run_id)
-        raw_hashes = state.get("hillclimb_frozen_hashes") or persisted.get("frozen_hashes")
+        baseline_payload, _ = self._load_sqlite_history(run_id)
+        raw_hashes = (
+            (baseline_payload or {}).get("frozen_hashes")
+            or state.get("hillclimb_frozen_hashes")
+            or persisted.get("frozen_hashes")
+        )
         if not isinstance(raw_hashes, Mapping) or not raw_hashes:
             raise HillclimbPause(
                 node_name,
@@ -1500,8 +1920,18 @@ class HillclimbStage:
                 pause_kind="blocked",
             )
         frozen_hashes = {str(k): str(v) for k, v in raw_hashes.items()}
+        expected_commit_sha = self._resolve_winning_commit_sha(
+            run_id, report, node_name=node_name
+        )
 
         handle, baseline = self._ensure_sandbox(run_id)
+        if not handle.is_git_worktree:
+            raise HillclimbPause(
+                node_name,
+                "Hillclimb verification requires a git worktree sandbox",
+                route="blocked",
+                pause_kind="blocked",
+            )
         self._resolve_role_driver(
             run_id=run_id,
             node_name=node_name,
@@ -1510,9 +1940,13 @@ class HillclimbStage:
         )
 
         checks: list[SurfaceCheckResult] = []
+        short_circuit = False
 
-        # 1. Verify frozen harness SHA-256 anti-tamper integrity.
+        # 1. Verify frozen harness SHA-256 anti-tamper integrity BEFORE running any command.
         tampered = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
+        if tampered:
+            short_circuit = True
+            _git_revert_to_commit(handle.workspace_path, expected_commit_sha)
         checks.append(
             SurfaceCheckResult(
                 surface="frozen_harness_integrity",
@@ -1520,96 +1954,164 @@ class HillclimbStage:
                 status="fail" if tampered else "pass",
                 exit_code=1 if tampered else 0,
                 evidence=(
-                    f"Tampered frozen harness paths: {', '.join(tampered)}"
+                    f"Tampered frozen harness paths (reverted to {expected_commit_sha[:8]}; "
+                    f"skipped metric execution): {', '.join(tampered)}"
                     if tampered
                     else f"All {len(frozen_hashes)} frozen harness file(s) match baseline SHA-256."
                 ),
             )
         )
 
-        # 2. Re-run frozen metric command inside the sandbox and ensure no regression vs baseline.
-        measured, measure_err, measure_out = self._measure_metric(
-            sandbox_path=handle.workspace_path,
-            config=cfg,
-            timeout_s=timeout_s,
-            node_name=node_name,
-        )
-        post_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
-        if post_tamper:
+        # 2. Bind sandbox explicitly to the SQLite-recorded winning commit & clean tree.
+        if not short_circuit:
+            current_head = _git_head_sha(handle.workspace_path)
+            dirty_before = _git_has_changes(handle.workspace_path)
+            binding_ok = (current_head == expected_commit_sha) and not dirty_before
+            if not binding_ok:
+                short_circuit = True
             checks.append(
                 SurfaceCheckResult(
-                    surface="hillclimb_metric",
-                    command=cfg.metric_command,
-                    status="fail",
-                    exit_code=1,
+                    surface="winning_commit_binding",
+                    command="git rev-parse HEAD && git status --porcelain",
+                    status="pass" if binding_ok else "fail",
+                    exit_code=0 if binding_ok else 1,
                     evidence=(
-                        "Frozen harness modified during verification metric run: "
-                        + ", ".join(post_tamper)
-                    ),
-                )
-            )
-        elif measure_err is not None or measured is None:
-            checks.append(
-                SurfaceCheckResult(
-                    surface="hillclimb_metric",
-                    command=cfg.metric_command,
-                    status="inconclusive",
-                    exit_code=None,
-                    evidence=measure_err or "Metric failed to parse; inconclusive never passes.",
-                )
-            )
-        else:
-            regressed = is_strictly_better(report.baseline_metric, measured, cfg.direction)
-            checks.append(
-                SurfaceCheckResult(
-                    surface="hillclimb_metric",
-                    command=cfg.metric_command,
-                    status="fail" if regressed else "pass",
-                    exit_code=1 if regressed else 0,
-                    evidence=(
-                        f"Verified metric={measured:g} vs baseline={report.baseline_metric:g} "
-                        f"({cfg.direction}); output={measure_out[:400]}"
+                        f"Sandbox HEAD matches SQLite winning commit {expected_commit_sha[:8]} "
+                        "with clean working tree."
+                        if binding_ok
+                        else (
+                            f"Sandbox state mismatch before verification: HEAD={current_head[:8]} "
+                            f"(expected {expected_commit_sha[:8]}), dirty={dirty_before}."
+                        )
                     ),
                 )
             )
 
-        # 3. Run any additional verification commands from params or state['verification_commands'].
-        extra_cmds: list[str] = []
-        if commands is not None:
-            extra_cmds.extend(str(item) for item in commands)
-        else:
-            state_cmds = state.get("verification_commands")
-            if isinstance(state_cmds, list):
-                extra_cmds.extend(str(item) for item in state_cmds)
-
-        for idx, raw_cmd in enumerate(extra_cmds, start=1):
-            code, output, cmd_issue = self._run_safe_command(
-                raw_cmd,
+        # 3. Re-run frozen metric command (with --ro-bind frozen harness) & check vs best_metric.
+        if not short_circuit:
+            measured, measure_err, measure_out = self._measure_metric(
                 sandbox_path=handle.workspace_path,
+                config=cfg,
                 timeout_s=timeout_s,
                 node_name=node_name,
             )
-            status: Literal["pass", "fail", "inconclusive"]
-            if cmd_issue is not None or code is None:
-                status = "inconclusive"
-                evidence = (
-                    f"Rejected verification command ({cmd_issue}); inconclusive never passes."
-                    if cmd_issue is not None
-                    else output or "Command failed to complete; inconclusive never passes."
+            post_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
+            if post_tamper:
+                short_circuit = True
+                checks.append(
+                    SurfaceCheckResult(
+                        surface="hillclimb_metric",
+                        command=cfg.metric_command,
+                        status="fail",
+                        exit_code=1,
+                        evidence=(
+                            "Frozen harness modified during verification metric run: "
+                            + ", ".join(post_tamper)
+                        ),
+                    )
                 )
-            elif code == 0:
-                status = "pass"
-                evidence = output
+            elif measure_err is not None or measured is None:
+                checks.append(
+                    SurfaceCheckResult(
+                        surface="hillclimb_metric",
+                        command=cfg.metric_command,
+                        status="inconclusive",
+                        exit_code=None,
+                        evidence=measure_err
+                        or "Metric failed to parse; inconclusive never passes.",
+                    )
+                )
             else:
-                status = "fail"
-                evidence = output
+                regressed_vs_best = is_strictly_better(
+                    report.best_metric, measured, cfg.direction
+                )
+                regressed_vs_baseline = is_strictly_better(
+                    report.baseline_metric, measured, cfg.direction
+                )
+                failed_metric = regressed_vs_best or regressed_vs_baseline
+                checks.append(
+                    SurfaceCheckResult(
+                        surface="hillclimb_metric",
+                        command=cfg.metric_command,
+                        status="fail" if failed_metric else "pass",
+                        exit_code=1 if failed_metric else 0,
+                        evidence=(
+                            f"Verified metric={measured:g} vs best={report.best_metric:g} "
+                            f"and baseline={report.baseline_metric:g} ({cfg.direction}); "
+                            f"output={measure_out[:400]}"
+                        ),
+                    )
+                )
+
+        # 4. Run any additional verification commands (with frozen harness read-only).
+        if not short_circuit:
+            extra_cmds: list[str] = []
+            if commands is not None:
+                extra_cmds.extend(str(item) for item in commands)
+            else:
+                state_cmds = state.get("verification_commands")
+                if isinstance(state_cmds, list):
+                    extra_cmds.extend(str(item) for item in state_cmds)
+
+            ro_files = _frozen_ro_files(handle.workspace_path, cfg.frozen_harness_paths)
+            for idx, raw_cmd in enumerate(extra_cmds, start=1):
+                code, raw_out, cmd_issue = self._run_safe_command(
+                    raw_cmd,
+                    sandbox_path=handle.workspace_path,
+                    timeout_s=timeout_s,
+                    node_name=node_name,
+                    read_only_files=ro_files,
+                )
+                output = _trim_output(raw_out)
+                status: Literal["pass", "fail", "inconclusive"]
+                if cmd_issue is not None or code is None:
+                    status = "inconclusive"
+                    evidence = (
+                        f"Rejected verification command ({cmd_issue}); inconclusive never passes."
+                        if cmd_issue is not None
+                        else output or "Command failed to complete; inconclusive never passes."
+                    )
+                elif code == 0:
+                    status = "pass"
+                    evidence = output
+                else:
+                    status = "fail"
+                    evidence = output
+                checks.append(
+                    SurfaceCheckResult(
+                        surface=f"check_{idx}",
+                        command=raw_cmd,
+                        status=status,
+                        exit_code=code,
+                        evidence=evidence,
+                    )
+                )
+
+            # 5. Reject if any verification command mutated the sandbox working tree or HEAD.
+            post_head = _git_head_sha(handle.workspace_path)
+            dirty_after = _git_has_changes(handle.workspace_path)
+            post_all_tamper = detect_frozen_harness_tamper(handle.workspace_path, frozen_hashes)
+            clean_ok = (
+                post_head == expected_commit_sha
+                and not dirty_after
+                and not post_all_tamper
+            )
             checks.append(
                 SurfaceCheckResult(
-                    surface=f"check_{idx}",
-                    command=raw_cmd,
-                    status=status,
-                    exit_code=code,
-                    evidence=evidence,
+                    surface="sandbox_cleanliness",
+                    command="git rev-parse HEAD && git status --porcelain",
+                    status="pass" if clean_ok else "fail",
+                    exit_code=0 if clean_ok else 1,
+                    evidence=(
+                        f"Sandbox remained clean at winning commit {expected_commit_sha[:8]} "
+                        "after all verification checks."
+                        if clean_ok
+                        else (
+                            f"Verification mutated sandbox: HEAD={post_head[:8]} "
+                            f"(expected {expected_commit_sha[:8]}), dirty={dirty_after}, "
+                            f"tampered={post_all_tamper}."
+                        )
+                    ),
                 )
             )
 
@@ -1639,6 +2141,7 @@ class HillclimbStage:
                 "verification_id": verification.verification_id,
                 "passed": verification.passed,
                 "check_count": len(verification.checks),
+                "winning_commit_sha": expected_commit_sha,
                 "summary": verification.summary,
             },
         )
@@ -1653,16 +2156,12 @@ class HillclimbStage:
 
         applied_paths: list[str] = []
         if apply_to_workspace:
-            clean_ephemeral_artifacts(
-                handle,
-                baseline,
-                write_scope=[*cfg.write_scope, *cfg.frozen_harness_paths],
-            )
             applied_paths = self._promote_sandbox_to_workspace(
                 handle,
                 baseline,
                 cfg,
                 frozen_hashes=frozen_hashes,
+                expected_commit_sha=expected_commit_sha,
                 node_name=node_name,
             )
             remove_sandbox(handle)

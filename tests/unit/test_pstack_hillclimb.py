@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 from collections.abc import Callable
@@ -13,6 +15,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import olympus.stages.hillclimb as hillclimb_mod
 from olympus.core.contracts import (
     EvidenceBrief,
     EvidenceFact,
@@ -44,8 +47,11 @@ from olympus.stages.craft import load_skill_pack
 from olympus.stages.hillclimb import (
     HillclimbPause,
     HillclimbStage,
+    _parse_safe_argv,
     _probe_bwrap,
+    _probe_bwrap_unshare_net,
     hillclimb_loop,
+    parse_metric_value,
     snapshot_frozen_harness,
 )
 
@@ -343,11 +349,17 @@ def test_anti_tamper_guard_rejects_and_reverts_frozen_harness_edits(tmp_path: Pa
     assert report.best_metric == 25.0
     assert report.kept_iterations == 1
     assert report.reverted_iterations == 2
-    assert [row.decision for row in report.rows] == [
-        "rejected_tamper",
-        "rejected_tamper",
-        "keep",
-    ]
+    assert report.rows[0].decision == "rejected_tamper"
+    # Under bwrap --ro-bind, runtime write fails with EROFS (error) before bench.py can mutate;
+    # without bwrap, post-metric SHA-256 catches it as rejected_tamper.
+    if _probe_bwrap() is not None:
+        assert report.rows[1].decision == "error"
+        assert "Read-only file system" in report.rows[1].reason or "PermissionError" in report.rows[
+            1
+        ].reason
+    else:
+        assert report.rows[1].decision == "rejected_tamper"
+    assert report.rows[2].decision == "keep"
     assert report.rows[0].commit_sha is None
     assert report.rows[1].commit_sha is None
     assert report.rows[2].commit_sha is not None
@@ -721,3 +733,563 @@ def test_pstack_hillclimb_e2e_graph_verify_surface_and_host_promotion(tmp_path: 
     assert "hillclimb.iteration_recorded" in event_types
     assert "hillclimb.completed" in event_types
     assert "craft.verify_recorded" in event_types
+
+
+def test_command_isolation_blocks_forbidden_flags_and_secret_env_leaks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    (repo / "bench.py").write_text(
+        "import os, solver\n"
+        "leaked = os.environ.get('OPENAI_API_KEY') or os.environ.get('DASHSCOPE_API_KEY')\n"
+        "assert leaked is None, f'Secret env leaked: {leaked!r}'\n"
+        "print(f'SCORE={solver.score_value()}')\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "bench.py")
+    _git(repo, "commit", "-m", "check env isolation")
+
+    # Forbidden flags must fail closed in _parse_safe_argv.
+    for bad_cmd in (
+        f"{sys.executable} -c 'print(1)'",
+        f"{sys.executable} -e bench.py",
+        "pytest --basetemp=/tmp/evil",
+        "ruff check --fix .",
+        f"{sys.executable} -oc bench.py",
+    ):
+        argv, issue = _parse_safe_argv(bad_cmd, host_root=repo, sandbox_root=repo)
+        assert argv is None and issue is not None, f"Expected rejection for {bad_cmd!r}"
+
+    # Host secrets must NEVER leak into benchmark subprocess env.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-must-not-leak")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-secret-must-not-leak")
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Env isolation",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo,
+    )
+    stage = HillclimbStage(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    cfg = _base_config(direction="minimize", target_value=100.0, max_iterations=1)
+    res = stage.hillclimb_loop(run_id=run_id, raw_input="Verify env isolation", config=cfg)
+    assert HillclimbReport.model_validate(res["hillclimb_report"]).baseline_metric == 100.0
+
+    # Verify bwrap builds --unshare-net and --ro-bind for frozen_harness_paths when available.
+    if _probe_bwrap() is not None:
+        captured_cmds: list[list[str]] = []
+        real_run = subprocess.run
+
+        def _spy_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(cmd, list) and cmd and Path(cmd[0]).name == "bwrap":
+                captured_cmds.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(hillclimb_mod.subprocess, "run", _spy_run)
+        val, err, _ = stage._measure_metric(
+            sandbox_path=repo,
+            config=cfg,
+            timeout_s=30,
+            node_name="hillclimb",
+        )
+        assert err is None and val == 100.0
+        assert captured_cmds
+        bwrap_cmd = captured_cmds[-1]
+        if _probe_bwrap_unshare_net():
+            assert "--unshare-net" in bwrap_cmd
+        bench_resolved = str((repo / "bench.py").resolve())
+        ro_pairs = [
+            (bwrap_cmd[i + 1], bwrap_cmd[i + 2])
+            for i in range(len(bwrap_cmd) - 2)
+            if bwrap_cmd[i] == "--ro-bind"
+        ]
+        assert (bench_resolved, bench_resolved) in ro_pairs
+
+
+def test_pre_execution_tamper_short_circuits_without_running_metric_and_unsandboxed_runtime_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Short-circuit tamper",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo,
+    )
+
+    metric_invocations: list[str] = []
+
+    def _spy_runner(cmd: str, *, cwd: Path, timeout_s: int = 60) -> tuple[int | None, str]:
+        del timeout_s
+        metric_invocations.append(cmd)
+        proc = subprocess.run(
+            [sys.executable, "bench.py"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    sandbox_paths: list[Path] = []
+
+    def _worker(req: DriverTurnRequest) -> str:
+        sandbox_paths.append(req.workspace_path)
+        if req.actor.endswith("_1"):
+            (req.workspace_path / "bench.py").write_text("print('SCORE=1')\n", encoding="utf-8")
+            return "HYPOTHESIS: Tamper bench before metric run"
+        if req.actor.endswith("_2"):
+            (req.workspace_path / "solver.py").write_text(
+                "def score_value() -> int:\n    return 40\n"
+                "def has_duplicate(nums: list[int]) -> bool:\n"
+                "    return len(set(nums)) < len(nums)\n",
+                encoding="utf-8",
+            )
+            return "HYPOTHESIS: Valid improvement"
+        raise AssertionError(req.actor)
+
+    stage = HillclimbStage(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker)}),
+        command_runner=_spy_runner,
+    )
+    res = stage.hillclimb_loop(
+        run_id=run_id,
+        raw_input="Test tamper short-circuit",
+        config=_base_config(direction="minimize", max_iterations=2, plateau_patience=3),
+    )
+    # Only baseline (1) + iter 2 (1) ran metric_command; tampered iter 1 NEVER executed it!
+    assert len(metric_invocations) == 2
+    assert [r["decision"] for r in res["hillclimb_report"]["rows"]] == ["rejected_tamper", "keep"]
+
+    # Now tamper bench.py before verify_surface: metric_command MUST NOT execute!
+    metric_invocations.clear()
+    (sandbox_paths[-1] / "bench.py").write_text("print('SCORE=0')\n", encoding="utf-8")
+    with pytest.raises(HillclimbPause, match="frozen_harness_integrity=fail"):
+        stage.verify_surface(run_id=run_id, state=res, apply_to_workspace=True)
+    assert metric_invocations == []
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # Without bwrap (opt-in unsandboxed), runtime tamper is still caught as rejected_tamper.
+    monkeypatch.setattr(hillclimb_mod, "_probe_bwrap", lambda: None)
+    run_rt = store.create_run(
+        title="Unsandboxed runtime tamper",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo,
+    )
+
+    def _rt_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "solver.py").write_text(
+            "from pathlib import Path\n"
+            "def score_value() -> int:\n"
+            "    Path('bench.py').write_text('print(\"SCORE=0\")\\n', encoding='utf-8')\n"
+            "    return 5\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Mutate bench.py during runtime"
+
+    rt_res = hillclimb_loop(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        run_id=run_rt,
+        raw_input="Runtime tamper fallback check",
+        config=_base_config(direction="minimize", max_iterations=1, plateau_patience=2),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_rt",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_rt_worker)}),
+        allow_unsandboxed_metric=True,
+    )
+    assert rt_res["hillclimb_report"]["rows"][0]["decision"] == "rejected_tamper"
+
+
+def test_verify_surface_enforces_winning_commit_best_metric_and_clean_sandbox(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    (repo / "mutating_check.py").write_text(
+        "from pathlib import Path\n"
+        "Path('verify_side_effect.txt').write_text('mutated', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "mutating_check.py")
+    _git(repo, "commit", "-m", "add mutating check script")
+
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Verify binding and cleanliness",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo,
+    )
+    sandboxes: list[Path] = []
+
+    def _worker(req: DriverTurnRequest) -> str:
+        sandboxes.append(req.workspace_path)
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 30\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Lower score to 30"
+
+    stage = HillclimbStage(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker)}),
+    )
+    res = stage.hillclimb_loop(
+        run_id=run_id,
+        raw_input="Optimize to 30",
+        config=_base_config(direction="minimize", max_iterations=1),
+    )
+    ws = sandboxes[-1]
+    winning_sha = res["hillclimb_winning_commit_sha"]
+
+    # 1. Extra verification command mutating sandbox fails sandbox_cleanliness & blocks promotion.
+    with pytest.raises(HillclimbPause, match="sandbox_cleanliness=fail"):
+        stage.verify_surface(
+            run_id=run_id,
+            state=res,
+            commands=[f"{sys.executable} mutating_check.py"],
+            apply_to_workspace=True,
+        )
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+    (ws / "verify_side_effect.txt").unlink()
+
+    # 2. Regression worse than best_metric (even though better than baseline 100) fails!
+    fake_worse_state = dict(res)
+    fake_worse_report = dict(res["hillclimb_report"])
+    fake_worse_report["best_metric"] = 10.0  # Real sandbox returns 30 (> 10, < 100 baseline)
+    fake_worse_state["hillclimb_report"] = fake_worse_report
+    with pytest.raises(HillclimbPause, match="hillclimb_metric=fail"):
+        stage.verify_surface(run_id=run_id, state=fake_worse_state, apply_to_workspace=True)
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # 3. Drifted sandbox HEAD (extra commit after winning commit) fails winning_commit_binding!
+    (ws / "solver.py").write_text(
+        "def score_value() -> int:\n    return 5\n"
+        "def has_duplicate(nums: list[int]) -> bool:\n"
+        "    return len(set(nums)) < len(nums)\n",
+        encoding="utf-8",
+    )
+    _git(ws, "add", "solver.py")
+    _git(ws, "commit", "-m", "unauthorized post-loop commit")
+    with pytest.raises(HillclimbPause, match="winning_commit_binding=fail"):
+        stage.verify_surface(run_id=run_id, state=res, apply_to_workspace=True)
+    assert "return 100" in (repo / "solver.py").read_text(encoding="utf-8")
+
+    # Restoring exact winning_sha passes verification and promotes cleanly.
+    _git(ws, "reset", "--hard", winning_sha)
+    ok = stage.verify_surface(run_id=run_id, state=res, apply_to_workspace=True)
+    assert ok["surface_verification"]["passed"] is True
+    assert ok["applied_paths"] == ["solver.py"]
+    assert "return 30" in (repo / "solver.py").read_text(encoding="utf-8")
+
+
+def test_atomic_promotion_symlink_delete_hardlink_isolation_and_dir_mode_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --- A. Hard-link alias must NOT be mutated in place on file overwrite ---
+    repo_hl = tmp_path / "repo_hl"
+    _init_opt_repo(repo_hl)
+    alias = tmp_path / "solver_hardlink_alias.py"
+    os.link(repo_hl / "solver.py", alias)
+    orig_alias_content = alias.read_text(encoding="utf-8")
+
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_hl = store.create_run(
+        title="Hardlink isolation",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_hl,
+    )
+
+    def _hl_worker(req: DriverTurnRequest) -> str:
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 20\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Improve to 20"
+
+    hillclimb_loop(
+        store=store,
+        workspace_root=repo_hl,
+        provider=_mock_provider([]),
+        run_id=run_hl,
+        raw_input="Test hardlink preservation",
+        config=_base_config(direction="minimize", max_iterations=1),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_hl",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_hl_worker)}),
+        apply_to_workspace=True,
+    )
+    assert "return 20" in (repo_hl / "solver.py").read_text(encoding="utf-8")
+    assert alias.read_text(encoding="utf-8") == orig_alias_content
+
+    # --- B. Deleting through an in-repo symlinked directory MUST be rejected ---
+    repo_sym = tmp_path / "repo_sym"
+    _init_opt_repo(repo_sym)
+    (repo_sym / "real_dir").mkdir()
+    (repo_sym / "real_dir" / "victim.txt").write_text("keep-me", encoding="utf-8")
+    (repo_sym / "sub").mkdir()
+    (repo_sym / "sub" / "victim.txt").write_text("tracked", encoding="utf-8")
+    _git(repo_sym, "add", ".")
+    _git(repo_sym, "commit", "-m", "add real_dir and sub")
+
+    run_sym = store.create_run(
+        title="Symlink delete guard",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_sym,
+    )
+    stage_sym = HillclimbStage(
+        store=store,
+        workspace_root=repo_sym,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_sym",
+    )
+    handle_sym, baseline_sym = stage_sym._ensure_sandbox(run_sym)
+    # Delete sub/victim.txt in sandbox and replace host `sub` with an in-repo symlink to `real_dir`.
+    (handle_sym.workspace_path / "sub" / "victim.txt").unlink()
+    (repo_sym / "sub" / "victim.txt").unlink()
+    (repo_sym / "sub").rmdir()
+    os.symlink("real_dir", repo_sym / "sub")
+
+    sym_cfg = HillclimbConfig(
+        frozen_harness_paths=["bench.py"],
+        metric_command=f"{sys.executable} bench.py",
+        metric_regex=r"SCORE=([0-9]+)",
+        direction="minimize",
+        write_scope=["sub/**"],
+    )
+    frozen_sym = snapshot_frozen_harness(handle_sym.workspace_path, ["bench.py"])
+    with pytest.raises(HillclimbPause, match="symlinked ancestor directory"):
+        stage_sym._promote_sandbox_to_workspace(
+            handle_sym, baseline_sym, sym_cfg, frozen_hashes=frozen_sym
+        )
+    assert (repo_sym / "real_dir" / "victim.txt").read_text(encoding="utf-8") == "keep-me"
+
+    # --- C. Rollback restores removed empty parent directory mode bits ---
+    repo_rb = tmp_path / "repo_rb"
+    _init_opt_repo(repo_rb)
+    nested_dir = repo_rb / "nested_mod"
+    nested_dir.mkdir(mode=0o750)
+    os.chmod(nested_dir, 0o750)
+    (nested_dir / "obsolete.py").write_text("OLD = 1\n", encoding="utf-8")
+    _git(repo_rb, "add", ".")
+    _git(repo_rb, "commit", "-m", "add nested_mod")
+    os.chmod(nested_dir, 0o750)
+
+    run_rb = store.create_run(
+        title="Dir mode rollback",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo_rb,
+    )
+    stage_rb = HillclimbStage(
+        store=store,
+        workspace_root=repo_rb,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes_rb",
+    )
+    handle_rb, baseline_rb = stage_rb._ensure_sandbox(run_rb)
+    # Sandbox deletes nested_mod/obsolete.py (causing host rmdir) and modifies solver.py.
+    (handle_rb.workspace_path / "nested_mod" / "obsolete.py").unlink()
+    (handle_rb.workspace_path / "solver.py").write_text(
+        "def score_value() -> int:\n    return 10\n"
+        "def has_duplicate(nums: list[int]) -> bool:\n"
+        "    return len(set(nums)) < len(nums)\n",
+        encoding="utf-8",
+    )
+    rb_cfg = HillclimbConfig(
+        frozen_harness_paths=["bench.py"],
+        metric_command=f"{sys.executable} bench.py",
+        metric_regex=r"SCORE=([0-9]+)",
+        direction="minimize",
+        write_scope=["solver.py", "nested_mod/**"],
+    )
+    frozen_rb = snapshot_frozen_harness(handle_rb.workspace_path, ["bench.py"])
+
+    def _boom_replace(_src: Path, _dst: Path) -> None:
+        raise OSError("Simulated disk full during copy_plan")
+
+    monkeypatch.setattr(hillclimb_mod, "_atomic_replace_from_src", _boom_replace)
+    with pytest.raises(HillclimbPause, match="rolled back"):
+        stage_rb._promote_sandbox_to_workspace(
+            handle_rb, baseline_rb, rb_cfg, frozen_hashes=frozen_rb
+        )
+    assert nested_dir.is_dir()
+    assert stat.S_IMODE(nested_dir.stat().st_mode) == 0o750
+    assert (nested_dir / "obsolete.py").read_text(encoding="utf-8") == "OLD = 1\n"
+
+
+def test_revert_cleans_gitignored_artifacts_and_resume_preserves_sqlite_trail(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    (repo / ".gitignore").write_text("*.ignored_cache\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "add gitignore")
+
+    store = RunStore(tmp_path / "olympus.sqlite")
+    run_id = store.create_run(
+        title="Git clean -fdx and resume trail",
+        mode=RunMode.EXECUTION,
+        workflow_name="pstack_hillclimb",
+        workspace_root=repo,
+    )
+    seen_ignored_on_iter2: list[bool] = []
+    seen_actors: list[str] = []
+
+    def _worker_part1(req: DriverTurnRequest) -> str:
+        seen_actors.append(req.actor)
+        it = int(req.actor.rsplit("_", 1)[-1])
+        if it == 1:
+            # Regress and drop a .gitignore'd file; git clean -fdx must purge it!
+            (req.workspace_path / "leak.ignored_cache").write_text("stale", encoding="utf-8")
+            (req.workspace_path / "solver.py").write_text(
+                "def score_value() -> int:\n    return 200\n"
+                "def has_duplicate(nums: list[int]) -> bool:\n"
+                "    return len(set(nums)) < len(nums)\n",
+                encoding="utf-8",
+            )
+            return "HYPOTHESIS: Regress with gitignored artifact"
+        if it == 2:
+            seen_ignored_on_iter2.append((req.workspace_path / "leak.ignored_cache").exists())
+            (req.workspace_path / "solver.py").write_text(
+                "def score_value() -> int:\n    return 50\n"
+                "def has_duplicate(nums: list[int]) -> bool:\n"
+                "    return len(set(nums)) < len(nums)\n",
+                encoding="utf-8",
+            )
+            return "HYPOTHESIS: Improve to 50"
+        raise AssertionError(req.actor)
+
+    res1 = hillclimb_loop(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        run_id=run_id,
+        raw_input="Run first 2 iterations",
+        config=_base_config(direction="minimize", max_iterations=2, plateau_patience=3),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker_part1)}),
+    )
+    assert seen_ignored_on_iter2 == [False]
+    assert res1["hillclimb_report"]["best_metric"] == 50.0
+
+    # Resume the SAME run_id with max_iterations=3: must continue at iteration 3 (no duplicates!).
+    def _worker_part2(req: DriverTurnRequest) -> str:
+        seen_actors.append(req.actor)
+        assert req.actor == "hephaestus:hillclimb_iter_3"
+        (req.workspace_path / "solver.py").write_text(
+            "def score_value() -> int:\n    return 15\n"
+            "def has_duplicate(nums: list[int]) -> bool:\n"
+            "    return len(set(nums)) < len(nums)\n",
+            encoding="utf-8",
+        )
+        return "HYPOTHESIS: Resumed iter 3 improves to 15"
+
+    res2 = hillclimb_loop(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        run_id=run_id,
+        raw_input="Resume to 3 iterations",
+        config=_base_config(direction="minimize", max_iterations=3, plateau_patience=3),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+        execution_drivers=ExecutionDriversConfig.resolve(worker_driver="scripted"),
+        driver_registry=DriverRegistry({"scripted": _ScriptedDriver(_worker_part2)}),
+    )
+    rep2 = HillclimbReport.model_validate(res2["hillclimb_report"])
+    assert [r.iteration for r in rep2.rows] == [1, 2, 3]
+    assert [r.decision for r in rep2.rows] == ["revert", "keep", "keep"]
+    assert rep2.best_metric == 15.0
+    assert seen_actors == [
+        "hephaestus:hillclimb_iter_1",
+        "hephaestus:hillclimb_iter_2",
+        "hephaestus:hillclimb_iter_3",
+    ]
+
+    events = store.list_events(run_id)
+    assert sum(1 for ev in events if ev.event_type == "hillclimb.baseline_recorded") == 1
+    iter_events = [ev for ev in events if ev.event_type == "hillclimb.iteration_recorded"]
+    assert [ev.payload["iteration"] for ev in iter_events] == [1, 2, 3]
+
+    trail = json.loads(Path(res2["hillclimb_decision_trail_path"]).read_text(encoding="utf-8"))
+    assert [r["iteration"] for r in trail["rows"]] == [1, 2, 3]
+
+
+def test_metric_parsing_uses_untruncated_output_and_rejects_ambiguous_multi_match(
+    tmp_path: Path,
+) -> None:
+    # 1. Conflicting multi-match output fails closed; identical repeated matches succeed.
+    val_amb, err_amb = parse_metric_value("SCORE=100\nSCORE=42\n", r"SCORE=([0-9]+)")
+    assert val_amb is None and err_amb is not None and "ambiguous" in err_amb
+
+    val_same, err_same = parse_metric_value("SCORE=42\nSCORE=42\n", r"SCORE=([0-9]+)")
+    assert err_same is None and val_same == 42.0
+
+    # 2. Metric emitted AFTER >2400 chars of stdout noise is still parsed cleanly.
+    repo = tmp_path / "repo"
+    _init_opt_repo(repo)
+    (repo / "bench.py").write_text(
+        "import solver\n"
+        "print('X' * 5000)\n"
+        "print(f'SCORE={solver.score_value()}')\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "bench.py")
+    _git(repo, "commit", "-m", "noisy stdout before metric")
+
+    store = RunStore(tmp_path / "olympus.sqlite")
+    stage = HillclimbStage(
+        store=store,
+        workspace_root=repo,
+        provider=_mock_provider([]),
+        artifacts_root=tmp_path / "artifacts",
+        sandbox_root=tmp_path / "sandboxes",
+    )
+    val, err, excerpt = stage._measure_metric(
+        sandbox_path=repo,
+        config=_base_config(direction="minimize", max_iterations=1),
+        timeout_s=30,
+        node_name="hillclimb",
+    )
+    assert err is None
+    assert val == 100.0
+    assert excerpt.endswith("...[truncated]")

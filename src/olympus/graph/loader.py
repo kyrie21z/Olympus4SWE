@@ -20,6 +20,7 @@ from olympus.core.contracts import (
 )
 from olympus.core.control import RunControl
 from olympus.core.dag import validate_design_spec, validate_plan
+from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.graph.engine import END, Graph, GraphPaused, Node
 from olympus.graph.progress import GATE_SPECS, is_artifact_approved
@@ -102,6 +103,21 @@ class WorkflowRouterDef(StrictModel):
     default: str = END
 
 
+_DESCRIPTIVE_MANIFEST_FIELDS: frozenset[str] = frozenset(
+    {"family", "autonomy", "applicable_scenarios", "anti_patterns"}
+)
+_SDLC_WATERFALL_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        "align_goal",
+        "design_spec",
+        "validate_design",
+        "pm_decompose",
+        "validate_plan",
+        "execute_task_dag",
+    }
+)
+
+
 class WorkflowDefinition(StrictModel):
     name: str = Field(min_length=1)
     description: str = ""
@@ -115,6 +131,23 @@ class WorkflowDefinition(StrictModel):
     edges: list[WorkflowEdgeDef] = Field(default_factory=list)
     routers: list[WorkflowRouterDef] = Field(default_factory=list)
     gates: dict[str, bool] = Field(default_factory=dict)
+
+    def _hash_payload(self) -> dict[str, Any]:
+        """Executable graph structure payload excluding descriptive manifest metadata."""
+        return self.model_dump(mode="json", exclude=set(_DESCRIPTIVE_MANIFEST_FIELDS))
+
+    def execution_hash(self) -> str:
+        """Return a deterministic SHA-256 fingerprint of executable graph structure."""
+        return content_hash(self._hash_payload())
+
+    @property
+    def content_hash(self) -> str:
+        """Return the legacy full-model SHA-256 fingerprint for backward-compatible resume."""
+        return content_hash(self.model_dump(mode="json"))
+
+    def uses_sdlc_artifacts(self) -> bool:
+        """Return whether this workflow executes legacy SDLC artifact nodes."""
+        return any(node.type in _SDLC_WATERFALL_NODE_TYPES for node in self.nodes)
 
     def node(self, name: str) -> WorkflowNodeDef | None:
         return next((n for n in self.nodes if n.name == name), None)
@@ -563,16 +596,22 @@ def _node_explore_reproduce(
 ) -> dict[str, Any]:
     runtime = _runtime(state)
     run_id = _run_id(state)
+    raw_base_ref = state.get("base_ref")
+    base_ref = (
+        raw_base_ref.strip() if isinstance(raw_base_ref, str) and raw_base_ref.strip() else None
+    )
     try:
         return _craft_stage(runtime).explore_reproduce(
             run_id=run_id,
             raw_input=str(state.get("raw_input", "")),
             constraints=list(state.get("constraints", [])),
             scope_paths=list(state.get("scope_paths", [])),
+            base_ref=base_ref,
             node_name=str(params.get("_node_name") or "explore"),
             role=str(params.get("_node_role") or "explorer"),
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             require_repro=bool(params.get("require_repro", False)),
+            read_only_report=bool(params.get("read_only_report", False)),
             max_steps=_craft_step_budget(params, runtime, 8),
         )
     except CraftPause as paused:
@@ -612,6 +651,7 @@ def _node_build_direct(state: dict[str, Any], params: Mapping[str, Any]) -> dict
             role=str(params.get("_node_role") or "builder"),
             skill_refs=tuple(params.get("_node_skill_refs") or ()),
             strict_scope=bool(params.get("strict_scope", True)),
+            failing_test_first=bool(params.get("failing_test_first", False)),
             max_diff_gate_retries=int(params.get("max_diff_gate_retries", 2)),
             max_steps=_craft_step_budget(params, runtime, 24, use_worker_steps=True),
         )

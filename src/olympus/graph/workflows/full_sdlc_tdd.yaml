@@ -4,6 +4,16 @@ description: >-
   planner emits a thin runnable end-to-end skeleton slice followed by cohesive vertical
   user-story slices, each carrying its own executable seam check, and execution continues to
   the end of the task DAG.
+family: sdlc
+autonomy: gated
+applicable_scenarios:
+  - greenfield 0-to-1 product development requiring upfront GoalSpec and DesignSpec alignment
+  - ambiguous multi-module systems needing explicit human spec, design, and plan approval gates
+  - large parallelizable deliverables decomposed into disjoint TDD task DAGs
+anti_patterns:
+  - trivial single-file known-cause patch
+  - read-only root-cause forensics without workspace edits
+  - well-scoped brownfield feature or bugfix that does not need three human approval gates
 stop_after: execute
 topology: tdd_first
 nodes:

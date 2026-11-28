@@ -3,6 +3,16 @@ description: >-
   Minimal-patch loop for small repository fixes: triage, freeze a compact GoalSpec,
   decompose a single-wave plan against the frozen spec, and execute immediately.
   Human gates are auto-satisfied so CI and scripts can run headless.
+family: minimal
+autonomy: autonomous_hard_stops
+applicable_scenarios:
+  - known-cause trivial patches in 1-2 files with an already-identified fix location
+  - low-overhead typo, config, or localized single-wave edits without reproduction or interrogation loops
+anti_patterns:
+  - unknown-cause bugs or regressions requiring deterministic reproduction and failing-test-first proof
+  - multi-file cross-boundary refactors needing two-shape architecture review
+  - read-only root-cause forensics without workspace edits
+  - ambiguous greenfield product design
 stop_after: execute
 topology: minimal_patch
 nodes:

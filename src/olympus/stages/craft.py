@@ -12,6 +12,7 @@ Primitives:
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import re
@@ -20,8 +21,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -36,6 +39,7 @@ from olympus.core.contracts import (
     SurfaceCheckResult,
     SurfaceVerificationReport,
 )
+from olympus.core.fingerprint import content_hash
 from olympus.core.store import RunStore
 from olympus.harness.diff_gate import DiffGateResult, run_diff_gate
 from olympus.harness.driver import (
@@ -168,6 +172,34 @@ _FORBIDDEN_SHORT_FLAGS: frozenset[str] = frozenset({"c", "e", "h", "o", "p", "w"
 _ABS_PATH_LITERAL_RE = re.compile(r"(?:^|[\s'\"=(,])/(?:etc|home|root|tmp|var|usr|opt|Users)/")
 _NON_PROOF_EXIT_CODES: frozenset[int] = frozenset({126, 127})
 _PYTEST_NON_FAILURE_EXIT_CODES: frozenset[int] = frozenset({2, 3, 4, 5})
+_ZERO_TEST_OUTPUT_RE = re.compile(
+    r"(?i)(?:"
+    r"\bran\s+0\s+tests?\b"
+    r"|\brunning\s+0\s+tests?\b"
+    r"|\bno\s+tests?\s+ran\b"
+    r"|\bcollected\s+0\s+items?\b"
+    r"|\b0\s+tests?\s+run\b"
+    r"|\bno\s+test\s+files?\s+found\b"
+    r"|\[no\s+test\s+files\]"
+    r"|\b0\s+specs?\b"
+    r")"
+)
+_TEST_DIR_NAMES: frozenset[str] = frozenset({"test", "tests", "__tests__", "spec", "specs"})
+_TEST_FILE_NAME_RE = re.compile(
+    r"^(?:test_.*|.*_test\.[^.]+|.*\.test\.[^.]+|.*\.spec\.[^.]+|.*Tests?\.[^.]+|.*Spec\.[^.]+)$"
+)
+_TEST_DEF_RE = re.compile(r"(?m)^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(")
+_UNITTEST_RAN_RE = re.compile(r"(?i)\bran\s+(\d+)\s+tests?\b")
+_UNITTEST_OK_SKIPPED_RE = re.compile(r"(?i)\bOK\s*\([^)]*\bskipped=(\d+)\b[^)]*\)")
+_SKIPPED_SUMMARY_RE = re.compile(
+    r"(?i)\b([1-9]\d*)\s+(?:skipped|ignored|deselected|xfailed)\b"
+)
+_POSITIVE_PASSED_RE = re.compile(r"(?i)\b[1-9]\d*\s+passed\b")
+_PYTEST_PROGRESS_WITH_PCT_RE = re.compile(r"^([.sSxXfFeE]+)\s+\[\s*\d+%\]$")
+_PYTEST_SKIP_ONLY_PCT_RE = re.compile(r"^[sSxX]+\s+\[\s*\d+%\]$")
+_PYTEST_SKIP_ONLY_LINE_RE = re.compile(r"^[sSxX]+$")
+_PYTEST_PASS_DOT_LINE_RE = re.compile(r"^[.sSxXfFeE]*\.[.sSxXfFeE]*(?:\s+\[\s*\d+%\])?$")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 class _SandboxIsolationUnavailableError(RuntimeError):
@@ -358,8 +390,107 @@ def _effective_repro_runner(argv: Sequence[str]) -> str:
     return binary
 
 
-def _is_proven_failure_exit(argv: Sequence[str], code: int | None) -> tuple[bool, str]:
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text) if text else ""
+
+
+def _has_zero_test_output(output: str) -> bool:
+    clean = _strip_ansi(output)
+    return bool(clean and _ZERO_TEST_OUTPUT_RE.search(clean))
+
+
+def _has_all_skipped_test_output(output: str, *, runner: str = "") -> str | None:
+    """Detect test runs that exited 0 only because every test was skipped/ignored."""
+    clean = _strip_ansi(output)
+    if not clean:
+        return None
+    unittest_skip = _UNITTEST_OK_SKIPPED_RE.search(clean)
+    if unittest_skip is not None:
+        skipped_count = int(unittest_skip.group(1))
+        ran_matches = _UNITTEST_RAN_RE.findall(clean)
+        ran_count = int(ran_matches[-1]) if ran_matches else 0
+        if skipped_count > 0 and (ran_count == 0 or skipped_count >= ran_count):
+            return f"all unittest tests were skipped ({skipped_count}/{ran_count} executed)"
+    if _SKIPPED_SUMMARY_RE.search(clean) and not _POSITIVE_PASSED_RE.search(clean):
+        # Allow unittest suites that ran more tests than skipped (e.g. Ran 5 tests, OK (skipped=1)).
+        ran_matches = _UNITTEST_RAN_RE.findall(clean)
+        if (
+            ran_matches
+            and unittest_skip is not None
+            and int(ran_matches[-1]) > int(unittest_skip.group(1))
+        ):
+            return None
+        return "all tests were skipped/ignored (0 passed)"
+    if runner in {"pytest", "py.test"} and not _POSITIVE_PASSED_RE.search(clean):
+        non_empty = [line.strip() for line in clean.splitlines() if line.strip()]
+        has_pass_dot = any(_PYTEST_PASS_DOT_LINE_RE.match(line) for line in non_empty)
+        if not has_pass_dot and non_empty:
+            pct_lines = [line for line in non_empty if _PYTEST_PROGRESS_WITH_PCT_RE.match(line)]
+            if pct_lines and all(_PYTEST_SKIP_ONLY_PCT_RE.match(line) for line in pct_lines):
+                return "all pytest tests were skipped/xfailed (0 passed)"
+            if _PYTEST_SKIP_ONLY_LINE_RE.match(non_empty[-1]):
+                return "all pytest tests were skipped/xfailed (0 passed)"
+    return None
+
+
+def _baseline_fingerprint(baseline: SandboxBaseline) -> str:
+    """Compute a deterministic fingerprint binding receipts to one exact sandbox baseline."""
+    return content_hash(
+        {
+            "is_git": baseline.is_git,
+            "base_commit": baseline.base_commit,
+            "entries": list(baseline.entries),
+        }
+    )
+
+
+def _is_test_path(path: str) -> bool:
+    posix = PurePosixPath(path.strip().replace("\\", "/"))
+    if not posix.name:
+        return False
+    if any(part.lower() in _TEST_DIR_NAMES for part in posix.parts[:-1]):
+        return True
+    return bool(_TEST_FILE_NAME_RE.match(posix.name))
+
+
+def _file_sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _extract_test_def_names(text: str) -> set[str]:
+    return set(_TEST_DEF_RE.findall(text))
+
+
+def _resolve_argv_test_files(workspace_path: Path, argv: Sequence[str]) -> list[str]:
+    """Extract existing workspace-relative test file paths referenced by a test command."""
+    found: list[str] = []
+    for token in argv[1:]:
+        if token.startswith("-"):
+            continue
+        raw_target = token.split("::", 1)[0].strip()
+        if not raw_target or Path(raw_target).is_absolute() or ".." in Path(raw_target).parts:
+            continue
+        candidates = [raw_target]
+        if "/" not in raw_target and "\\" not in raw_target and not raw_target.endswith(".py"):
+            parts = raw_target.split(".")
+            for prefix_len in range(len(parts), 0, -1):
+                rel_py = "/".join(parts[:prefix_len]) + ".py"
+                candidates.append(rel_py)
+        for rel in candidates:
+            norm = PurePosixPath(rel.replace("\\", "/")).as_posix()
+            if (workspace_path / norm).is_file() and norm not in found:
+                found.append(norm)
+                break
+    return found
+
+
+def _is_proven_failure_exit(
+    argv: Sequence[str], code: int | None, output: str = ""
+) -> tuple[bool, str]:
     """Return (proven, detail) distinguishing real test failures from tool/signal errors."""
+    clean_output = _strip_ansi(output)
     if code is None:
         return False, "repro timed out or failed to execute"
     if code == 0:
@@ -368,6 +499,8 @@ def _is_proven_failure_exit(argv: Sequence[str], code: int | None) -> tuple[bool
         return False, f"repro terminated by signal, exit={code}"
     if code in _NON_PROOF_EXIT_CODES:
         return False, f"command not found/not executable, exit={code}"
+    if _has_zero_test_output(clean_output):
+        return False, f"command ran zero tests, exit={code}"
     runner = _effective_repro_runner(argv)
     if runner in {"pytest", "py.test"} and code != 1:
         if code == 5:
@@ -376,6 +509,75 @@ def _is_proven_failure_exit(argv: Sequence[str], code: int | None) -> tuple[bool
     if runner == "unittest" and code == 2:
         return False, "unittest CLI/usage error, exit=2"
     return True, f"repro failed with exit={code}"
+
+
+def _is_proven_green_exit(
+    argv: Sequence[str], code: int | None, output: str = ""
+) -> tuple[bool, str]:
+    """Return (passed, detail) rejecting non-zero, zero-test, and all-skipped runs."""
+    clean_output = _strip_ansi(output)
+    if code is None:
+        return False, "verification command timed out or failed to execute"
+    if code != 0:
+        return False, f"exit_code={code}: {_trim_output(clean_output, 600)}"
+    if _has_zero_test_output(clean_output):
+        return False, f"vacuous zero-test run (exit=0): {_trim_output(clean_output, 600)}"
+    runner = _effective_repro_runner(argv)
+    skipped_issue = _has_all_skipped_test_output(clean_output, runner=runner)
+    if skipped_issue is not None:
+        return False, f"{skipped_issue}: {_trim_output(clean_output, 600)}"
+    return True, "green exit=0"
+
+
+def _verify_red_tests_preserved(
+    workspace_path: Path, red_receipt: Mapping[str, Any]
+) -> str | None:
+    """Verify locked red-phase test files match their exact SHA-256 snapshot byte-for-byte."""
+    raw_hashes = red_receipt.get("red_test_file_hashes")
+    hash_map = raw_hashes if isinstance(raw_hashes, Mapping) else {}
+    for rel, expected_sha in hash_map.items():
+        if not isinstance(rel, str) or not rel.strip() or not isinstance(expected_sha, str):
+            continue
+        target = workspace_path / rel
+        if not target.is_file():
+            return f"Locked red test file was deleted or is missing: {rel}"
+        actual_sha = _file_sha256(target)
+        if actual_sha != expected_sha:
+            return (
+                f"Locked red test file was modified after red phase (SHA-256 mismatch): {rel}"
+            )
+
+    raw_paths = red_receipt.get("required_test_paths")
+    required_paths = (
+        [str(p) for p in raw_paths if isinstance(p, str) and p.strip()]
+        if isinstance(raw_paths, list)
+        else []
+    )
+    baseline_hashes = red_receipt.get("red_baseline_hashes")
+    baseline_map = baseline_hashes if isinstance(baseline_hashes, Mapping) else {}
+    added_defs = red_receipt.get("added_test_defs")
+    added_defs_map = added_defs if isinstance(added_defs, Mapping) else {}
+
+    for rel in required_paths:
+        target = workspace_path / rel
+        if not target.is_file():
+            return f"Required red test file was deleted or is missing: {rel}"
+        raw_bytes = target.read_bytes()
+        if not raw_bytes.strip():
+            return f"Required red test file was emptied: {rel}"
+        if rel in baseline_map:
+            current_hash = hashlib.sha256(raw_bytes).hexdigest()
+            if baseline_map[rel] is not None and current_hash == baseline_map[rel]:
+                return f"Red-phase regression test file was reverted to pre-red baseline: {rel}"
+        expected_defs = added_defs_map.get(rel)
+        if isinstance(expected_defs, list) and expected_defs:
+            current_defs = _extract_test_def_names(raw_bytes.decode("utf-8", errors="replace"))
+            missing = [name for name in expected_defs if name not in current_defs]
+            if missing:
+                return (
+                    f"Red-phase test definition(s) removed from {rel}: {', '.join(sorted(missing))}"
+                )
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -536,6 +738,7 @@ def _run_argv_command(
     timeout_s: int = 60,
     host_root: Path | None = None,
     require_fs_isolation: bool = True,
+    trim: bool = True,
 ) -> tuple[int | None, str]:
     """Execute one tokenized command directly (``shell=False``) with read-only host FS via bwrap."""
     bwrap_bin = _probe_bwrap()
@@ -615,7 +818,7 @@ def _run_argv_command(
     finally:
         shutil.rmtree(repro_tmp, ignore_errors=True)
     combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part and part.strip())
-    return proc.returncode, _trim_output(combined)
+    return proc.returncode, (_trim_output(combined) if trim else combined.strip())
 
 
 def _trim_output(text: str, limit: int = _MAX_EXCERPT_CHARS) -> str:
@@ -664,6 +867,79 @@ def _compose_system_prompt(base_prompt: str, skill_refs: Sequence[str]) -> str:
     return f"{base_prompt}\n\n{pack}"
 
 
+def _format_investigation_report(brief: EvidenceBrief) -> str:
+    """Format an ``EvidenceBrief`` into a deterministic read-only forensics report."""
+    lines: list[str] = [
+        "# Investigation Report",
+        "",
+        f"**Brief ID:** `{brief.brief_id}`  ",
+        f"**Content Hash:** `{brief.content_hash}`",
+        "",
+        "## Root-Cause Summary",
+        "",
+        brief.summary.strip(),
+        "",
+        "## Verified Codebase Evidence",
+        "",
+    ]
+    if brief.facts:
+        for fact in brief.facts:
+            loc = f"{fact.path}:{fact.line}" if fact.line is not None else fact.path
+            lines.append(f"- `{loc}` — {fact.observation.strip()}")
+    else:
+        lines.append("- (no file:line facts recorded)")
+
+    if brief.candidate_files:
+        lines.extend(["", "## Implicated Files", ""])
+        for path in brief.candidate_files:
+            lines.append(f"- `{path}`")
+
+    if brief.repro_command:
+        lines.extend(["", "## Reproduction Signal", ""])
+        lines.append(f"- **Command:** `{brief.repro_command}`")
+        lines.append(f"- **Verified on base:** `{brief.repro_verified}`")
+        if brief.repro_exit_code is not None:
+            lines.append(f"- **Exit code:** `{brief.repro_exit_code}`")
+        if brief.repro_excerpt.strip():
+            lines.extend(["", "```text", brief.repro_excerpt.strip(), "```"])
+
+    if brief.unresolved_questions:
+        lines.extend(["", "## Open Questions", ""])
+        for question in brief.unresolved_questions:
+            lines.append(f"- {question.strip()}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _checkout_base_ref(repo_root: Path, sandbox_path: Path, base_ref: str) -> str:
+    """Resolve and detach-checkout ``base_ref`` inside a throwaway git worktree."""
+    ref = base_ref.strip()
+    if not ref or ref.startswith("-"):
+        raise ValueError(f"Invalid base_ref {base_ref!r}")
+    resolve_proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if resolve_proc.returncode != 0:
+        detail = (resolve_proc.stderr or resolve_proc.stdout).strip() or "unknown ref"
+        raise ValueError(f"Unable to resolve base_ref {ref!r}: {detail}")
+    resolved_sha = resolve_proc.stdout.strip()
+    checkout_proc = subprocess.run(
+        ["git", "checkout", "--detach", resolved_sha],
+        cwd=str(sandbox_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if checkout_proc.returncode != 0:
+        detail = (checkout_proc.stderr or checkout_proc.stdout).strip() or "checkout failed"
+        raise ValueError(f"Failed to checkout base_ref {ref!r} ({resolved_sha}): {detail}")
+    return resolved_sha
+
+
 class CraftStage:
     """Cohesive handler for all six orthogonal evidence-first craft primitives."""
 
@@ -704,16 +980,35 @@ class CraftStage:
 
     # ------------------------------------------------------------------ state persistence
 
-    def _craft_dir(self, run_id: str) -> Path:
-        path = self.artifacts_root / run_id / "craft"
+    def _is_inside_workspace(self, path: Path) -> bool:
+        resolved = path.resolve(strict=False)
+        return resolved == self.workspace_root or resolved.is_relative_to(self.workspace_root)
+
+    def _craft_dir(self, run_id: str, *, read_only_workspace: bool = False) -> Path:
+        root = self.artifacts_root
+        if read_only_workspace and self._is_inside_workspace(root):
+            fallback_root = (
+                Path(tempfile.gettempdir()).resolve(strict=False) / "olympus-read-only-artifacts"
+            )
+            if self._is_inside_workspace(fallback_root):
+                raise CraftPause(
+                    "explore",
+                    "Refusing to write read-only investigation artifacts inside workspace_root",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
+            root = fallback_root
+        path = root / run_id / "craft"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _state_file(self, run_id: str) -> Path:
-        return self._craft_dir(run_id) / "state.json"
+    def _state_file(self, run_id: str, *, read_only_workspace: bool = False) -> Path:
+        return self._craft_dir(run_id, read_only_workspace=read_only_workspace) / "state.json"
 
-    def _load_persisted(self, run_id: str) -> dict[str, Any]:
-        path = self._state_file(run_id)
+    def _load_persisted(
+        self, run_id: str, *, read_only_workspace: bool = False
+    ) -> dict[str, Any]:
+        path = self._state_file(run_id, read_only_workspace=read_only_workspace)
         if not path.is_file():
             return {}
         try:
@@ -722,10 +1017,16 @@ class CraftStage:
             return {}
         return raw if isinstance(raw, dict) else {}
 
-    def _save_persisted(self, run_id: str, updates: Mapping[str, Any]) -> dict[str, Any]:
-        current = self._load_persisted(run_id)
+    def _save_persisted(
+        self,
+        run_id: str,
+        updates: Mapping[str, Any],
+        *,
+        read_only_workspace: bool = False,
+    ) -> dict[str, Any]:
+        current = self._load_persisted(run_id, read_only_workspace=read_only_workspace)
         current.update(updates)
-        self._state_file(run_id).write_text(
+        self._state_file(run_id, read_only_workspace=read_only_workspace).write_text(
             json.dumps(current, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
@@ -816,6 +1117,7 @@ class CraftStage:
         model_cls: type[T],
         max_steps: int,
         trace_name: str,
+        read_only_workspace: bool = False,
     ) -> tuple[T, str]:
         driver, driver_model, resolved_spec = self._resolve_role_driver(
             run_id=run_id,
@@ -825,7 +1127,10 @@ class CraftStage:
         )
         active_provider = self._provider_for_model(driver_model)
         toolkit = WorkspaceToolkit(workspace_path, read_only=True, env_root=self.workspace_root)
-        trace_path = self._craft_dir(run_id) / f"{trace_name}.jsonl"
+        trace_path = (
+            self._craft_dir(run_id, read_only_workspace=read_only_workspace)
+            / f"{trace_name}.jsonl"
+        )
         loop = AgentLoop(
             provider=active_provider,
             toolkit=toolkit,
@@ -908,10 +1213,30 @@ class CraftStage:
             reuse=True,
             sandbox_root=self.sandbox_root,
         )
-        baseline = load_sandbox_baseline(handle)
+        baseline = load_sandbox_baseline(handle) if handle.reused else None
+        baseline_invalidated = not handle.reused or baseline is None
+        if handle.is_git_worktree:
+            head_proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(handle.workspace_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            actual_head = head_proc.stdout.strip() if head_proc.returncode == 0 else None
+            if actual_head:
+                if handle.base_commit != actual_head:
+                    handle = replace(handle, base_commit=actual_head)
+                if baseline is not None and baseline.base_commit != actual_head:
+                    baseline = None
+                    baseline_invalidated = True
         if baseline is None:
             baseline = snapshot_sandbox_state(handle)
             save_sandbox_baseline(handle, baseline)
+        if baseline_invalidated:
+            persisted = self._load_persisted(run_id)
+            if persisted.get("red_test_receipt") is not None:
+                self._save_persisted(run_id, {"red_test_receipt": None})
         return handle, baseline
 
     def _promote_sandbox_to_workspace(
@@ -1166,6 +1491,64 @@ class CraftStage:
                 valid.append(cleaned)
         return valid, rejected
 
+    def _run_verified_command(
+        self,
+        command: str | None,
+        *,
+        cwd: Path,
+        timeout_s: int,
+        node_name: str,
+    ) -> tuple[list[str] | None, int | None, str, str | None]:
+        """Validate and execute one allowlisted command under the bwrap/sandbox boundary."""
+        cmd_issue = _validate_substantive_command(command)
+        if cmd_issue is not None:
+            return None, None, "", cmd_issue
+        assert command is not None
+        argv, argv_issue = _parse_sandboxed_repro_argv(
+            command,
+            host_root=self.workspace_root,
+            sandbox_root=cwd,
+        )
+        if argv_issue is not None or argv is None:
+            return None, None, "", argv_issue or "command rejected by allowlist"
+        if self._run_command is _run_sandbox_command:
+            try:
+                code, raw_output = _run_argv_command(
+                    argv,
+                    cwd=cwd,
+                    timeout_s=timeout_s,
+                    host_root=self.workspace_root,
+                    require_fs_isolation=not self._allow_unsandboxed_repro,
+                    trim=False,
+                )
+            except _SandboxIsolationUnavailableError as exc:
+                raise CraftPause(
+                    node_name,
+                    str(exc),
+                    route="blocked",
+                    pause_kind="blocked",
+                ) from exc
+        else:
+            code, raw_output = self._run_command(command, cwd=cwd, timeout_s=timeout_s)
+        return argv, code, raw_output, None
+
+    def _assert_read_only_store_outside_workspace(self, node_name: str) -> None:
+        """Fail closed in read-only report mode if RunStore SQLite DB lives inside workspace."""
+        raw_db_path = getattr(self.store, "db_path", None)
+        if raw_db_path is None:
+            return
+        db_str = str(raw_db_path).strip()
+        if not db_str or db_str == ":memory:" or db_str.startswith("file::memory:"):
+            return
+        if self._is_inside_workspace(Path(db_str)):
+            raise CraftPause(
+                node_name,
+                "Read-only investigation refuses to write to RunStore inside workspace_root "
+                f"({raw_db_path}); configure RunStore outside the target repository.",
+                route="blocked",
+                pause_kind="blocked",
+            )
+
     # ------------------------------------------------------------------ 6 orthogonal primitives
 
     def explore_reproduce(
@@ -1175,26 +1558,41 @@ class CraftStage:
         raw_input: str,
         constraints: Sequence[str] = (),
         scope_paths: Sequence[str] = (),
+        base_ref: str | None = None,
         node_name: str = "explore",
         role: str = "explorer",
         skill_refs: Sequence[str] = (),
         require_repro: bool = False,
+        read_only_report: bool = False,
         max_steps: int = 8,
     ) -> dict[str, Any]:
+        if read_only_report:
+            self._assert_read_only_store_outside_workspace(node_name)
         toolkit = WorkspaceToolkit(
             self.workspace_root, read_only=True, env_root=self.workspace_root
         )
         inventory = format_workspace_inventory(toolkit, scope_paths=scope_paths)
-        system_prompt = _compose_system_prompt(
-            "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only "
-            "(batching file reads efficiently) and return ONLY valid EvidenceBrief JSON conforming "
-            "strictly to the schema. Leave repro_verified=false (the deterministic control plane "
-            "verifies repro commands). Record solvable engineering defaults, tie-breakers, and "
-            "environment notes in `assumptions` and keep `unresolved_questions` as `[]` unless "
-            "execution is genuinely blocked on an unresolvable product/intent decision.\n"
-            f"{_SANDBOXED_COMMAND_RULES}",
-            skill_refs,
-        )
+        if read_only_report:
+            base_system_prompt = (
+                "You are Prometheus (Read-Only Root-Cause Forensics Explorer). Inspect the "
+                "repository strictly read-only without modifying any files and return ONLY "
+                "valid EvidenceBrief JSON conforming strictly to the schema. Explain the exact "
+                "root-cause mechanism in `summary`, ground every claim in `file:line` entries "
+                "inside `facts`, list implicated files in `candidate_files`, and leave "
+                "repro_verified=false."
+            )
+        else:
+            base_system_prompt = (
+                "You are Prometheus (Evidence-First Explorer). Inspect the repository read-only "
+                "(batching file reads efficiently) and return ONLY valid EvidenceBrief JSON "
+                "conforming strictly to the schema. Leave repro_verified=false (the deterministic "
+                "control plane verifies repro commands). Record solvable engineering defaults, "
+                "tie-breakers, and environment notes in `assumptions` and keep "
+                "`unresolved_questions` as `[]` unless execution is genuinely blocked on an "
+                "unresolvable product/intent decision.\n"
+                f"{_SANDBOXED_COMMAND_RULES}"
+            )
+        system_prompt = _compose_system_prompt(base_system_prompt, skill_refs)
         merged_constraints = [
             *constraints,
             *(
@@ -1213,8 +1611,14 @@ class CraftStage:
             if require_repro
             else ""
         )
+        report_note = (
+            "\nThis is a terminal read-only investigation (`stop_after: report`). "
+            "Do not plan edits; produce a complete, self-contained root-cause EvidenceBrief."
+            if read_only_report
+            else ""
+        )
         user_prompt = (
-            f"Goal:\n{raw_input}\n\n{inventory}{constraints_block}{repro_note}\n\n"
+            f"Goal:\n{raw_input}\n\n{inventory}{constraints_block}{repro_note}{report_note}\n\n"
             f"Return JSON matching schema:\n"
             f"{json.dumps(EvidenceBrief.model_json_schema(), ensure_ascii=False)}"
         )
@@ -1229,11 +1633,13 @@ class CraftStage:
             model_cls=EvidenceBrief,
             max_steps=max_steps,
             trace_name="explore",
+            read_only_workspace=read_only_report,
         )
         # Never trust LLM-claimed repro verification; run repro inside a throwaway sandbox.
         repro_verified = False
         repro_exit_code = brief.repro_exit_code
         repro_excerpt = brief.repro_excerpt
+        repro_receipt: dict[str, Any] | None = None
         if require_repro:
             cmd_issue = _validate_substantive_command(brief.repro_command)
             if cmd_issue is not None:
@@ -1241,7 +1647,11 @@ class CraftStage:
                     update={"repro_verified": False, "repro_exit_code": None}
                 )
                 dumped = brief.model_dump(mode="json")
-                self._save_persisted(run_id, {"evidence_brief": dumped})
+                self._save_persisted(
+                    run_id,
+                    {"evidence_brief": dumped},
+                    read_only_workspace=read_only_report,
+                )
                 raise CraftPause(
                     node_name,
                     f"Reproduction required before fixing ({cmd_issue})",
@@ -1256,50 +1666,77 @@ class CraftStage:
                 reuse=False,
                 sandbox_root=self.sandbox_root,
             )
+            resolved_base_ref = repro_handle.base_commit or "HEAD"
             try:
-                argv, argv_issue = _parse_sandboxed_repro_argv(
-                    brief.repro_command,
-                    host_root=self.workspace_root,
-                    sandbox_root=repro_handle.workspace_path,
-                )
-                if argv_issue is not None or argv is None:
+                if base_ref and not repro_handle.is_git_worktree:
                     brief = brief.model_copy(
                         update={"repro_verified": False, "repro_exit_code": None}
                     )
                     dumped = brief.model_dump(mode="json")
-                    self._save_persisted(run_id, {"evidence_brief": dumped})
+                    self._save_persisted(
+                        run_id,
+                        {"evidence_brief": dumped},
+                        read_only_workspace=read_only_report,
+                    )
                     raise CraftPause(
                         node_name,
-                        f"Unsafe repro_command rejected in read-only explore ({argv_issue})",
+                        f"Cannot verify explicit base_ref {base_ref!r} on a non-git copy sandbox",
                         route="blocked",
                         pause_kind="blocked",
                         state_updates={"evidence_brief": dumped},
                     )
-                if self._run_command is _run_sandbox_command:
+                if base_ref and repro_handle.is_git_worktree:
                     try:
-                        code, excerpt = _run_argv_command(
-                            argv,
-                            cwd=repro_handle.workspace_path,
-                            timeout_s=60,
-                            host_root=self.workspace_root,
-                            require_fs_isolation=not self._allow_unsandboxed_repro,
+                        resolved_base_ref = _checkout_base_ref(
+                            self.workspace_root,
+                            repro_handle.workspace_path,
+                            base_ref,
                         )
-                    except _SandboxIsolationUnavailableError as exc:
+                    except ValueError as exc:
+                        brief = brief.model_copy(
+                            update={"repro_verified": False, "repro_exit_code": None}
+                        )
+                        dumped = brief.model_dump(mode="json")
+                        self._save_persisted(
+                            run_id,
+                            {"evidence_brief": dumped},
+                            read_only_workspace=read_only_report,
+                        )
                         raise CraftPause(
                             node_name,
                             str(exc),
                             route="blocked",
                             pause_kind="blocked",
+                            state_updates={"evidence_brief": dumped},
                         ) from exc
-                else:
-                    code, excerpt = self._run_command(
-                        brief.repro_command, cwd=repro_handle.workspace_path, timeout_s=60
+                argv, code, excerpt, issue = self._run_verified_command(
+                    brief.repro_command,
+                    cwd=repro_handle.workspace_path,
+                    timeout_s=60,
+                    node_name=node_name,
+                )
+                if issue is not None or argv is None:
+                    brief = brief.model_copy(
+                        update={"repro_verified": False, "repro_exit_code": None}
+                    )
+                    dumped = brief.model_dump(mode="json")
+                    self._save_persisted(
+                        run_id,
+                        {"evidence_brief": dumped},
+                        read_only_workspace=read_only_report,
+                    )
+                    raise CraftPause(
+                        node_name,
+                        f"Unsafe repro_command rejected in read-only explore ({issue})",
+                        route="blocked",
+                        pause_kind="blocked",
+                        state_updates={"evidence_brief": dumped},
                     )
             finally:
                 remove_sandbox(repro_handle)
             repro_exit_code = code
-            repro_excerpt = excerpt
-            repro_verified, repro_detail = _is_proven_failure_exit(argv, code)
+            repro_verified, repro_detail = _is_proven_failure_exit(argv, code, output=excerpt)
+            repro_excerpt = _trim_output(excerpt)
             brief = brief.model_copy(
                 update={
                     "repro_exit_code": repro_exit_code,
@@ -1307,22 +1744,52 @@ class CraftStage:
                     "repro_verified": repro_verified,
                 }
             )
+            repro_receipt = {
+                "command": brief.repro_command,
+                "exit_code": repro_exit_code,
+                "excerpt": repro_excerpt,
+                "verified": repro_verified,
+                "base_ref": resolved_base_ref,
+            }
             if not repro_verified:
                 dumped = brief.model_dump(mode="json")
-                self._save_persisted(run_id, {"evidence_brief": dumped})
+                self._save_persisted(
+                    run_id,
+                    {"evidence_brief": dumped, "repro_receipt": repro_receipt},
+                    read_only_workspace=read_only_report,
+                )
                 raise CraftPause(
                     node_name,
                     f"Reproduction command did not prove failure on base workspace "
                     f"({repro_detail}): {brief.repro_command}",
                     route="blocked",
                     pause_kind="blocked",
-                    state_updates={"evidence_brief": dumped},
+                    state_updates={
+                        "evidence_brief": dumped,
+                        "repro_receipt": repro_receipt,
+                    },
                 )
         else:
             brief = brief.model_copy(update={"repro_verified": False})
 
         dumped = brief.model_dump(mode="json")
-        self._save_persisted(run_id, {"evidence_brief": dumped})
+        persisted_updates: dict[str, Any] = {"evidence_brief": dumped}
+        if repro_receipt is not None:
+            persisted_updates["repro_receipt"] = repro_receipt
+        report_md: str | None = None
+        report_path: Path | None = None
+        if read_only_report:
+            report_md = _format_investigation_report(brief)
+            report_path = (
+                self._craft_dir(run_id, read_only_workspace=True) / "investigation_report.md"
+            )
+            report_path.write_text(report_md, encoding="utf-8")
+            persisted_updates["investigation_report"] = report_md
+        self._save_persisted(
+            run_id,
+            persisted_updates,
+            read_only_workspace=read_only_report,
+        )
         self.store.append_event(
             run_id=run_id,
             stage="craft",
@@ -1333,9 +1800,34 @@ class CraftStage:
                 "content_hash": brief.content_hash,
                 "fact_count": len(brief.facts),
                 "repro_verified": brief.repro_verified,
+                "repro_command": brief.repro_command,
+                "repro_exit_code": brief.repro_exit_code,
+                "read_only_report": read_only_report,
                 "unresolved_questions": list(brief.unresolved_questions),
             },
         )
+        if read_only_report:
+            assert report_md is not None and report_path is not None
+            self.store.append_event(
+                run_id=run_id,
+                stage="craft",
+                event_type="craft.investigation_report_recorded",
+                actor="prometheus",
+                payload={
+                    "brief_id": brief.brief_id,
+                    "content_hash": brief.content_hash,
+                    "fact_count": len(brief.facts),
+                    "candidate_file_count": len(brief.candidate_files),
+                    "read_only": True,
+                    "report_path": str(report_path),
+                },
+            )
+            return {
+                "evidence_brief": dumped,
+                "investigation_report": report_md,
+                "read_only": True,
+                "route": "report",
+            }
         if brief.unresolved_questions:
             raise CraftPause(
                 node_name,
@@ -1344,7 +1836,10 @@ class CraftStage:
                 pause_kind="clarify",
                 state_updates={"evidence_brief": dumped},
             )
-        return {"evidence_brief": dumped, "route": "ready"}
+        result_state: dict[str, Any] = {"evidence_brief": dumped, "route": "ready"}
+        if repro_receipt is not None:
+            result_state["repro_receipt"] = repro_receipt
+        return result_state
 
     def architect_sketch(
         self,
@@ -1366,8 +1861,9 @@ class CraftStage:
         inventory = format_workspace_inventory(toolkit, scope_paths=scope_paths)
         system_prompt = _compose_system_prompt(
             "You are Athena (Lightweight Architect). Compare at least two candidate shapes and "
-            "return ONLY valid ArchitectSketch JSON with a tight write_scope and concrete "
-            "verification_plan commands.\n"
+            "return ONLY valid ArchitectSketch JSON with a tight write_scope of workspace-relative "
+            "paths (never absolute paths) and concrete direct allowlisted verification_plan "
+            "commands.\n"
             f"{_SANDBOXED_COMMAND_RULES}",
             skill_refs,
         )
@@ -1397,6 +1893,24 @@ class CraftStage:
             max_steps=max_steps,
             trace_name="architect",
         )
+        normalized_scope: list[str] = []
+        for raw_entry in sketch.write_scope:
+            entry = raw_entry.strip()
+            candidate = Path(entry)
+            if candidate.is_absolute():
+                resolved = candidate.resolve(strict=False)
+                if resolved.is_relative_to(self.workspace_root):
+                    rel = resolved.relative_to(self.workspace_root).as_posix()
+                    entry = rel if rel and rel != "." else entry
+            if entry and entry not in normalized_scope:
+                normalized_scope.append(entry)
+        if normalized_scope and normalized_scope != sketch.write_scope:
+            sketch = ArchitectSketch.model_validate(
+                {
+                    **sketch.model_dump(mode="json", exclude={"content_hash"}),
+                    "write_scope": normalized_scope,
+                }
+            )
         valid_cmds, rejected_cmds = self._partition_verification_plan(sketch.verification_plan)
         if rejected_cmds:
             if self._has_remaining_budget(run_id):
@@ -1467,6 +1981,268 @@ class CraftStage:
         )
         return {"architect_sketch": dumped, "route": "ready"}
 
+    def _ensure_red_test_receipt(
+        self,
+        *,
+        run_id: str,
+        raw_input: str,
+        state: Mapping[str, Any],
+        brief: EvidenceBrief | None,
+        sketch: ArchitectSketch,
+        handle: SandboxHandle,
+        baseline: SandboxBaseline,
+        node_name: str,
+        role: str,
+        system_prompt: str,
+        strict_scope: bool,
+        max_steps: int,
+    ) -> dict[str, Any]:
+        """Establish deterministic pre-fix failing-test evidence on the target surface."""
+        persisted = self._load_persisted(run_id)
+        del state  # Never trust caller-supplied red receipts; only trust control-plane state.
+        current_baseline_fp = _baseline_fingerprint(baseline)
+        existing = persisted.get("red_test_receipt")
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("verified") is True
+            and isinstance(existing.get("command"), str)
+            and existing["command"].strip()
+            and existing.get("baseline_fingerprint") == current_baseline_fp
+            and isinstance(existing.get("red_test_file_hashes"), Mapping)
+        ):
+            return dict(existing)
+
+        target_cmd = (
+            brief.repro_command
+            if brief is not None and _has_executable_command(brief.repro_command)
+            else (sketch.verification_plan[0] if sketch.verification_plan else None)
+        )
+        cmd_issue = _validate_substantive_command(target_cmd)
+        if cmd_issue is not None or target_cmd is None:
+            raise CraftPause(
+                node_name,
+                f"failing_test_first requires a valid failing test command ({cmd_issue})",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        argv, argv_issue = _parse_sandboxed_repro_argv(
+            target_cmd,
+            host_root=self.workspace_root,
+            sandbox_root=handle.workspace_path,
+        )
+        if argv_issue is not None or argv is None:
+            raise CraftPause(
+                node_name,
+                f"failing_test_first rejected unsafe test command ({argv_issue}): {target_cmd}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+
+        # Always verify against the untouched production code of the current sandbox
+        # rather than blindly trusting a potentially stale historical base_ref receipt.
+        pre_argv, pre_code, pre_raw_output, pre_issue = self._run_verified_command(
+            target_cmd,
+            cwd=handle.workspace_path,
+            timeout_s=60,
+            node_name=node_name,
+        )
+        if pre_issue is not None or pre_argv is None:
+            raise CraftPause(
+                node_name,
+                f"failing_test_first rejected test command ({pre_issue}): {target_cmd}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        required_test_paths: list[str] = []
+        for candidate_path in sketch.write_scope:
+            if (
+                _is_test_path(candidate_path)
+                and (handle.workspace_path / candidate_path).is_file()
+                and candidate_path not in required_test_paths
+            ):
+                required_test_paths.append(candidate_path)
+        for resolved_path in _resolve_argv_test_files(handle.workspace_path, pre_argv):
+            if resolved_path not in required_test_paths:
+                required_test_paths.append(resolved_path)
+
+        pre_failed, _ = _is_proven_failure_exit(pre_argv, pre_code, output=pre_raw_output)
+        if pre_failed:
+            persisted_repro = persisted.get("repro_receipt")
+            source = (
+                "explore_repro"
+                if (
+                    isinstance(persisted_repro, Mapping)
+                    and persisted_repro.get("verified") is True
+                    and persisted_repro.get("command") == target_cmd
+                    and (
+                        handle.base_commit is None
+                        or persisted_repro.get("base_ref") == handle.base_commit
+                    )
+                )
+                else "sandbox_pre_fix"
+            )
+            red_test_file_hashes: dict[str, str] = {}
+            for rel in required_test_paths:
+                digest = _file_sha256(handle.workspace_path / rel)
+                if digest is not None:
+                    red_test_file_hashes[rel] = digest
+            receipt: dict[str, Any] = {
+                "command": target_cmd,
+                "exit_code": pre_code,
+                "excerpt": _trim_output(pre_raw_output),
+                "verified": True,
+                "source": source,
+                "baseline_fingerprint": current_baseline_fp,
+                "required_test_paths": required_test_paths,
+                "red_test_file_hashes": red_test_file_hashes,
+            }
+            self._save_persisted(run_id, {"red_test_receipt": receipt})
+            self.store.append_event(
+                run_id=run_id,
+                stage="craft",
+                event_type="craft.red_test_recorded",
+                actor="hephaestus",
+                payload={
+                    "command": target_cmd,
+                    "exit_code": pre_code,
+                    "source": source,
+                    "baseline_fingerprint": current_baseline_fp,
+                    "required_test_paths": required_test_paths,
+                },
+            )
+            return receipt
+
+        # Base test currently passes: require Hephaestus to write a failing regression test first
+        # inside test-only write_scope so production code cannot be mutated during the red phase.
+        test_write_scope = [path for path in sketch.write_scope if _is_test_path(path)]
+        if not test_write_scope:
+            raise CraftPause(
+                node_name,
+                "failing_test_first requires at least one test file in write_scope to author a "
+                "failing regression test before editing production code",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        pre_red_hashes: dict[str, str | None] = {
+            rel: _file_sha256(handle.workspace_path / rel) for rel in test_write_scope
+        }
+        pre_red_defs: dict[str, set[str]] = {
+            rel: _extract_test_def_names(
+                (handle.workspace_path / rel).read_text(encoding="utf-8", errors="replace")
+            )
+            if (handle.workspace_path / rel).is_file()
+            else set()
+            for rel in test_write_scope
+        }
+        red_prompt = (
+            f"Goal:\n{raw_input}\n\n"
+            f"Authorized test-only write_scope: {json.dumps(test_write_scope)}\n"
+            f"Target test command: `{target_cmd}` (currently exits {pre_code}).\n\n"
+            "PHASE 1 (RED TEST FIRST): Add or update a regression test inside the test-only "
+            "write_scope that reproduces the defect and FAILS against untouched production code "
+            "when running the target test command. Do NOT edit production files yet."
+        )
+        self._run_worker_turn(
+            run_id=run_id,
+            node_name=node_name,
+            role=role,
+            actor="hephaestus:red_test",
+            workspace_path=handle.workspace_path,
+            write_scope=test_write_scope,
+            forbidden_globs=sketch.forbidden_globs,
+            strict_scope=True,
+            system_prompt=system_prompt,
+            user_prompt=red_prompt,
+            max_steps=max(4, min(max_steps, 16)),
+            trace_name="build_red_test",
+        )
+        clean_ephemeral_artifacts(handle, baseline, write_scope=test_write_scope)
+        red_gate = run_diff_gate(
+            handle,
+            baseline,
+            allowed_write_scope=test_write_scope,
+            forbidden_globs=sketch.forbidden_globs,
+            strict_scope=True,
+        )
+        if red_gate.rejected:
+            raise CraftPause(
+                node_name,
+                red_gate.rejection_message(),
+                route="blocked",
+                pause_kind="blocked",
+            )
+        red_argv, red_code, red_raw_output, red_issue = self._run_verified_command(
+            target_cmd,
+            cwd=handle.workspace_path,
+            timeout_s=60,
+            node_name=node_name,
+        )
+        if red_issue is not None or red_argv is None:
+            raise CraftPause(
+                node_name,
+                f"failing_test_first rejected test command ({red_issue}): {target_cmd}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        red_failed, red_detail = _is_proven_failure_exit(red_argv, red_code, output=red_raw_output)
+        if not red_failed:
+            raise CraftPause(
+                node_name,
+                f"failing_test_first requires a proven failing test before applying the fix "
+                f"({red_detail}): {target_cmd}",
+                route="blocked",
+                pause_kind="blocked",
+            )
+        red_changed = list(red_gate.changed_paths)
+        red_required_paths = sorted(set([*required_test_paths, *red_changed]))
+        red_baseline_hashes: dict[str, str | None] = {
+            rel: pre_red_hashes.get(rel) for rel in red_changed
+        }
+        red_test_file_hashes = {}
+        for rel in red_required_paths:
+            digest = _file_sha256(handle.workspace_path / rel)
+            if digest is not None:
+                red_test_file_hashes[rel] = digest
+        added_test_defs: dict[str, list[str]] = {}
+        for rel in red_changed:
+            target_file = handle.workspace_path / rel
+            if target_file.is_file():
+                after_defs = _extract_test_def_names(
+                    target_file.read_text(encoding="utf-8", errors="replace")
+                )
+                newly_added = sorted(after_defs - pre_red_defs.get(rel, set()))
+                if newly_added:
+                    added_test_defs[rel] = newly_added
+        receipt = {
+            "command": target_cmd,
+            "exit_code": red_code,
+            "excerpt": _trim_output(red_raw_output),
+            "verified": True,
+            "source": "red_test_turn",
+            "baseline_fingerprint": current_baseline_fp,
+            "changed_paths": red_changed,
+            "required_test_paths": red_required_paths,
+            "red_test_file_hashes": red_test_file_hashes,
+            "red_baseline_hashes": red_baseline_hashes,
+            "added_test_defs": added_test_defs,
+        }
+        self._save_persisted(run_id, {"red_test_receipt": receipt})
+        self.store.append_event(
+            run_id=run_id,
+            stage="craft",
+            event_type="craft.red_test_recorded",
+            actor="hephaestus",
+            payload={
+                "command": target_cmd,
+                "exit_code": red_code,
+                "source": "red_test_turn",
+                "baseline_fingerprint": current_baseline_fp,
+                "changed_paths": red_changed,
+                "required_test_paths": red_required_paths,
+            },
+        )
+        return receipt
+
     def build_direct(
         self,
         *,
@@ -1477,6 +2253,7 @@ class CraftStage:
         role: str = "builder",
         skill_refs: Sequence[str] = (),
         strict_scope: bool = True,
+        failing_test_first: bool = False,
         max_diff_gate_retries: int = 2,
         max_steps: int = 24,
     ) -> dict[str, Any]:
@@ -1497,9 +2274,36 @@ class CraftStage:
             "the isolated worktree strictly within the authorized write_scope.",
             skill_refs,
         )
+        red_test_receipt: dict[str, Any] | None = None
+        if failing_test_first:
+            red_test_receipt = self._ensure_red_test_receipt(
+                run_id=run_id,
+                raw_input=raw_input,
+                state=state,
+                brief=brief,
+                sketch=sketch,
+                handle=handle,
+                baseline=baseline,
+                node_name=node_name,
+                role=role,
+                system_prompt=system_prompt,
+                strict_scope=strict_scope,
+                max_steps=max_steps,
+            )
+
         proven_findings = (
             prior_review.proven_blocking_findings() if prior_review is not None else []
         )
+        red_context = ""
+        if red_test_receipt is not None:
+            red_context = (
+                f"\nVerified failing test before fix:\n"
+                f"- command: `{red_test_receipt['command']}`\n"
+                f"- exit_code: {red_test_receipt['exit_code']}\n"
+                f"- excerpt: {_trim_output(str(red_test_receipt.get('excerpt', '')), 600)}\n"
+                "Fix the root cause inside write_scope so this exact test surface turns green "
+                "(exit 0) without weakening assertions or adding defensive workarounds.\n"
+            )
         if proven_findings:
             findings_json = json.dumps(
                 [item.model_dump(mode="json") for item in proven_findings],
@@ -1512,6 +2316,7 @@ class CraftStage:
             base_user_prompt = (
                 f"Goal:\n{raw_input}\n\n"
                 f"Authorized write_scope: {json.dumps(sketch.write_scope)}\n"
+                f"{red_context}"
                 f"Fix ONLY these run-proven blocking findings from Momus interrogation:\n"
                 f"{findings_json}\n\nCurrent diff:\n```diff\n{current_diff}\n```"
             )
@@ -1526,12 +2331,25 @@ class CraftStage:
                 f"ArchitectSketch:\n"
                 f"{json.dumps(sketch.model_dump(mode='json'), ensure_ascii=False, indent=2)}\n\n"
                 f"EvidenceBrief:\n{brief_block}\n\n"
+                f"{red_context}"
                 f"Implement the chosen shape cleanly inside write_scope and run verification."
             )
 
         user_prompt = base_user_prompt
         gate_result: DiffGateResult | None = None
         last_outcome: TurnOutcome | None = None
+        green_test_receipt: dict[str, Any] | None = None
+        last_green_failure: str | None = None
+        locked_red_paths: list[str] = []
+        if red_test_receipt is not None and isinstance(
+            red_test_receipt.get("red_test_file_hashes"), Mapping
+        ):
+            locked_red_paths = [
+                str(p)
+                for p in red_test_receipt["red_test_file_hashes"]
+                if isinstance(p, str) and p.strip()
+            ]
+        worker_forbidden_globs = list(dict.fromkeys([*sketch.forbidden_globs, *locked_red_paths]))
         for attempt in range(1, max(1, max_diff_gate_retries) + 1):
             last_outcome, _ = self._run_worker_turn(
                 run_id=run_id,
@@ -1540,7 +2358,7 @@ class CraftStage:
                 actor="hephaestus:build",
                 workspace_path=handle.workspace_path,
                 write_scope=sketch.write_scope,
-                forbidden_globs=sketch.forbidden_globs,
+                forbidden_globs=worker_forbidden_globs,
                 strict_scope=strict_scope,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1555,28 +2373,95 @@ class CraftStage:
                 forbidden_globs=sketch.forbidden_globs,
                 strict_scope=strict_scope,
             )
-            if not gate_result.rejected:
-                break
-            rejection = gate_result.rejection_message()
-            self.store.append_event(
-                run_id=run_id,
-                stage="craft",
-                event_type="craft.diff_gate_rejected",
-                actor="diff_gate",
-                payload={
-                    "attempt": attempt,
-                    "violations": [
-                        {"path": v.path, "reason": v.reason} for v in gate_result.violations
-                    ],
-                },
-            )
-            user_prompt = f"{base_user_prompt}\n\n[DIFF GATE REJECTED]\n{rejection}"
+            if gate_result.rejected:
+                rejection = gate_result.rejection_message()
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="craft",
+                    event_type="craft.diff_gate_rejected",
+                    actor="diff_gate",
+                    payload={
+                        "attempt": attempt,
+                        "violations": [
+                            {"path": v.path, "reason": v.reason} for v in gate_result.violations
+                        ],
+                    },
+                )
+                user_prompt = f"{base_user_prompt}\n\n[DIFF GATE REJECTED]\n{rejection}"
+                continue
+
+            if red_test_receipt is not None:
+                target_cmd = str(red_test_receipt["command"])
+                preserved_issue = _verify_red_tests_preserved(
+                    handle.workspace_path, red_test_receipt
+                )
+                if preserved_issue is not None:
+                    green_code = None
+                    green_raw_output = ""
+                    green_ok = False
+                    failure_reason = preserved_issue
+                else:
+                    green_argv, green_code, green_raw_output, green_issue = (
+                        self._run_verified_command(
+                            target_cmd,
+                            cwd=handle.workspace_path,
+                            timeout_s=60,
+                            node_name=node_name,
+                        )
+                    )
+                    if green_issue is not None or green_argv is None:
+                        green_ok = False
+                        failure_reason = green_issue or "verification command rejected"
+                    else:
+                        green_ok, green_detail = _is_proven_green_exit(
+                            green_argv, green_code, output=green_raw_output
+                        )
+                        failure_reason = green_detail
+                if green_ok:
+                    green_test_receipt = {
+                        "command": target_cmd,
+                        "exit_code": 0,
+                        "excerpt": _trim_output(green_raw_output),
+                        "verified": True,
+                    }
+                    last_green_failure = None
+                    break
+                last_green_failure = (
+                    f"Post-fix verification failed on red test surface `{target_cmd}` "
+                    f"({failure_reason})"
+                )
+                self.store.append_event(
+                    run_id=run_id,
+                    stage="craft",
+                    event_type="craft.failing_test_still_red",
+                    actor="hephaestus",
+                    payload={
+                        "attempt": attempt,
+                        "command": target_cmd,
+                        "exit_code": green_code,
+                        "reason": failure_reason,
+                    },
+                )
+                user_prompt = (
+                    f"{base_user_prompt}\n\n"
+                    f"[FAILING_TEST_FIRST POST-FIX CHECK FAILED]\n{last_green_failure}"
+                )
+                continue
+            break
 
         assert gate_result is not None
         if gate_result.rejected:
             raise CraftPause(
                 node_name,
                 gate_result.rejection_message(),
+                route="blocked",
+                pause_kind="blocked",
+            )
+        if red_test_receipt is not None and green_test_receipt is None:
+            raise CraftPause(
+                node_name,
+                last_green_failure
+                or f"Post-fix verification did not turn green for `{red_test_receipt['command']}`",
                 route="blocked",
                 pause_kind="blocked",
             )
@@ -1595,13 +2480,32 @@ class CraftStage:
 
         diff = capture_sandbox_diff(handle, baseline)
         (self._craft_dir(run_id) / "diff.patch").write_text(diff, encoding="utf-8")
-        self._save_persisted(
-            run_id,
-            {
-                "craft_changed_paths": list(gate_result.changed_paths),
-                "sandbox_path": str(handle.workspace_path),
-            },
-        )
+        persisted_updates: dict[str, Any] = {
+            "craft_changed_paths": list(gate_result.changed_paths),
+            "sandbox_path": str(handle.workspace_path),
+        }
+        failing_test_receipt: dict[str, Any] | None = None
+        if red_test_receipt is not None and green_test_receipt is not None:
+            failing_test_receipt = {
+                "red": red_test_receipt,
+                "green": green_test_receipt,
+                "same_surface": red_test_receipt["command"] == green_test_receipt["command"],
+            }
+            persisted_updates["failing_test_receipt"] = failing_test_receipt
+            self.store.append_event(
+                run_id=run_id,
+                stage="craft",
+                event_type="craft.failing_test_verified",
+                actor="hephaestus",
+                payload={
+                    "command": red_test_receipt["command"],
+                    "red_exit_code": red_test_receipt["exit_code"],
+                    "green_exit_code": green_test_receipt["exit_code"],
+                    "red_source": red_test_receipt.get("source"),
+                    "same_surface": True,
+                },
+            )
+        self._save_persisted(run_id, persisted_updates)
         self.store.append_event(
             run_id=run_id,
             stage="craft",
@@ -1610,13 +2514,17 @@ class CraftStage:
             payload={
                 "changed_paths": list(gate_result.changed_paths),
                 "diff_bytes": len(diff.encode("utf-8")),
+                "failing_test_first": failing_test_first,
             },
         )
-        return {
+        result_state: dict[str, Any] = {
             "craft_diff": diff,
             "craft_changed_paths": list(gate_result.changed_paths),
             "route": "built",
         }
+        if failing_test_receipt is not None:
+            result_state["failing_test_receipt"] = failing_test_receipt
+        return result_state
 
     def hygiene_pass(
         self,
@@ -1655,6 +2563,18 @@ class CraftStage:
             f"Inspect and clean only the diff below:\n```diff\n"
             f"{_trim_output(diff, _MAX_DIFF_PROMPT_CHARS)}\n```"
         )
+        persisted_red = self._load_persisted(run_id).get("red_test_receipt")
+        hygiene_locked_paths = (
+            [
+                str(p)
+                for p in persisted_red["red_test_file_hashes"]
+                if isinstance(p, str) and p.strip()
+            ]
+            if isinstance(persisted_red, Mapping)
+            and isinstance(persisted_red.get("red_test_file_hashes"), Mapping)
+            else []
+        )
+        hygiene_forbidden = list(dict.fromkeys([*sketch.forbidden_globs, *hygiene_locked_paths]))
         self._run_worker_turn(
             run_id=run_id,
             node_name=node_name,
@@ -1662,7 +2582,7 @@ class CraftStage:
             actor="hephaestus:hygiene",
             workspace_path=handle.workspace_path,
             write_scope=sketch.write_scope,
-            forbidden_globs=sketch.forbidden_globs,
+            forbidden_globs=hygiene_forbidden,
             strict_scope=strict_scope,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -1684,6 +2604,15 @@ class CraftStage:
                 route="blocked",
                 pause_kind="blocked",
             )
+        if isinstance(persisted_red, Mapping) and hygiene_locked_paths:
+            preserved_issue = _verify_red_tests_preserved(handle.workspace_path, persisted_red)
+            if preserved_issue is not None:
+                raise CraftPause(
+                    node_name,
+                    f"Hygiene pass violated red-test immutability: {preserved_issue}",
+                    route="blocked",
+                    pause_kind="blocked",
+                )
         updated_diff = capture_sandbox_diff(handle, baseline)
         (self._craft_dir(run_id) / "diff.patch").write_text(updated_diff, encoding="utf-8")
         self.store.append_event(
@@ -1818,12 +2747,13 @@ class CraftStage:
                 continue
             if self._run_command is _run_sandbox_command:
                 try:
-                    code, output = _run_argv_command(
+                    code, raw_output = _run_argv_command(
                         argv,
                         cwd=handle.workspace_path,
                         timeout_s=30,
                         host_root=self.workspace_root,
                         require_fs_isolation=not self._allow_unsandboxed_repro,
+                        trim=False,
                     )
                 except _SandboxIsolationUnavailableError as exc:
                     raise CraftPause(
@@ -1833,17 +2763,18 @@ class CraftStage:
                         pause_kind="blocked",
                     ) from exc
             else:
-                code, output = self._run_command(
+                code, raw_output = self._run_command(
                     finding.repro_command, cwd=handle.workspace_path, timeout_s=30
                 )
-            proven_failure, reason_detail = _is_proven_failure_exit(argv, code)
+            proven_failure, reason_detail = _is_proven_failure_exit(argv, code, output=raw_output)
+            trimmed_output = _trim_output(raw_output)
             if proven_failure:
                 verified_findings.append(
                     finding.model_copy(
                         update={
                             "proven": True,
                             "exit_code": code,
-                            "observed_output": output,
+                            "observed_output": trimmed_output,
                         }
                     )
                 )
@@ -1857,7 +2788,7 @@ class CraftStage:
                         update={
                             "proven": False,
                             "exit_code": code,
-                            "observed_output": output,
+                            "observed_output": trimmed_output,
                         }
                     )
                 )
@@ -1936,6 +2867,7 @@ class CraftStage:
         timeout_s: int = 120,
     ) -> dict[str, Any]:
         sketch = self._hydrate_model(run_id, state, "architect_sketch", ArchitectSketch)
+        brief = self._hydrate_model(run_id, state, "evidence_brief", EvidenceBrief)
         handle, baseline = self._ensure_sandbox(run_id)
         # Emit role dispatch record so Argus verification is auditable in the dispatch ledger.
         self._resolve_role_driver(
@@ -1950,6 +2882,14 @@ class CraftStage:
             if commands is not None
             else (list(sketch.verification_plan) if sketch is not None else [])
         )
+        if (
+            commands is None
+            and brief is not None
+            and brief.repro_verified
+            and brief.repro_command
+            and brief.repro_command not in planned
+        ):
+            planned.append(brief.repro_command)
         checks: list[SurfaceCheckResult] = []
         if not planned:
             checks.append(
@@ -2000,12 +2940,13 @@ class CraftStage:
                     continue
                 if self._run_command is _run_sandbox_command:
                     try:
-                        code, output = _run_argv_command(
+                        code, raw_output = _run_argv_command(
                             argv,
                             cwd=handle.workspace_path,
                             timeout_s=timeout_s,
                             host_root=self.workspace_root,
                             require_fs_isolation=not self._allow_unsandboxed_repro,
+                            trim=False,
                         )
                     except _SandboxIsolationUnavailableError as exc:
                         raise CraftPause(
@@ -2015,17 +2956,27 @@ class CraftStage:
                             pause_kind="blocked",
                         ) from exc
                 else:
-                    code, output = self._run_command(
+                    code, raw_output = self._run_command(
                         raw_cmd, cwd=handle.workspace_path, timeout_s=timeout_s
                     )
                 status: Literal["pass", "fail", "inconclusive"]
                 runner = _effective_repro_runner(argv)
                 if code is None:
                     status = "inconclusive"
-                elif code == 0 and runner == "unittest" and re.search(r"\bRan 0 tests\b", output):
+                elif (
+                    code == 0
+                    and runner == "unittest"
+                    and re.search(r"\bRan 0 tests\b", _strip_ansi(raw_output))
+                ):
                     status = "fail"
                 elif code == 0:
-                    status = "pass"
+                    if (
+                        _has_zero_test_output(raw_output)
+                        or _has_all_skipped_test_output(raw_output, runner=runner) is not None
+                    ):
+                        status = "inconclusive"
+                    else:
+                        status = "pass"
                 else:
                     status = "fail"
                 checks.append(
@@ -2034,7 +2985,7 @@ class CraftStage:
                         command=raw_cmd,
                         status=status,
                         exit_code=code,
-                        evidence=output,
+                        evidence=_trim_output(raw_output),
                     )
                 )
 

@@ -193,7 +193,7 @@ def resolve_resume_node(
 
     paused_cursor = extract_paused_cursor(events, valid_names=names)
     if paused_cursor is not None:
-        if definition.family != "sdlc":
+        if not definition.uses_sdlc_artifacts():
             return paused_cursor
         if not _is_superseded_legacy_cursor(
             paused_cursor,

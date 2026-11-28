@@ -4,6 +4,15 @@ description: >-
   white-box DesignSpec with exclusive module paths and interface seams, then decompose a
   modular Wave 0/1/2 TaskPlan. Every gate stays human-controlled and the run stops after
   the plan is approved.
+family: sdlc
+autonomy: gated
+applicable_scenarios:
+  - architecture RFCs, technical blueprints, and multi-phase delivery roadmaps
+  - spec-and-plan-only alignment stopping after approved TaskPlan with zero code writes
+anti_patterns:
+  - code implementation, bug fixing, or runtime verification
+  - read-only forensic investigation of an existing defect
+  - small repository patches
 stop_after: plan
 topology: modular_product
 nodes:
